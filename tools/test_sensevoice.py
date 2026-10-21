@@ -10,7 +10,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'app'))
-from recognize import Recognition, QuietBoost, join_text, punctuation_only
+from recognize import Recognition, QuietBoost, SenseVoiceSession, join_text, punctuation_only
 
 
 class Vad:
@@ -263,6 +263,17 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(punctuation_only('金额1.5元', '金额15元。'))
         self.assertFalse(punctuation_only('没有到账', '有到账。'))
         self.assertFalse(punctuation_only('use GitHub', 'use Git Hub.'))
+
+    def test_punctuation_preserves_existing_punctuation(self):
+        for original, rewritten in [('不，删除文件', '不删除文件。'),
+                                     ('使用.NET', '使用NET。'),
+                                     ('你好！', '你好。')]:
+            with self.subTest(original=original):
+                self.assertFalse(punctuation_only(original, rewritten))
+                session = SimpleNamespace(punctuation=SimpleNamespace(
+                    add_punctuation=lambda text: rewritten))
+                self.assertEqual(SenseVoiceSession.punctuate(session, original), original)
+        self.assertTrue(punctuation_only('你好，世界', '你好，世界。'))
 
     def test_asr_preserves_relative_volume_inside_a_segment(self):
         class Spy(Session):

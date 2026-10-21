@@ -77,7 +77,7 @@ def main():
     assert window["rect"][2] > window["rect"][0] and window["rect"][3] > window["rect"][1], "Window is empty"
     left, top, right, bottom = window["rect"]
     width, height = right - left, bottom - top
-    points = ([(32, 48), (96, 48), (64, 40), (64, 56)] if width == 128 else
+    points = ([(64, 32), (64, 64), (80, 34), (80, 62)] if width == 128 else
               [(24, 44), (88, 44), (56, 36), (56, 52)] if width == 112 else
               [(12, 36), (59, 36), (36, 12), (36, 59)] if width == 72 else
               [(8, 18), (90, 18), (50, 5), (50, 30)])
@@ -90,8 +90,10 @@ def main():
             colors.append((pixel & 255, (pixel >> 8) & 255, (pixel >> 16) & 255))
     finally:
         user.ReleaseDC(None, screen)
-    assert sum(max(rgb) - min(rgb) <= 8 and 60 <= min(rgb) <= 240 for rgb in colors) >= 3, \
-        "Window exists but its gray surface was not drawn on the desktop: " + str(colors)
+    # Graphite is cool-tinted and translucent, so the live desktop affects its color.
+    assert sum(max(rgb) - min(rgb) <= 55 and 20 <= min(rgb) <= 155
+               and rgb[2] >= rgb[0] - 20 for rgb in colors) >= 3, \
+        "Window exists but its graphite surface was not drawn on the desktop: " + str(colors)
     print("PASS: VoxFix Desktop has one visible interactive-desktop window")
     if "--exercise-reopen" in sys.argv:
         root = Path(__file__).resolve().parent.parent

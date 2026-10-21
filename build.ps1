@@ -4,8 +4,9 @@ New-Item -ItemType Directory -Path (Join-Path $projectRoot 'bin') -Force | Out-N
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $executable = Join-Path $projectRoot 'bin\VoxFix Desktop.exe'
 $icon = Join-Path $projectRoot 'app\assets\VoxFix Desktop.ico'
-$compileOptions = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+', '/r:System.Drawing.dll', '/r:System.Windows.Forms.dll', '/r:System.Web.Extensions.dll', "/out:$executable")
+$compileOptions = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+', '/r:System.Drawing.dll', '/r:System.Windows.Forms.dll', '/r:System.Web.Extensions.dll', '/r:Accessibility.dll', "/out:$executable")
 $compileOptions += @("/r:$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\WPF\UIAutomationClient.dll", "/r:$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\WPF\UIAutomationTypes.dll", "/r:$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\WPF\WindowsBase.dll")
+$compileOptions += "/resource:$projectRoot\app\assets\graphite-material.png,VoxFix.GraphiteMaterial"
 if (-not (Test-Path -LiteralPath $icon)) {
     & $compiler @compileOptions "$projectRoot\app\Microphone.cs"
     if ($LASTEXITCODE -ne 0) { throw 'Build failed' }

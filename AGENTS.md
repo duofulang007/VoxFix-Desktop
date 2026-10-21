@@ -1,73 +1,88 @@
 # AGENTS.md
 
-给在本仓库里动手的 AI / 协作者看的操作手册。产品说明见 [README](README.md)，技术记录的阅读顺序见
-[docs/README.md](docs/README.md)。
+本仓库的操作约定。当前版本 **1.6.24.0**；产品说明见 [README](README.md)，
+技术记录从 [docs/README.md](docs/README.md) 读起，工具入口见 [tools/README.md](tools/README.md)。
 
-## 这是什么
+## 生产链路
 
-Windows x64 本地语音输入（替代 Win+H）。两个可执行单元：
+- `app/Microphone.cs`：单文件 C# WinForms，负责窗口、全局快捷键、采音、焦点、送字与原生自检；无 NuGet、无 .NET SDK。
+- `app/recognize.py`：stdin/stdout 逐行 JSON 子进程，负责 VAD 分段、可修订草稿、标点和只追加定稿。
+- SenseVoiceSmall INT8 + Silero VAD + CT-Transformer，CPU 推理；`app/assets/graphite-material.png` 嵌入 EXE。
 
-- `app/Microphone.cs` —— 单文件 C#（WinForms，无 NuGet、无 .NET SDK），负责悬浮窗口、采音、送字、自检。
-- `app/recognize.py` —— 子进程，stdin/stdout 逐行 JSON。负责 VAD 分段、草稿、标点、定稿。
-
-首遍识别固定 SenseVoiceSmall INT8 + Silero VAD + CT-Transformer，CPU 推理。换模型是产品决策，
-不是随手优化：`docs/中文与混说-换Qwen伪流式-2026-10-21.md` 里 Qwen3-ASR 准确率更高但被否，
-别只看到准确率就换回去。
+换模型是产品决策。Qwen3-ASR 准确率更高但延迟、内存不合要求，用户已否决；
+见 `docs/中文与混说-换Qwen伪流式-2026-10-21.md`，不要仅凭准确率换回去。
 
 ## 构建与验证
 
-```powershell
-# 编译（必须用 PowerShell 工具执行；Bash 里直调 csc.exe 会被安全策略拦）
-Set-Location "D:\Projects\VoxFix Desktop"; .\build.ps1
+必须在 PowerShell 执行构建。先退出正在运行的 VoxFix（退出会清空内存缓存），否则 EXE 被占用报 CS0016：
 
-# 编译前若应用在跑，先结束它，否则 csc 报 CS0016 文件被占用
+```powershell
+Set-Location 'D:\Projects\VoxFix Desktop'
 Get-Process | Where-Object { $_.ProcessName -like 'VoxFix Desktop*' } | Stop-Process -Force
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-验证顺序（改动越大越要往全跑）：
+`Bypass` 只作用于本次进程，不修改用户执行策略。沙箱可能看不到真实桌面的 VoxFix 进程；
+若仍报占用，需在真实桌面权限下确认进程，不能把旧 EXE 的测试当作新源码验证。
 
-| 命令 | 覆盖 |
+Python 测试统一使用 `.venv/Scripts/python.exe`，按改动范围运行：
+
+| 脚本 | 覆盖与前提 |
 |---|---|
-| `tools/test_sensevoice.py` | 协议、分段、标点校验、语言守卫，无设备无需模型 |
-| `tools/test_language_guard.py` | 外文输出守卫 |
-| `tools/test_microphone.py` | 真实模型 + 175 秒连续会话 + 麦克风节奏 |
-| `tools/evaluate_sensevoice.py` | 174 条固定语料，出分数 |
-| `"bin\VoxFix Desktop.exe" --self-test` | 界面/送字/形变/音效自检，结果写 `work/microphone-self-test.txt`，末行须 `PASS:` |
-| `--focus-test` / `--idle-focus-test` | 真实 WinForms + 真实 SendInput 的焦点与空闲形变回归 |
-| `--target-probe [进程名]` | 某窗口能否收字，写 `work/target-probe.txt`，不抢前台 |
-| `--memory-test` / `--stream-test` | 真实模型兜底与真实送字 |
+| `tools/test_sensevoice.py` | 协议、分段、草稿、标点保留；无需模型或设备 |
+| `tools/test_language_guard.py` | 中英字符边界、外文拒绝与先前定稿恢复；无需模型 |
+| `tools/test_asr_scoring.py` | 中文按字、英文按词、否定、静音与外文计分 |
+| `tools/test_microphone.py` | 真实模型协议、尾音、轻声、坏包恢复、175 秒固定音频连续会话；不访问麦克风 |
+| `tools/evaluate_sensevoice.py` | 174 条固定语料，依赖 `work/p0/manifest.json` 与对应 WAV |
+| `tools/test_desktop_window.py` | 实际交互桌面的窗口可见性与表面绘制，须已有可见 VoxFix 窗口 |
 
-`--memory-test` 会移动真实鼠标、依赖前台，用户正在用电脑时会以 `pressed=False; dragged=True`
-失败，这是环境性失败，不是回归。
+原生测试用 `Start-Process` 等待退出，不能在 PowerShell 直接把带引号路径当命令：
 
-## 行为契约（改了就是 bug）
+```powershell
+$p = Start-Process '.\bin\VoxFix Desktop.exe' -ArgumentList '--self-test' -Wait -PassThru
+$p.ExitCode
+Get-Content work\microphone-self-test.txt
+```
 
-1. **只追加**：已经上屏的文字永不回改、回删。
-2. **标点只允许加标点**：`punctuation_only()` 校验不过就返回原文。
-3. **ITN 关闭**：开了会把「一百二十八元五角」写成「128元5元角」。
-4. **语言不锁**：`language='auto'` 是实测最优；锁 `zh-CN` 会打废英文整句，锁 `en-US` 中文全空。
-   运行时只认单个精确语言码，不接受 `multi`/`auto`/逗号组合。
-5. **外文守卫**：首段出现中英之外字符，按 `zh-CN`/`en-US` 重解或拒收；上屏后再出现即停止输入。
-6. **送字准入是三态**，不是二值门：`Editable` 送、`Unknown` 送、只读 `ReadOnly` 进缓存。
-   别退回「UIA 判不了就整段缓存」。
-7. **UI 线程不做 UIA**：判定必须走 `ClassifySafe`（工作线程 + 熔断），否则 Chromium provider 会让调用挂死。
-8. **焦点判定要重试**：UIA 的无障碍焦点滞后一两帧，同一对 (窗口, 焦点) 最多重试 3 次再锁定。
+| 参数 | 覆盖 / `work/` 结果文件 |
+|---|---|
+| `--self-test` | 界面、送字规则、形变、音效；`microphone-self-test.txt` |
+| `--hotkey-test` | 真实快捷键拦截，不录音、不操作剪贴板；`microphone-hotkey-test.txt` |
+| `--hotkey-cycle-test` | 开始、暂停、重开、Esc；短暂采音但不向其他软件送字；`microphone-hotkey-cycle-test.txt` |
+| `--focus-test` / `--idle-focus-test` | 真实窗口焦点、送字和空闲形变；`microphone-focus-test.txt` / `microphone-idle-shape-test.txt` |
+| `--capture-test` | 默认麦克风三次重开与尾缓冲；`VoxFix Desktop-capture-test.txt` |
+| `--smoke-test` | 真实模型启动与缓存换轮；`microphone-ui-test.txt` / `microphone-round-reset-test.txt` |
+| `--stream-test` / `--memory-test` | 真实模型、专用输入框送字与缓存兜底；`VoxFix Desktop-stream-test.txt` / `microphone-memory-test.txt` |
+| `--target-probe [进程名]` | 只读诊断，不抢前台；`target-probe.txt`。仅明确要求时才加会送字的 `--type` |
 
-## 环境坑（本机实测，别重复踩）
+原生测试在真实交互桌面**串行运行**；同时检查退出码为 0、结果文件更新时间属于本次运行且内容为 PASS。
+旧 `VoxFix Desktop-test-failure.txt` 或旧 PASS 均不能代表本轮结果。真实键鼠操作会干扰焦点和保护机制，
+尤其 `--memory-test` 会移动鼠标；受干扰失败应单独复测，不能直接判成产品回归。
+完成构建和验证后可用 `--background` 恢复后台待命，不自动录音。
 
-- Bash 工具里 `csc.exe` / `Add-Type` 被拦；`powershell -File build.ps1` 可以。
-- 对 Chromium（`Chrome_WidgetWin_*`）调 UIA `FindAll` / 读 `FocusedElement`，在独立进程里可能**永不返回**
-  （同样的查询在 PowerShell 里 6ms）。只能靠 300ms 熔断 + `stalledWindows` 表绕开。
-- 模型权重、`runtime/` 二进制、`work/` 实验数据、`bin/`、`.venv/` 都不入库，`.gitignore` 已覆盖。
-  评测资产在仓库外 `D:/VoxFixEval/`。
-- HuggingFace 直连不通，`ModelScope` 是唯一高速源。
-- `.tmp/` 已清空（原本 3.1GB 的 sherpa 源码构建、pip 构建工具、`hw-tokenizer`、ffmpeg 二进制）。
-  历史探针 `recognition_probe.py` / `segment_probe.py` / `qwen_prefix_probe.py` / `video_asr_probe.py`
-  依赖 `.tmp/video-tools` 的 ffmpeg，`sherpa_context_probe.py` 依赖 `.tmp/hw-tokenizer`，重跑前要重新装。
-  `bin/` 里也不再保留 before-fix 备份 exe，需要回滚就用 git。
+## 行为契约
+
+1. 已上屏文字只追加，永不回改、回删。
+2. `punctuation_only()` 同时保护词元及原有标点，标点模型只能添加；验证失败返回原文。
+3. ITN 关闭，否则金额可能被错误改写；不得按评测词句硬编码替换。
+4. SenseVoice 使用 `language='auto'`，不全局锁中英；锁中文会损坏英文整句，锁英文可能使中文全空。
+5. 草稿中的中英以外字符不展示；定稿出现则拒绝并报错，保留先前定稿供恢复。不删除外文字符掩盖错误，不承诺自动重解。
+6. 送字准入三态：`Editable` 和 `Unknown` 送字，明确的 `ReadOnly` 进缓存。Chromium 等优先读取 MSAA 实际焦点，不能仅凭窗口外壳决定只读。
+7. UI 线程不做 UIA/MSAA，生产判定走 `ClassifySafe`：工作线程 + 300ms 熔断 + `stalledWindows`。
+8. 无障碍焦点可能滞后，同一窗口/焦点组合最多重试 3 次；粗粒度宿主继续复查内部焦点。
+9. 成功开始新轮才清旧缓存；停止、收起、启动失败保留，退出清空。离框音频只入缓存，回框只送新话。
+10. Win+H 开始/暂停，Esc 收起；不恢复浮动小字提示。UI 几何、材质和动画改动必须验证实际桌面。
+
+## 文件、数据与历史
+
+- 模型、`runtime/` 二进制、`work/` 实验数据、`bin/`、`.venv/` 不入库；`work/sensevoice-20261021/assets.json` 例外。
+- 不删除模型、语料、窗口位置、个人数据或未知来源的本地实验文件。评测资产可能位于 `D:/VoxFixEval/` 或本机 `work/p0/`。
+- 当前不使用旧 Nemotron/Qwen 探针。34 个历史脚本从工作树移除，在 Git `5209268` 中保留；按工具索引恢复到独立实验目录，勿冒充当前回归。
+- 不假定 HuggingFace 可直连；本机此前通过 ModelScope 获取权重，下载后按来源和校验值核验。
+- 保留既有未提交工作，提交前检查范围；只提交代码、文档、许可和必要界面资源，不提交凭据或私有转写数据。
 
 ## 文档
 
-- 新记录落 `docs/主题-YYYY-MM-DD.md`，文首写清版本号与日期，结论要能指到 `tools/` 脚本和 `work/` 数据。
-- 写完回 `docs/README.md` 登记，标明「现行」或「历史」；结论被推翻就改状态，别删原文。
-- 面向使用者的行为变化同步 `docs/使用说明.md` 与 `README.md`（版本号、检查命令）。
+新记录用 `docs/主题-YYYY-MM-DD.md`，文首标版本、日期、状态，结论指向脚本与结果；
+在 `docs/README.md` 登记为“现行”或“历史”。结论过时改状态，保留原始记录。
+面向使用者的行为变化同步 `README.md`、`docs/使用说明.md` 和版本号；维护规则变化同步本文件。

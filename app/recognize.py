@@ -7,7 +7,6 @@ from pathlib import Path
 import re
 import sys
 import threading
-import time
 
 import numpy as np
 
@@ -18,7 +17,6 @@ MAX_SECONDS = 180
 PREVIEW_STEP = 5600  # 350 ms; replace obsolete drafts instead of queueing them.
 MIN_PREVIEW = 8800
 BOUNDARY_PAD = 6400
-STATS = {'decode_ms': [], 'commits': 0, 'skipped': 0}
 _RANGES = ((0x0020, 0x007E), (0x2000, 0x206F), (0x3000, 0x303F),
            (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xFE30, 0xFE4F), (0xFF00, 0xFFEF))
 _SYMBOLS = frozenset('£¥©®°±µ·×÷€')
@@ -39,7 +37,11 @@ def join_text(previous, text):
 
 def punctuation_only(original, result):
     tokens = r"[A-Za-z0-9_]+(?:[.'/:+-][A-Za-z0-9_]+)*|[^\s，。！？；：、,.!?;:]"
-    return re.findall(tokens, original) == re.findall(tokens, result)
+    if re.findall(tokens, original) != re.findall(tokens, result):
+        return False
+    # Existing punctuation also carries meaning (for example the dot in .NET).
+    remaining = iter(result)
+    return all(char in remaining for char in original if not char.isspace())
 
 
 class QuietBoost:
@@ -295,7 +297,6 @@ class Recognition:
                         key, audio = self.draft
                         self.draft = None
                     self.decoding = True
-                tick = time.perf_counter()
                 text = re.sub(r'<\|[^|]*\|>', '', self.session.run(QuietBoost().process(audio)).text).strip()
                 if final and hasattr(self.session, 'punctuate'):
                     text = self.session.punctuate(text)
@@ -305,7 +306,6 @@ class Recognition:
                         if not final:
                             continue
                         raise RuntimeError('识别到中文和英文之外的文字，本次结果未自动输入')
-                    STATS['decode_ms'].append(round((time.perf_counter() - tick) * 1000, 1))
                     if self.cancelled:
                         return
                     if final:
@@ -313,7 +313,6 @@ class Recognition:
                         self.committed = join_text(previous, text)
                         self.segments.append({'route': route, 'start': start, 'end': end,
                                               'text': self.committed[len(previous):]})
-                        STATS['commits'] += 1
                     elif key == self.active_key and not self.ending:
                         self.preview = text
         except Exception as error:
