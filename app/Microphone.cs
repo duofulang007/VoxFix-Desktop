@@ -15,7 +15,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.3.0")]
+[assembly: AssemblyVersion("1.6.5.0")]
 
 static class Native
 {
@@ -36,6 +36,16 @@ static class Native
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern IntPtr FindWindow(string className, string title);
     [DllImport("user32.dll")] internal static extern bool PostMessage(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
     [DllImport("user32.dll")] internal static extern bool DestroyIcon(IntPtr icon);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern int GetClassName(IntPtr window, StringBuilder name, int length);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern int GetWindowText(IntPtr window, StringBuilder text, int length);
+    internal static string ClassOf(IntPtr window) {
+        var name = new StringBuilder(256);
+        return GetClassName(window, name, name.Capacity) > 0 ? name.ToString() : "";
+    }
+    internal static string TitleOf(IntPtr window) {
+        var text = new StringBuilder(512);
+        return GetWindowText(window, text, text.Capacity) > 0 ? text.ToString() : "";
+    }
     [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr window);
     [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr window, IntPtr dc);
     [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
@@ -305,6 +315,12 @@ sealed class Microphone : Form
     readonly System.Windows.Forms.Timer limit = new System.Windows.Forms.Timer { Interval = 180000 };
     readonly System.Windows.Forms.Timer capture = new System.Windows.Forms.Timer { Interval = 40 };
     readonly System.Windows.Forms.Timer animation = new System.Windows.Forms.Timer { Interval = 16 };
+    // Idle focus watch: the capsule reports whether text would land in a real input box
+    // even before recording starts. Cheap when the target pair has not changed.
+    readonly System.Windows.Forms.Timer focusWatch = new System.Windows.Forms.Timer { Interval = 400 };
+    IntPtr idleWindow, idleFocus;
+    int idleAttempts;
+    bool idleWatching;
     readonly SemaphoreSlim pipeline = new SemaphoreSlim(1, 1);
     readonly bool animationsEnabled = Native.AnimationsEnabled();
     Process worker;
@@ -314,7 +330,8 @@ sealed class Microphone : Form
     readonly ContextMenuStrip menu = new ContextMenuStrip();
     Action<string> copyText;
     string copiedInTest = "";
-    bool memoryTest;
+    readonly bool memoryTest;
+    readonly bool probeOnly;
     bool inputFocused;
     bool recoveryCopied;
     bool hovered, pressed;
@@ -347,7 +364,8 @@ sealed class Microphone : Form
     protected override CreateParams CreateParams { get { var p = base.CreateParams; p.ExStyle |= 0x08080080; return p; } }
     public Microphone(string path, string test) {
         root = path; smokeTest = test == "--smoke-test"; streamTest = test == "--stream-test"; Text = "VoxFix Desktop"; AccessibleName = "VoxFix Desktop 麦克风";
-        memoryTest = test == "--memory-test";
+        memoryTest = test == "--memory-test" || test == "--focus-test" || test == "--idle-focus-test";
+        probeOnly = test == "--focus-test" || test == "--idle-focus-test";
         if (memoryTest || streamTest || smokeTest) playEarcon = (name, wait) => { };
         copyText = streamTest || memoryTest ? new Action<string>(text => copiedInTest = text) : new Action<string>(Clipboard.SetText);
         menu.Items.Add("复制未上屏文字", null, (s, e) => CopyRecovery());
@@ -363,6 +381,7 @@ sealed class Microphone : Form
         tip.SetToolTip(this, "正在加载本地模型…");
         limit.Tick += async (s, e) => { limit.Stop(); await Toggle(); };
         capture.Tick += async (s, e) => await Pump();
+        focusWatch.Tick += async (s, e) => await WatchIdleFocus();
         animation.Tick += async (s, e) => {
             if (TakeLongPress(motionClock.Elapsed.TotalMilliseconds)) { await NewRecording(); return; }
             motion.Update(restarting ? "recording" : state, level, motionClock.Elapsed.TotalMilliseconds, !animationsEnabled, speechDetected);
@@ -404,10 +423,11 @@ sealed class Microphone : Form
                 await ShortClick(e.X);
             }
         };
-        Shown += async (s, e) => await StartWorker();
+        Shown += async (s, e) => { focusWatch.Start(); if (!probeOnly) await StartWorker(); };
         FormClosed += (s, e) => {
             closing = true; limit.Stop(); limit.Dispose();
             capture.Stop(); capture.Dispose();
+            focusWatch.Stop(); focusWatch.Dispose();
             if (guard != null) guard.Dispose();
             if (recorder != null) recorder.Dispose();
             EndListening(true);
@@ -468,15 +488,69 @@ sealed class Microphone : Form
     }
     void UpdateMemoryShape() {
         bool pill = MemoryPill;
-        AccessibleName = !pill ? "VoxFix Desktop 麦克风" : state == "error" ? "识别失败，左侧重试，右侧复制" : transcribing || speechDetected || state == "busy" ? "正在转写，暂不可复制" : CopyReady ? (recoveryCopied ? "已复制未上屏文字" : "复制未上屏文字") : "正在监听，等待讲话";
-        if (pill) AccessibleDescription = state == "error" ? "左侧重试 · 右侧复制 · 缓存文字保留" : "录音时点左侧结束，点右侧复制 · 长按约0.4秒清空缓存并开始新录音";
+        AccessibleName = !pill ? "VoxFix Desktop 麦克风"
+            : state == "error" ? "识别失败，左侧重试，右侧复制"
+            : recovery.Length == 0 ? "当前焦点不能直接输入，文字会先缓存"
+            : transcribing || speechDetected || state == "busy" ? "正在转写，暂不可复制"
+            : CopyReady ? (recoveryCopied ? "已复制未上屏文字" : "复制未上屏文字")
+            : "正在监听，等待讲话";
+        if (pill) AccessibleDescription = state == "error" ? "左侧重试 · 右侧复制 · 缓存文字保留"
+            : recovery.Length == 0 ? "点一下开始说话 · 焦点移回输入框会变回圆形"
+            : "录音时点左侧结束，点右侧复制 · 长按约0.4秒清空缓存并开始新录音";
         animation.Start();
     }
-    bool MemoryPill { get { return restarting ? restartPill : (delivery != null && (state == "recording" || state == "busy")) ? !inputFocused : recovery.Length > 0; } }
+    bool MemoryPill {
+        get {
+            if (restarting) return restartPill;
+            // While recording the shape reports the live delivery gate.
+            if (delivery != null && (state == "recording" || state == "busy")) return !inputFocused;
+            // Otherwise a waiting cache owns the capsule, and with nothing cached the
+            // shape still reports whether this focus can receive text right now.
+            if (recovery.Length > 0) return true;
+            return !inputFocused && (state == "idle" || state == "error");
+        }
+    }
     bool CopyReady { get { return !restarting && recovery.Length > 0 && !transcribing && !speechDetected && state != "busy" && state != "loading"; } }
     void SetInputFocus(bool focused) {
         if (inputFocused == focused) return;
-        inputFocused = focused; UpdateMemoryShape(); RefreshSurface();
+        inputFocused = focused;
+        if (state == "idle" && recovery.Length == 0)
+            tip.SetToolTip(this, focused ? "这里可以直接输入，点一下开始说话" : "这里不会直接输入，文字会先存成可复制内容");
+        UpdateMemoryShape(); RefreshSurface();
+    }
+    sealed class IdleProbe { internal IntPtr Window, Focus; internal TargetKind Kind; }
+    // Same reporting while nothing is being recorded, so the capsule shows the delivery
+    // gate at a glance. A stalled provider must not freeze the overlay either.
+    async Task WatchIdleFocus() {
+        if (closing || idleWatching) return;
+        if (state != "idle" && state != "error") return;
+        if (recovery.Length > 0) {
+            // A waiting transcript owns the capsule and stays a copy button.
+            idleWindow = idleFocus = IntPtr.Zero; idleAttempts = 0;
+            if (inputFocused) SetInputFocus(false);
+            return;
+        }
+        IntPtr window = Native.GetForegroundWindow(), own = Handle;
+        if (window == IntPtr.Zero || window == own) {
+            idleWindow = idleFocus = IntPtr.Zero; idleAttempts = 0;
+            if (inputFocused) SetInputFocus(false);
+            return;
+        }
+        IntPtr focus = Native.Focus(window);
+        bool samePair = window == idleWindow && focus == idleFocus;
+        // Accessibility focus trails a real focus move by a frame or two, so a pair is
+        // asked up to three times before its verdict is trusted and the polling stops.
+        if (samePair && idleAttempts >= 3) return;
+        idleWatching = true;
+        try {
+            var probe = Task.Run(() => new IdleProbe { Window = window, Focus = focus, Kind = Classify(window, focus, own, null) });
+            if (await Task.WhenAny(probe, Task.Delay(400)) != probe) return;
+            IdleProbe result = await probe;
+            if (closing || (state != "idle" && state != "error") || recovery.Length > 0) return;
+            idleAttempts = samePair ? idleAttempts + 1 : 1;
+            idleWindow = result.Window; idleFocus = result.Focus;
+            SetInputFocus(Deliverable(result.Kind));
+        } catch { } finally { idleWatching = false; }
     }
     bool OwnsSurface(Point point) {
         SizeF size = ShapeSize(shape.Value);
@@ -512,10 +586,13 @@ sealed class Microphone : Form
         if (state == "error" && (!MemoryPill || x < 68)) { await Toggle(); return; }
         if (state == "recording" && (!MemoryPill || x < 68)) { await EndRecording(); return; }
         if (MemoryPill) {
-            if (recovery.Length > 0) CopyRecovery();
-            else tip.Show("正在定稿，停顿后可复制；点左侧声纹可结束录音并收齐尾字", this, Width / 2, -28, 2500);
+            if (recovery.Length > 0) { CopyRecovery(); return; }
+            // An idle capsule with nothing cached is a focus hint, not a copy button.
+            if (state != "recording" && state != "busy") { await Toggle(); return; }
+            tip.Show("正在定稿，停顿后可复制；点左侧声纹可结束录音并收齐尾字", this, Width / 2, -28, 2500);
+            return;
         }
-        else await Toggle();
+        await Toggle();
     }
     void ApplyReply(Dictionary<string, object> reply) {
         if (reply.ContainsKey("level")) level = Convert.ToSingle(reply["level"]);
@@ -613,18 +690,51 @@ sealed class Microphone : Form
         StopWorker();
         Status("error", message + (recovery.Length > 0 ? " 左侧重试 · 右侧复制 · 右键退出" : " 点击重试 · 右键退出"));
     }
-    bool HasEditableTarget() { return HasEditableTarget(target, targetFocus); }
-    bool EditingGestureDown() {
-        if (Native.GetAsyncKeyState(0x01) < 0 && !OwnsSurface(Cursor.Position)) return true;
-        foreach (int key in new[] { 0x10, 0x11, 0x12, 0x5B, 0x5C })
-            if (Native.GetAsyncKeyState(key) < 0) return true;
-        return false;
+    // UIA is a positive signal, not a gate. Chromium/Electron with accessibility off
+    // (WorkBuddy, several IDEs), Flutter and XAML-island apps expose no Edit/Document
+    // node at all: their whole window tree is a single Pane. Treating that silence as
+    // "no input box" sent every sentence to the copy cache, so the tree's absence is
+    // now its own state and the text is still delivered at the caret.
+    internal enum TargetKind { ReadOnly, Unknown, Editable }
+    static bool Deliverable(TargetKind kind) { return kind == TargetKind.Editable || kind == TargetKind.Unknown; }
+    // Pure decision, kept testable. A coarse window (Chromium with accessibility off,
+    // Flutter, custom-drawn shells) answers with one placeholder node that describes the
+    // window itself - Electron composers report a read-only Document - so its verdict is
+    // discarded and the text is delivered at the caret instead of being cached.
+    static TargetKind DecideTarget(bool coarse, bool textHost, bool writable) {
+        if (coarse) return TargetKind.Unknown;
+        if (textHost) return writable ? TargetKind.Editable : TargetKind.ReadOnly;
+        return TargetKind.ReadOnly;
     }
-    bool HasEditableTarget(IntPtr window, IntPtr focus) {
-        if (window == IntPtr.Zero || window == Handle || focus == IntPtr.Zero) return false;
+    readonly Dictionary<IntPtr, bool> coarseWindows = new Dictionary<IntPtr, bool>();
+    // Chromium/Electron hosts keep accessibility off until a client asks, and then answer
+    // with a placeholder read-only Document - or stall the client outright - so their tree
+    // can never describe the caret. Flutter and custom-drawn shells behave the same way.
+    // The window class is instant and cannot stall, so it decides without touching UIA.
+    // Ordinary dialogs are never coarse: UIA reports their buttons and fields reliably.
+    static bool CoarseClass(IntPtr window) {
+        string name = Native.ClassOf(window);
+        return name.StartsWith("Chrome_WidgetWin_", StringComparison.Ordinal)
+            || name == "FLUTTER_RUNNER_WIN32_WINDOW" || name == "CEF-OSC-WIDGET"
+            || name == "TaskManagerWindow" || name == "Intermediate D3D Window";
+    }
+    // Cached per window and per recording.
+    static bool WindowIsCoarse(IntPtr window, Dictionary<IntPtr, bool> cache) {
+        bool cached;
+        if (cache != null && cache.TryGetValue(window, out cached)) return cached;
+        bool coarse = CoarseClass(window);
+        if (cache != null) cache[window] = coarse;
+        return coarse;
+    }
+    static TargetKind Classify(IntPtr window, IntPtr focus, IntPtr own, Dictionary<IntPtr, bool> cache) {
+        if (window == IntPtr.Zero || window == own) return TargetKind.ReadOnly;
+        // A coarse window cannot answer for the caret, so ask nothing further.
+        if (WindowIsCoarse(window, cache)) return TargetKind.Unknown;
+        if (focus == IntPtr.Zero) return TargetKind.ReadOnly;
         try {
             var element = System.Windows.Automation.AutomationElement.FocusedElement;
-            if (element == null || !element.Current.IsEnabled || !element.Current.IsKeyboardFocusable || !element.Current.HasKeyboardFocus) return false;
+            if (element == null) return TargetKind.ReadOnly;
+            if (!element.Current.IsEnabled || !element.Current.IsKeyboardFocusable || !element.Current.HasKeyboardFocus) return TargetKind.ReadOnly;
             // UIA can briefly return the previous application's focused element.
             var ancestor = element;
             bool belongs = false;
@@ -633,17 +743,42 @@ sealed class Microphone : Form
                 if (handle == window || (handle != IntPtr.Zero && Native.IsChild(window, handle))) { belongs = true; break; }
                 ancestor = System.Windows.Automation.TreeWalker.RawViewWalker.GetParent(ancestor);
             }
-            if (!belongs) return false;
-            object pattern;
             var type = element.Current.ControlType;
-            if (type != System.Windows.Automation.ControlType.Edit && type != System.Windows.Automation.ControlType.Document && type != System.Windows.Automation.ControlType.ComboBox) return false;
+            bool textHost = type == System.Windows.Automation.ControlType.Edit
+                || type == System.Windows.Automation.ControlType.Document
+                || type == System.Windows.Automation.ControlType.ComboBox;
+            // A foreign or hidden focus node cannot prove this window is editable.
+            if (!belongs || !textHost) return TargetKind.ReadOnly;
+            object pattern;
             if (element.TryGetCurrentPattern(System.Windows.Automation.ValuePattern.Pattern, out pattern))
-                return !((System.Windows.Automation.ValuePattern)pattern).Current.IsReadOnly;
+                return DecideTarget(false, true, !((System.Windows.Automation.ValuePattern)pattern).Current.IsReadOnly);
             if (element.TryGetCurrentPattern(System.Windows.Automation.TextPattern.Pattern, out pattern))
-                return Object.Equals(((System.Windows.Automation.TextPattern)pattern).DocumentRange.GetAttributeValue(System.Windows.Automation.TextPattern.IsReadOnlyAttribute), false);
-        } catch { }
+                return DecideTarget(false, true, Object.Equals(((System.Windows.Automation.TextPattern)pattern).DocumentRange.GetAttributeValue(System.Windows.Automation.TextPattern.IsReadOnlyAttribute), false));
+            return DecideTarget(false, true, true);
+        } catch { return TargetKind.Unknown; }
+    }
+    TargetKind ClassifyTarget(IntPtr window, IntPtr focus) { return Classify(window, focus, Handle, coarseWindows); }
+    // A stalled accessibility provider must never freeze dictation: give it one bounded
+    // chance, then stop asking that window and let the text reach the caret.
+    readonly HashSet<IntPtr> stalledWindows = new HashSet<IntPtr>();
+    async Task<TargetKind> ClassifySafe(IntPtr window, IntPtr focus) {
+        if (stalledWindows.Contains(window)) return TargetKind.Unknown;
+        var probe = Task.Run(() => ClassifyTarget(window, focus));
+        if (await Task.WhenAny(probe, Task.Delay(300)) != probe) {
+            Task ignored = probe.ContinueWith(task => { var inner = task.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+            stalledWindows.Add(window);
+            return TargetKind.Unknown;
+        }
+        return await probe;
+    }
+    bool HasEditableTarget() { return ClassifyTarget(target, targetFocus) == TargetKind.Editable; }
+    bool EditingGestureDown() {
+        if (Native.GetAsyncKeyState(0x01) < 0 && !OwnsSurface(Cursor.Position)) return true;
+        foreach (int key in new[] { 0x10, 0x11, 0x12, 0x5B, 0x5C })
+            if (Native.GetAsyncKeyState(key) < 0) return true;
         return false;
     }
+    bool HasEditableTarget(IntPtr window, IntPtr focus) { return ClassifyTarget(window, focus) == TargetKind.Editable; }
     async Task ProbeTarget(IntPtr testWindow) {
         TextDelivery session = delivery;
         if (session == null || session.Invalidated) return;
@@ -651,10 +786,10 @@ sealed class Microphone : Form
         IntPtr window = Native.GetForegroundWindow(), focus = Native.Focus(window);
         if (memoryTest && window != testWindow) return;
         try {
-            bool editable = await Task.Run(() => HasEditableTarget(window, focus));
+            var kind = await ClassifySafe(window, focus);
             if (closing || delivery != session || epoch != targetEpoch || Native.GetForegroundWindow() != window || Native.Focus(window) != focus) return;
             if (!memoryTest && state != "recording") return;
-            if (!editable) { SetInputFocus(false); Pause("当前没有可确认的输入位置，继续录音并保存未上屏文字。"); return; }
+            if (!Deliverable(kind)) { SetInputFocus(false); Pause("当前没有可确认的输入位置，继续录音并保存未上屏文字。"); return; }
             if (EditingGestureDown()) return;
             if (session.Paused.Length > 0) {
                 await pipeline.WaitAsync();
@@ -693,7 +828,7 @@ sealed class Microphone : Form
                 // Preserve the onset while UI Automation and the worker initialize.
                 recorder = new Recorder();
                 Status("busy", "正在开始录音…");
-                bool editable = !memoryTest && await Task.Run(() => HasEditableTarget());
+                bool editable = !memoryTest && Deliverable(await ClassifySafe(target, targetFocus));
                 SetInputFocus(editable);
                 await BeginStream();
                 if (!editable) Pause("没有可确认的输入框，继续识别并保存未上屏文字。");
@@ -708,6 +843,8 @@ sealed class Microphone : Form
     }
     async Task BeginStream() {
         draft = ""; speechDetected = transcribing = false; tip.Hide(this);
+        coarseWindows.Clear();
+        stalledWindows.Clear();
         recordingId = Guid.NewGuid().ToString("N"); delivery = new TextDelivery(); sentBytes = 0;
         audioRoute = appliedSegments = 0; backupRoutes.Clear();
         targetEpoch++; nextTargetProbe = 0;
@@ -960,6 +1097,43 @@ sealed class Microphone : Form
         }
         await Task.Delay(30);
     }
+    async Task<bool> WaitShape(bool pill, int milliseconds = 3000) {
+        var clock = Stopwatch.StartNew();
+        while (clock.ElapsedMilliseconds < milliseconds) {
+            await Task.Delay(50);
+            if (MemoryPill == pill && shape.Settled && Math.Abs(shape.Value - (pill ? 1 : 0)) < .01) return true;
+        }
+        return false;
+    }
+    // Idle morph: moving the caret in and out of a real input box must animate the
+    // circle into the capsule and back, without any recording in progress.
+    async Task RunIdleShapeTest() {
+        using (var editor = new Form { Text = "VoxFix idle shape test", Width = 320, Height = 160, TopMost = true })
+        using (var other = new Form { Text = "VoxFix idle no input test", Width = 220, Height = 120, TopMost = true })
+        using (var field = new TextBox { Dock = DockStyle.Fill })
+        using (var button = new Button { Text = "No input here", Dock = DockStyle.Fill }) {
+            editor.Controls.Add(field); other.Controls.Add(button);
+            other.Show(); editor.Show();
+            Action<Form, Control> focus = (form, control) => {
+                uint foreground = Native.GetWindowThreadProcessId(Native.GetForegroundWindow(), IntPtr.Zero), current = Native.GetCurrentThreadId();
+                bool attached = foreground != current && Native.AttachThreadInput(current, foreground, true);
+                try { Native.SetForegroundWindow(form.Handle); form.Activate(); control.Focus(); }
+                finally { if (attached) Native.AttachThreadInput(current, foreground, false); }
+            };
+            delivery = null; recovery = draft = ""; idleWindow = idleFocus = IntPtr.Zero; idleAttempts = 0;
+            Status("idle", "空闲形变测试"); focusWatch.Start();
+            focus(editor, field);
+            if (!await WaitShape(false)) throw new Exception("Idle circle did not appear for a text field");
+            focus(other, button);
+            if (!await WaitShape(true)) throw new Exception("Idle capsule did not appear outside a text field");
+            focus(editor, field);
+            if (!await WaitShape(false)) throw new Exception("Idle shape did not return to the circle");
+            recovery = "等待复制的文字"; UpdateMemoryShape();
+            focus(other, button);
+            await Task.Delay(600);
+            if (!MemoryPill || !AccessibleName.Contains("复制")) throw new Exception("Cached text must pin the copy capsule regardless of focus");
+        }
+    }
     async Task RunFocusRecoveryTest() {
         using (var editor = new Form { Text = "VoxFix focus recovery test", Width = 320, Height = 160, TopMost = true })
         using (var other = new Form { Text = "VoxFix no input test", Width = 200, Height = 100, TopMost = true })
@@ -1121,7 +1295,9 @@ sealed class Microphone : Form
         DrawShape(g, shape.Value, restarting ? "recording" : state, recoveryCopied, copyFeedback, hoverFeedback, pressFeedback,
             motion.Activity, motion.Voice, motion.Level, animationsEnabled ? motionClock.Elapsed.TotalMilliseconds : 0,
             restarting || (state == "recording" && !inputFocused && recovery.Length == 0),
-            !restarting && (transcribing || speechDetected || state == "busy"), readyFeedback);
+            !restarting && (transcribing || speechDetected || state == "busy"), readyFeedback,
+            // A capsule with nothing to copy yet: idle, focus outside any input.
+            MemoryPill && recovery.Length == 0 && !transcribing && !restarting);
     }
     internal static SizeF ShapeSize(double shape) {
         double ratio = 1 + (106.0 / 42 - 1) * shape;
@@ -1129,7 +1305,7 @@ sealed class Microphone : Form
         return ratio >= 1 ? new SizeF((float)(minor * ratio), (float)minor) : new SizeF((float)minor, (float)(minor / ratio));
     }
     internal static void DrawShape(Graphics g, double shape, string state, bool copied, float success, float hover, float press,
-        float activity = 0, float voice = 0, float level = 0, double now = 0, bool pending = false, bool transcribing = false, float ready = 1) {
+        float activity = 0, float voice = 0, float level = 0, double now = 0, bool pending = false, bool transcribing = false, float ready = 1, bool stashed = false) {
         g.Clear(Color.Transparent); g.SmoothingMode = SmoothingMode.AntiAlias;
         // A capsule keeps the circle's area, including spring overshoot and reversal.
         SizeF size = ShapeSize(shape);
@@ -1155,7 +1331,7 @@ sealed class Microphone : Form
             using (var rim = new Pen(Color.FromArgb((int)((45 + hover * 20) * blend), 235, 238, 237), 1)) g.DrawPath(rim, outline);
             var saved = g.Save(); g.SetClip(outline);
             if (blend > 0) using (var pill = new Bitmap(106, 42)) using (var ink = Graphics.FromImage(pill)) {
-                DrawMemory(ink, copied, success, hover, press, false, activity, level, now, state == "busy" || state == "loading", pending, voice, transcribing, ready, false);
+                DrawMemory(ink, copied, success, hover, press, false, activity, level, now, state == "busy" || state == "loading", pending, voice, transcribing, ready, false, stashed);
                 DrawFade(g, pill, 11, 27, blend);
             }
             var motif = g.Save();
@@ -1178,7 +1354,7 @@ sealed class Microphone : Form
             g.DrawImage(image, new Rectangle(x, y, image.Width, image.Height), 0, 0, image.Width, image.Height, GraphicsUnit.Pixel, attributes);
         }
     }
-    internal static void DrawMemory(Graphics g, bool copied, float success = -1, float hover = 0, float press = 0, bool backdrop = true, float activity = 0, float level = 0, double now = 0, bool processing = false, bool pending = false, float voice = 0, bool transcribing = false, float ready = 1, bool listeningMotif = true) {
+    internal static void DrawMemory(Graphics g, bool copied, float success = -1, float hover = 0, float press = 0, bool backdrop = true, float activity = 0, float level = 0, double now = 0, bool processing = false, bool pending = false, float voice = 0, bool transcribing = false, float ready = 1, bool listeningMotif = true, bool stashed = false) {
         if (success < 0) success = copied ? 1 : 0;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         if (backdrop) {
@@ -1223,6 +1399,10 @@ sealed class Microphone : Form
                     float travel = now == 0 ? .5f : (float)((now % 1000) / 1000);
                     using (var progress = new Pen(Color.FromArgb(150, 240, 243, 241), 2)) { progress.StartCap = progress.EndCap = LineCap.Round; g.DrawLine(progress, 59 + 20 * travel, 33, 69 + 20 * travel, 33); }
                 }
+            } else if (stashed) {
+                // Nothing cached and no deliverable focus: say where the words will go.
+                using (var ink = new SolidBrush(Color.FromArgb(150, 239, 241, 240))) g.DrawString("缓存", font, ink, new RectangleF(51, 2, 48, 35), format);
+                using (var line = new Pen(Color.FromArgb(45, 240, 243, 241), 2)) { line.StartCap = line.EndCap = LineCap.Round; g.DrawLine(line, 62, 34, 86, 34); }
             } else {
                 int alpha = (int)(150 + 105 * ready);
                 using (var before = new SolidBrush(Color.FromArgb((int)(alpha * leaving), 239, 241, 240))) g.DrawString("复制", font, before, new RectangleF(51, 3 - 3 * (1 - leaving), 47, 35), format);
@@ -1292,6 +1472,65 @@ sealed class Microphone : Form
         g.Restore(saved);
         g.Restore(glyph);
     }
+    // Diagnostic: report how a target window is classified without dictating.
+    // --target-probe [process] [--type text]
+    static int RunTargetProbe(string[] args, string root) {
+        IntPtr previous = Native.GetForegroundWindow(), window = previous;
+        string filter = args.Length > 1 && !args[1].StartsWith("--") ? args[1] : "";
+        string typed = "";
+        for (int i = 1; i < args.Length - 1; i++) if (args[i] == "--type") typed = args[i + 1];
+        if (filter.Length > 0) {
+            foreach (var process in Process.GetProcessesByName(filter)) {
+                if (process.MainWindowHandle != IntPtr.Zero) { window = process.MainWindowHandle; break; }
+            }
+        }
+        Thread.Sleep(120);
+        IntPtr foreground = Native.GetForegroundWindow();
+        IntPtr focus = Native.Focus(window);
+        var cache = new Dictionary<IntPtr, bool>();
+        bool coarse = WindowIsCoarse(window, cache);
+        // Reading the focused element of a coarse host can stall indefinitely, and it
+        // describes the window rather than the caret anyway.
+        string elementInfo = "skipped (coarse host)", patternInfo = "";
+        if (!coarse) {
+            var element = System.Windows.Automation.AutomationElement.FocusedElement;
+            if (element != null) {
+                try {
+                    var current = element.Current;
+                    elementInfo = current.ControlType.ProgrammaticName.Replace("ControlType.", "") + "|class=" + current.ClassName
+                        + "|hwnd=0x" + ((long)current.NativeWindowHandle).ToString("X") + "|focus=" + current.HasKeyboardFocus
+                        + "|focusable=" + current.IsKeyboardFocusable + "|enabled=" + current.IsEnabled
+                        + "|name=" + (current.Name.Length > 24 ? current.Name.Substring(0, 24) : current.Name);
+                    object value;
+                    if (element.TryGetCurrentPattern(System.Windows.Automation.ValuePattern.Pattern, out value))
+                        patternInfo += "value(readOnly=" + ((System.Windows.Automation.ValuePattern)value).Current.IsReadOnly + ") ";
+                    if (element.TryGetCurrentPattern(System.Windows.Automation.TextPattern.Pattern, out value)) {
+                        object readOnly = ((System.Windows.Automation.TextPattern)value).DocumentRange
+                            .GetAttributeValue(System.Windows.Automation.TextPattern.IsReadOnlyAttribute);
+                        patternInfo += "text(readOnly=" + readOnly + ") ";
+                    }
+                    if (patternInfo.Length == 0) patternInfo = "no value/text pattern";
+                } catch { elementInfo = "unreadable"; }
+            }
+        }
+        var lines = new List<string>();
+        lines.Add("time=" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+        lines.Add("window=0x" + ((long)window).ToString("X") + " class=" + Native.ClassOf(window) + " title=" + Native.TitleOf(window));
+        lines.Add("foreground=0x" + ((long)foreground).ToString("X") + " active=" + (foreground == window) + " focus=0x" + ((long)focus).ToString("X"));
+        lines.Add("uia: coarse=" + coarse + " focused=" + elementInfo + " patterns=" + patternInfo);
+        var kind = Classify(window, focus, IntPtr.Zero, cache);
+        lines.Add("kind=" + kind + " deliver=" + Deliverable(kind) + (foreground == window ? "" : " (projected: window is not active, silence is what matters)"));
+        if (typed.Length > 0 && foreground == window) {
+            var inputs = Native.TextInputs(typed);
+            uint sent = Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Native.Input)));
+            lines.Add("typed='" + typed + "' inputs=" + inputs.Length + " sent=" + sent
+                + " foregroundKept=" + (Native.GetForegroundWindow() == window));
+        } else if (typed.Length > 0) lines.Add("typed=skipped (window is not active)");
+        lines.Add("");
+        Directory.CreateDirectory(Path.Combine(root, "work"));
+        File.AppendAllText(Path.Combine(root, "work", "target-probe.txt"), String.Join("\r\n", lines.ToArray()) + "\r\n");
+        return 0;
+    }
     [STAThread] static void Main(string[] args) {
         Native.SetProcessDPIAware();
         string root = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
@@ -1324,8 +1563,69 @@ sealed class Microphone : Form
             }
             return;
         }
+        if (args.Length > 0 && args[0] == "--target-probe") { RunTargetProbe(args, root); return; }
+        if (args.Length > 0 && args[0] == "--idle-focus-test") {
+            Directory.CreateDirectory(Path.Combine(root, "work"));
+            using (var shell = new Microphone(Path.Combine(root, ".tmp", Guid.NewGuid().ToString("N")), "--idle-focus-test")) {
+                shell.Show();
+                var context = new ApplicationContext();
+                var timer = new System.Windows.Forms.Timer { Interval = 40 };
+                timer.Tick += async (s, e) => {
+                    timer.Stop();
+                    try {
+                        await shell.RunIdleShapeTest();
+                        File.WriteAllText(Path.Combine(root, "work", "microphone-idle-shape-test.txt"),
+                            "PASS: idle circle inside a text field / idle capsule outside it / animated morph both ways / cached text pins the copy capsule");
+                    } catch (Exception error) {
+                        File.WriteAllText(Path.Combine(root, "work", "VoxFix Desktop-test-failure.txt"), error.ToString());
+                        Environment.ExitCode = 1;
+                    } finally { timer.Dispose(); context.ExitThread(); }
+                };
+                timer.Start();
+                Application.Run(context);
+            }
+            return;
+        }
+        // Focus gate only: no microphone, no model. Used to prove the delivery decision.
+        if (args.Length > 0 && args[0] == "--focus-test") {
+            Directory.CreateDirectory(Path.Combine(root, "work"));
+            // The form installs a WinForms synchronization context, so the async test needs
+            // a running message loop to resume on; blocking on the thread would deadlock.
+            using (var shell = new Microphone(Path.Combine(root, ".tmp", Guid.NewGuid().ToString("N")), "--focus-test")) {
+                // Showing the overlay is what lets this process take the foreground back
+                // for its own test windows; the window itself never activates.
+                shell.Show();
+                var context = new ApplicationContext();
+                var timer = new System.Windows.Forms.Timer { Interval = 40 };
+                timer.Tick += async (s, e) => {
+                    timer.Stop();
+                    try {
+                        await shell.RunFocusRecoveryTest();
+                        File.WriteAllText(Path.Combine(root, "work", "microphone-focus-test.txt"),
+                            "PASS: stale foreign-window UIA rejected / editable field resumes and injects / non-input window enters fallback / focus return resumes only new text / new field adopted / read-only field stays in fallback / recovery resumes without replay / late old audio stays in fallback");
+                    } catch (Exception error) {
+                        File.WriteAllText(Path.Combine(root, "work", "VoxFix Desktop-test-failure.txt"), error.ToString());
+                        Environment.ExitCode = 1;
+                    } finally { timer.Dispose(); context.ExitThread(); }
+                };
+                timer.Start();
+                Application.Run(context);
+            }
+            return;
+        }
         if (args.Length > 0 && args[0] == "--self-test") {
             if (Marshal.SizeOf(typeof(Native.Input)) != (IntPtr.Size == 8 ? 40 : 28)) throw new Exception("INPUT layout");
+            // A coarse window (Electron/Flutter/custom-drawn) must stay deliverable,
+            // while a real read-only field and a visible non-text control must not.
+            if (DecideTarget(true, false, false) != TargetKind.Unknown || !Deliverable(TargetKind.Unknown))
+                throw new Exception("Coarse window must stay deliverable");
+            // Electron answers with a read-only whole-document placeholder; it is still deliverable.
+            if (DecideTarget(true, true, false) != TargetKind.Unknown)
+                throw new Exception("Placeholder read-only document must not veto a coarse window");
+            if (Deliverable(DecideTarget(false, false, false)) || Deliverable(DecideTarget(false, true, false)))
+                throw new Exception("Visible non-text or read-only targets must stay in fallback");
+            if (DecideTarget(false, true, true) != TargetKind.Editable || !Deliverable(TargetKind.Editable))
+                throw new Exception("Writable text host must deliver");
             var inputs = Native.TextInputs("你好A😀");
             if (inputs.Length != 10 || inputs[0].data.keyboard.scan != '你' || inputs[1].data.keyboard.flags != 6) throw new Exception("Unicode input");
             Directory.CreateDirectory(Path.Combine(root, "work"));
@@ -1426,9 +1726,16 @@ sealed class Microphone : Form
                 }
                 bitmap.Save(Path.Combine(root, "work", "listening-silence-and-speech.png"));
             }
+            using (var bitmap = new Bitmap(128 * 2, 96)) using (var ink = Graphics.FromImage(bitmap)) {
+                // Idle: circle inside a text field, capsule (nothing cached yet) outside it.
+                for (int i = 0; i < 2; i++) using (var cell = new Bitmap(128, 96)) using (var layer = Graphics.FromImage(cell)) {
+                    DrawShape(layer, i, "idle", false, 0, 0, 0, 0, 0, 0, 0, false, false, i == 1 ? 0 : 1, i == 1);
+                    ink.DrawImageUnscaled(cell, i * 128, 0);
+                }
+                bitmap.Save(Path.Combine(root, "work", "idle-focus-states.png"));
+            }
             using (var shell = new Microphone(root, "--stream-test")) {
-                shell.state = "recording"; shell.delivery = new TextDelivery { Paused = "无输入焦点" };
-                shell.ApplyReply(new Dictionary<string, object> { { "text", "" }, { "preview", "未定稿的话" } });
+                shell.state = "recording"; shell.delivery = new TextDelivery { Paused = "无输入焦点" };                shell.ApplyReply(new Dictionary<string, object> { { "text", "" }, { "preview", "未定稿的话" } });
                 if (!shell.MemoryPill || shell.recovery.Length != 0 || shell.copiedInTest.Length != 0) throw new Exception("Fallback draft must morph without exposing draft to clipboard");
                 shell.ApplyReply(new Dictionary<string, object> { { "text", "已定稿的话" }, { "preview", "" } });
                 if (!shell.MemoryPill || shell.recovery != "已定稿的话") throw new Exception("Final fallback did not retain copy pill");
@@ -1454,6 +1761,21 @@ sealed class Microphone : Form
                     }
                 }
                 bitmap.Save(Path.Combine(root, "work", "focus-mode-states.png"));
+            }
+            using (var shell = new Microphone(root, "--stream-test")) {
+                // Idle shape must report the delivery gate too, not only while recording.
+                shell.state = "idle"; shell.delivery = null; shell.recovery = "";
+                shell.SetInputFocus(true);
+                if (shell.MemoryPill) throw new Exception("Idle focus inside an input box must stay a circle");
+                shell.SetInputFocus(false);
+                if (!shell.MemoryPill) throw new Exception("Idle focus outside an input box must morph to a capsule");
+                shell.recovery = "等待复制的文字";
+                shell.SetInputFocus(true);
+                if (!shell.MemoryPill) throw new Exception("A waiting transcript must keep the copy capsule");
+                if (!shell.AccessibleName.Contains("复制")) throw new Exception("Capsule with cached text must stay a copy control");
+                shell.recovery = "";
+                shell.SetInputFocus(false);
+                if (shell.AccessibleName.Contains("复制")) throw new Exception("Idle capsule without cache must not announce copying");
             }
             var morph = new ShapeMotion();
             double circleArea = 0;
@@ -1620,7 +1942,7 @@ sealed class Microphone : Form
             delivery.Sent("C"); delivery.Paused = "再次离开"; delivery.Accept("ABCD");
             if (delivery.TakePending() != "D" || delivery.TakePending() != "" || delivery.Delivered != "AC" || delivery.Accounted != "ABCD")
                 throw new Exception("Interleaved delivery/fallback ledger duplicated or lost text");
-            File.WriteAllText(Path.Combine(root, "work", "microphone-self-test.txt"), "PASS: x64 INPUT / Unicode / append-only text / English spaces / duplicate and revision guards / audio levels / Windows dictation earcon resources / quiet microphone / fine five-bar waveform in circle and capsule / speech hold / silence return / interruption / reduced motion / state rendering / jelly spring / long press restart guard / direct copy pill without dot / manual memory copy (test sink) / retain across sessions / append only undelivered text / focus changes keep recording / clipboard busy and retry; input devices=" + Recorder.waveInGetNumDevs());
+            File.WriteAllText(Path.Combine(root, "work", "microphone-self-test.txt"), "PASS: x64 INPUT / Unicode / coarse-host delivery / read-only and non-text veto / idle shape follows focus / append-only text / English spaces / duplicate and revision guards / audio levels / Windows dictation earcon resources / quiet microphone / fine five-bar waveform in circle and capsule / speech hold / silence return / interruption / reduced motion / state rendering / jelly spring / long press restart guard / direct copy pill without dot / manual memory copy (test sink) / retain across sessions / append only undelivered text / focus changes keep recording / clipboard busy and retry; input devices=" + Recorder.waveInGetNumDevs());
             return;
         }
         bool created;
