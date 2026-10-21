@@ -61,6 +61,10 @@ Get-Process | Where-Object { $_.ProcessName -like 'VoxFix Desktop*' } | Stop-Pro
 - 模型权重、`runtime/` 二进制、`work/` 实验数据、`bin/`、`.venv/` 都不入库，`.gitignore` 已覆盖。
   评测资产在仓库外 `D:/VoxFixEval/`。
 - HuggingFace 直连不通，`ModelScope` 是唯一高速源。
+- `.tmp/` 已清空（原本 3.1GB 的 sherpa 源码构建、pip 构建工具、`hw-tokenizer`、ffmpeg 二进制）。
+  历史探针 `recognition_probe.py` / `segment_probe.py` / `qwen_prefix_probe.py` / `video_asr_probe.py`
+  依赖 `.tmp/video-tools` 的 ffmpeg，`sherpa_context_probe.py` 依赖 `.tmp/hw-tokenizer`，重跑前要重新装。
+  `bin/` 里也不再保留 before-fix 备份 exe，需要回滚就用 git。
 
 ## 文档
 
