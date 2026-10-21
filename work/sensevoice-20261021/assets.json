@@ -1,0 +1,26 @@
+{
+  "runtime": "sherpa-onnx 1.13.8 Windows CPython 3.13 CPU",
+  "runtimeSource": "https://github.com/k2-fsa/sherpa-onnx/tree/v1.13.8",
+  "assets": [
+    {
+      "path": "models\\sensevoice\\model.int8.onnx",
+      "bytes": 239233841,
+      "sha256": "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51"
+    },
+    {
+      "path": "models\\sensevoice\\tokens.txt",
+      "bytes": 315894,
+      "sha256": "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc"
+    },
+    {
+      "path": "models\\vad\\silero_vad.onnx",
+      "bytes": 643854,
+      "sha256": "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
+    },
+    {
+      "path": "models\\punctuation\\model.int8.onnx",
+      "bytes": 75519198,
+      "sha256": "65a3fb9f5ad7bfb96bf69e0dc4481df97f6ee60513c1d94ce981ba6effd524b1"
+    }
+  ]
+}

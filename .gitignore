@@ -1,0 +1,36 @@
+# Local environments, generated files and personal experiment data
+/.venv/
+/.tmp/
+/.workbuddy/
+/.agents/
+/.codex/
+/.aws/
+/bin/
+/downloads/
+*.lnk
+__pycache__/
+*.py[cod]
+.env
+.env.*
+*.log
+
+# Retain only the production model metadata and vocabulary
+/models/*
+!/models/sensevoice/
+!/models/vad/
+!/models/punctuation/
+*.onnx
+*.onnx.data
+
+# Retain runtime provenance, not vendored binaries
+/runtime/*
+!/runtime/sherpa-onnx-1.13.8/
+/runtime/sherpa-onnx-1.13.8/*
+!/runtime/sherpa-onnx-1.13.8/LICENSE
+!/runtime/sherpa-onnx-1.13.8/SOURCE.md
+
+# Keep the production asset checksums
+/work/*
+!/work/sensevoice-20261021/
+/work/sensevoice-20261021/*
+!/work/sensevoice-20261021/assets.json
