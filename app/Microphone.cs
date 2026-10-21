@@ -15,7 +15,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.0.0")]
+[assembly: AssemblyVersion("1.6.3.0")]
 
 static class Native
 {
@@ -28,6 +28,8 @@ static class Native
     [DllImport("user32.dll")] internal static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] internal static extern bool AttachThreadInput(uint first, uint second, bool attach);
     [DllImport("user32.dll")] internal static extern short GetAsyncKeyState(int key);
+    [DllImport("user32.dll")] internal static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] internal static extern IntPtr WindowFromPoint(Point point);
     [DllImport("kernel32.dll")] internal static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint thread);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetUserObjectInformation(IntPtr handle, int index, StringBuilder name, int length, out int needed);
@@ -335,6 +337,8 @@ sealed class Microphone : Form
     bool listening;
     float level;
     bool speechDetected, transcribing;
+    bool restarting, restartPill;
+    Action<string, bool> playEarcon = Earcon;
     float readyFeedback;
     readonly DictationMotion motion = new DictationMotion();
     readonly Stopwatch motionClock = Stopwatch.StartNew();
@@ -344,6 +348,7 @@ sealed class Microphone : Form
     public Microphone(string path, string test) {
         root = path; smokeTest = test == "--smoke-test"; streamTest = test == "--stream-test"; Text = "VoxFix Desktop"; AccessibleName = "VoxFix Desktop 麦克风";
         memoryTest = test == "--memory-test";
+        if (memoryTest || streamTest || smokeTest) playEarcon = (name, wait) => { };
         copyText = streamTest || memoryTest ? new Action<string>(text => copiedInTest = text) : new Action<string>(Clipboard.SetText);
         menu.Items.Add("复制未上屏文字", null, (s, e) => CopyRecovery());
         menu.Items.Add("开始录音", null, async (s, e) => { if (state == "recording") await EndRecording(); else await Toggle(); });
@@ -360,7 +365,7 @@ sealed class Microphone : Form
         capture.Tick += async (s, e) => await Pump();
         animation.Tick += async (s, e) => {
             if (TakeLongPress(motionClock.Elapsed.TotalMilliseconds)) { await NewRecording(); return; }
-            motion.Update(state, level, motionClock.Elapsed.TotalMilliseconds, !animationsEnabled, speechDetected);
+            motion.Update(restarting ? "recording" : state, level, motionClock.Elapsed.TotalMilliseconds, !animationsEnabled, speechDetected);
             shape.Update(MemoryPill, motionClock.Elapsed.TotalMilliseconds, !animationsEnabled);
             copyFeedback = Feedback(copyFeedback, recoveryCopied ? 1 : 0);
             hoverFeedback = Feedback(hoverFeedback, hovered ? 1 : 0);
@@ -374,7 +379,7 @@ sealed class Microphone : Form
             RefreshSurface();
         };
         MouseEnter += (s, e) => { hovered = true; animation.Start(); };
-        MouseLeave += (s, e) => { hovered = false; pressed = false; animation.Start(); };
+        MouseLeave += (s, e) => { hovered = false; if (!Capture) pressed = false; animation.Start(); };
         MouseCaptureChanged += (s, e) => { if (!Capture) { pressed = false; animation.Start(); } };
         MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) { down = Cursor.Position; origin = Location; dragged = false; pressed = true; heldTriggered = false; pressedAt = motionClock.Elapsed.TotalMilliseconds; Capture = true; animation.Start(); } };
         MouseMove += (s, e) => {
@@ -427,7 +432,7 @@ sealed class Microphone : Form
         UpdateMemoryShape();
         if (value != "recording") { level = 0; speechDetected = false; }
         if (value == "idle" || value == "error") transcribing = false;
-        motion.Update(state, level, motionClock.Elapsed.TotalMilliseconds, !animationsEnabled, speechDetected);
+        motion.Update(restarting ? "recording" : state, level, motionClock.Elapsed.TotalMilliseconds, !animationsEnabled, speechDetected);
         animation.Start();
     }
     float Feedback(float value, float targetValue) {
@@ -440,7 +445,7 @@ sealed class Microphone : Form
         try {
             copyText(recovery);
             recoveryCopied = true;
-            tip.SetToolTip(this, "已复制 · 录音时点左侧声纹结束，点右侧重新复制 · 长按清空并开始新录音");
+            tip.SetToolTip(this, state == "error" ? "已复制 · 左侧重试 · 右侧重新复制" : "已复制 · 录音时点左侧声纹结束，点右侧重新复制 · 长按清空并开始新录音");
         } catch { tip.SetToolTip(this, "剪贴板暂时不可用，文字仍在图标里，点击重试。"); }
         UpdateMemoryShape();
         animation.Start();
@@ -463,12 +468,12 @@ sealed class Microphone : Form
     }
     void UpdateMemoryShape() {
         bool pill = MemoryPill;
-        AccessibleName = !pill ? "VoxFix Desktop 麦克风" : transcribing || speechDetected || state == "busy" ? "正在转写，暂不可复制" : CopyReady ? (recoveryCopied ? "已复制未上屏文字" : "复制未上屏文字") : "正在监听，等待讲话";
-        if (pill) AccessibleDescription = "录音时点左侧结束，点右侧复制 · 长按约0.4秒清空缓存并开始新录音";
+        AccessibleName = !pill ? "VoxFix Desktop 麦克风" : state == "error" ? "识别失败，左侧重试，右侧复制" : transcribing || speechDetected || state == "busy" ? "正在转写，暂不可复制" : CopyReady ? (recoveryCopied ? "已复制未上屏文字" : "复制未上屏文字") : "正在监听，等待讲话";
+        if (pill) AccessibleDescription = state == "error" ? "左侧重试 · 右侧复制 · 缓存文字保留" : "录音时点左侧结束，点右侧复制 · 长按约0.4秒清空缓存并开始新录音";
         animation.Start();
     }
-    bool MemoryPill { get { return (delivery != null && (state == "recording" || state == "busy")) ? !inputFocused : recovery.Length > 0; } }
-    bool CopyReady { get { return recovery.Length > 0 && !transcribing && !speechDetected && state != "busy" && state != "loading"; } }
+    bool MemoryPill { get { return restarting ? restartPill : (delivery != null && (state == "recording" || state == "busy")) ? !inputFocused : recovery.Length > 0; } }
+    bool CopyReady { get { return !restarting && recovery.Length > 0 && !transcribing && !speechDetected && state != "busy" && state != "loading"; } }
     void SetInputFocus(bool focused) {
         if (inputFocused == focused) return;
         inputFocused = focused; UpdateMemoryShape(); RefreshSurface();
@@ -481,20 +486,30 @@ sealed class Microphone : Form
         return dx * dx + dy * dy <= diameter * diameter / 4;
     }
     bool TakeLongPress(double now) {
-        if (!pressed || dragged || heldTriggered || !MemoryPill || (state != "idle" && state != "recording") || now - pressedAt < 400) return false;
+        if (!pressed || dragged || heldTriggered || !MemoryPill || (state != "idle" && state != "recording" && state != "error") || now - pressedAt < 400) return false;
         heldTriggered = true;
         return true;
     }
     async Task NewRecording() {
-        if (state == "recording") await EndRecording();
-        if (state == "idle") {
-            recovery = draft = ""; recoveryCopied = false; copyFeedback = 0;
-            UpdateMemoryShape(); RefreshSurface();
-            await Toggle();
+        if (restarting) return;
+        restartPill = MemoryPill; restarting = true;
+        tip.Hide(this); tip.Active = false;
+        try {
+            if (state == "error") await StartWorker(false);
+            if (state == "recording") await EndRecording(true);
+            if (state == "idle") {
+                recovery = draft = ""; recoveryCopied = false;
+                UpdateMemoryShape(); RefreshSurface();
+                await Toggle();
+            }
+        } finally {
+            restarting = false;
+            if (!closing) { tip.Active = true; UpdateMemoryShape(); RefreshSurface(); }
         }
     }
     async Task ShortClick(int x) {
         if (heldTriggered) return;
+        if (state == "error" && (!MemoryPill || x < 68)) { await Toggle(); return; }
         if (state == "recording" && (!MemoryPill || x < 68)) { await EndRecording(); return; }
         if (MemoryPill) {
             if (recovery.Length > 0) CopyRecovery();
@@ -525,12 +540,12 @@ sealed class Microphone : Form
         string path = EarconPath(name);
         if (File.Exists(path)) Native.PlaySound(path, IntPtr.Zero, wait ? 0x20002u : 0x20003u);
     }
-    void EndListening(bool cancelled) {
+    void EndListening(bool cancelled, bool silent = false) {
         if (!listening) return;
         listening = false;
-        Earcon(cancelled ? "BasicCancelledEarcon" : "BasicDoneListeningEarcon", closing);
+        if (!silent) playEarcon(cancelled ? "BasicCancelledEarcon" : "BasicDoneListeningEarcon", closing);
     }
-    async Task StartWorker() {
+    async Task StartWorker(bool runChecks = true) {
         try {
             Status("loading", "正在加载 SenseVoiceSmall 本地模型…");
             StopWorker();
@@ -544,9 +559,9 @@ sealed class Microphone : Form
             if (closing) return;
             if (!reply.ContainsKey("ready") || !reply.ContainsKey("segmented")) throw new IOException("SenseVoice 识别服务启动失败。");
             Status("idle", "点击说话 · 拖动移动 · 右键退出");
-            if (memoryTest) { await RunMemoryTest(); return; }
-            if (streamTest) { await RunStreamTest(); return; }
-            if (smokeTest) {
+            if (runChecks && memoryTest) { await RunMemoryTest(); return; }
+            if (runChecks && streamTest) { await RunStreamTest(); return; }
+            if (runChecks && smokeTest) {
                 using (var bitmap = new Bitmap(Width, Height)) {
                     DrawToBitmap(bitmap, ClientRectangle);
                     bitmap.Save(Path.Combine(root, "work", "microphone-live-render.png"));
@@ -596,7 +611,7 @@ sealed class Microphone : Form
             KeepRecovery(delivery.TakePending() + (draft.Length > 0 ? "\n[未定稿] " + draft : ""));
         delivery = null;
         StopWorker();
-        Status("error", message + " 点击重试 · 右键退出");
+        Status("error", message + (recovery.Length > 0 ? " 左侧重试 · 右侧复制 · 右键退出" : " 点击重试 · 右键退出"));
     }
     bool HasEditableTarget() { return HasEditableTarget(target, targetFocus); }
     bool EditingGestureDown() {
@@ -675,6 +690,8 @@ sealed class Microphone : Form
                 if (Native.GetAsyncKeyState(key) < 0) { tip.SetToolTip(this, "请松开修饰键后再开始录音。"); return; }
             target = Native.GetForegroundWindow(); targetFocus = Native.Focus(target);
             try {
+                // Preserve the onset while UI Automation and the worker initialize.
+                recorder = new Recorder();
                 Status("busy", "正在开始录音…");
                 bool editable = !memoryTest && await Task.Run(() => HasEditableTarget());
                 SetInputFocus(editable);
@@ -682,8 +699,7 @@ sealed class Microphone : Form
                 if (!editable) Pause("没有可确认的输入框，继续识别并保存未上屏文字。");
                 if (closing) return;
                 guard = new InteractionGuard(OwnsSurface, reason => Pause(reason + "改变了输入位置，正在重新检测输入框。", true));
-                recorder = new Recorder();
-                listening = true; Earcon("BasicListeningEarcon");
+                listening = true; playEarcon("BasicListeningEarcon", false);
                 Status("recording", editable ? "正在录音，停顿后输入 · 点击麦克风结束" : "正在录音，未上屏文字将直接显示为复制按钮 · 右键可结束录音"); limit.Start(); capture.Start();
             } catch (Exception error) { Fail(error.Message); }
             return;
@@ -768,13 +784,13 @@ sealed class Microphone : Form
         catch (Exception error) { Fail(error.Message); }
         finally { pipeline.Release(); }
     }
-    async Task EndRecording() {
+    async Task EndRecording(bool silent = false) {
         if (closing || state != "recording") return;
         limit.Stop(); capture.Stop(); Status("busy", "正在补全尾字…");
         try {
             byte[] tail;
             try { tail = recorder.Stop(); } finally { recorder.Dispose(); recorder = null; }
-            EndListening(delivery != null && delivery.Paused.Length != 0);
+            EndListening(delivery != null && delivery.Cancelled, silent);
             await FinishRecording(tail);
         } catch (Exception error) { Fail(error.Message); }
     }
@@ -837,6 +853,7 @@ sealed class Microphone : Form
         }
     }
     async Task RunMemoryTest() {
+        await VerifyStartupCapture();
         await BeginStream();
         Status("recording", "兜底记忆测试");
         target = targetFocus = IntPtr.Zero;
@@ -860,11 +877,20 @@ sealed class Microphone : Form
         delivery.Paused = "下一次录音";
         await FinishRecording(new byte[0]);
         if (recovery != remembered) throw new Exception("New session lost memory");
-        pressed = true; pressedAt = motionClock.Elapsed.TotalMilliseconds - 400; heldTriggered = false;
-        string previousId = recordingId;
-        if (!TakeLongPress(motionClock.Elapsed.TotalMilliseconds)) throw new Exception("Copied pill did not accept long press");
-        await NewRecording();
-        if (state != "recording" || recordingId == previousId || recovery.Length != 0 || recoveryCopied || draft.Length != 0 || !MemoryPill) throw new Exception("Long press did not reset memory and start in no-input capsule mode");
+        var cues = new List<string>(); playEarcon = (name, wait) => cues.Add(name);
+        await HoldCopiedPillTest();
+        if (cues.Count != 1 || cues[0] != "BasicListeningEarcon") throw new Exception("Idle long press must play only one start cue");
+        await Task.Delay(200);
+        KeepRecovery("进行中的已复制缓存"); recoveryCopied = true;
+        cues.Clear();
+        Task restart = NewRecording();
+        while (!restart.IsCompleted) {
+            if (!MemoryPill || motion.Activity < .95f) throw new Exception("Restart must preserve capsule and listening halo");
+            await Task.Delay(1);
+        }
+        await restart;
+        if (cues.Count != 1 || cues[0] != "BasicListeningEarcon") throw new Exception("Recording restart must not play stop/cancel plus start cues");
+        if (state != "recording" || recovery.Length != 0 || recoveryCopied || draft.Length != 0 || !MemoryPill) throw new Exception("Long press did not reset memory and start in no-input capsule mode");
         await pipeline.WaitAsync();
         try { await Feed(recorder.Split()); }
         finally { pipeline.Release(); }
@@ -881,9 +907,58 @@ sealed class Microphone : Form
         OnMouseUp(new MouseEventArgs(MouseButtons.Left, 1, 64, 48, 0));
         for (int i = 0; i < 150 && state == "busy"; i++) await Task.Delay(20);
         if (state != "idle" || copiedInTest.Length != 0 || recovery.Contains(remembered)) throw new Exception("Short click after long press did not stop or old memory returned");
+        CopyRecovery();
+        Fail("测试已复制状态下识别服务恢复");
+        await HoldCopiedPillTest();
+        if (recovery.Length != 0 || recoveryCopied || draft.Length != 0 || state != "recording") throw new Exception("Error-state long press failed to create a clean round");
+        await EndRecording();
         await RunFocusRecoveryTest();
-        File.WriteAllText(Path.Combine(root, "work", "microphone-memory-test.txt"), "PASS: " + Assembly.GetExecutingAssembly().GetName().Version + " / stale foreign-window UIA rejected / resume stays capsule while audio boundary is pending / repeated non-input probes remain capsule / real SenseVoice / focus return shows circle with old cache retained / actual non-input window / large audio packet / recording continues / manual copy / long press clears old memory / release does not copy or stop / next click stops / stored gap never replayed / new editable field / read-only fallback");
+        File.WriteAllText(Path.Combine(root, "work", "microphone-memory-test.txt"), "PASS: " + Assembly.GetExecutingAssembly().GetName().Version + " / stale foreign-window UIA rejected / resume stays capsule while audio boundary is pending / repeated non-input probes remain capsule / real SenseVoice / focus return shows circle with old cache retained / actual non-input window / large audio packet / recording continues / manual copy / native mouse long press in idle and error states / service recovery / clears old memory / release does not copy or stop / next click stops / stored gap never replayed / new editable field / read-only fallback");
         Close();
+    }
+    async Task VerifyStartupCapture() {
+        var clock = Stopwatch.StartNew();
+        Task starting = Toggle();
+        bool armedBeforeWaiting = recorder != null;
+        await starting;
+        if (state != "recording" || recorder == null) throw new Exception("Startup did not reach recording");
+        capture.Stop(); limit.Stop();
+        await Task.Delay(200);
+        int bytes;
+        try { bytes = recorder.Stop().Length; } finally { recorder.Dispose(); recorder = null; }
+        EndListening(false, true);
+        await Exchange(new { op = "cancel", id = recordingId });
+        if (guard != null) { guard.Dispose(); guard = null; }
+        delivery = null; recovery = draft = ""; Status("idle", "启动采集测试完成");
+        if (!armedBeforeWaiting) throw new Exception("Initial speech is unprotected: microphone opens only after asynchronous setup");
+        if (bytes < 3200) throw new Exception("Startup capture did not retain its initial microphone buffers");
+        File.WriteAllText(Path.Combine(root, "work", "microphone-startup-test.txt"), "PASS: capture armed before async setup; initial PCM retained=" + bytes + "; observation ms=" + clock.ElapsedMilliseconds + "; audio discarded in memory");
+    }
+    async Task HoldCopiedPillTest() {
+        string previousId = recordingId;
+        Point previousPointer = Cursor.Position;
+        bool keepCapsule = MemoryPill, keepListening = state == "recording";
+        var area = Screen.PrimaryScreen.WorkingArea;
+        Location = new Point(area.Left + 40, area.Top + 100);
+        RefreshSurface(); await Task.Delay(80);
+        Native.SetCursorPos(Left + 88, Top + 48);
+        var mouseDown = new[] { new Native.Input { type = 0, data = new Native.Payload { mouse = new Native.Mouse { flags = 2 } } } };
+        var mouseUp = new[] { new Native.Input { type = 0, data = new Native.Payload { mouse = new Native.Mouse { flags = 4 } } } };
+        try {
+            if (Native.WindowFromPoint(Cursor.Position) != Handle) throw new Exception("Gesture test's mouse target is not its own window");
+            Native.SendInput(1, mouseDown, Marshal.SizeOf(typeof(Native.Input)));
+            for (int i = 0; i < 75 && (state != "recording" || recordingId == previousId); i++) {
+                await Task.Delay(20);
+                if (keepCapsule && !MemoryPill) throw new Exception("Long press restart flashed from capsule to circle");
+                if (keepListening && motion.Activity < .95f) throw new Exception("Long press restart flashed listening halo off");
+            }
+            if (state != "recording" || recordingId == previousId)
+                throw new Exception("Native copied-pill long press failed: pressed=" + pressed + "; held=" + heldTriggered + "; dragged=" + dragged + "; capture=" + Capture);
+        } finally {
+            Native.SendInput(1, mouseUp, Marshal.SizeOf(typeof(Native.Input)));
+            Native.SetCursorPos(previousPointer.X, previousPointer.Y);
+        }
+        await Task.Delay(30);
     }
     async Task RunFocusRecoveryTest() {
         using (var editor = new Form { Text = "VoxFix focus recovery test", Width = 320, Height = 160, TopMost = true })
@@ -1043,10 +1118,10 @@ sealed class Microphone : Form
         DrawCurrent(e.Graphics);
     }
     void DrawCurrent(Graphics g) {
-        DrawShape(g, shape.Value, state, recoveryCopied, copyFeedback, hoverFeedback, pressFeedback,
+        DrawShape(g, shape.Value, restarting ? "recording" : state, recoveryCopied, copyFeedback, hoverFeedback, pressFeedback,
             motion.Activity, motion.Voice, motion.Level, animationsEnabled ? motionClock.Elapsed.TotalMilliseconds : 0,
-            state == "recording" && !inputFocused && recovery.Length == 0,
-            transcribing || speechDetected || state == "busy", readyFeedback);
+            restarting || (state == "recording" && !inputFocused && recovery.Length == 0),
+            !restarting && (transcribing || speechDetected || state == "busy"), readyFeedback);
     }
     internal static SizeF ShapeSize(double shape) {
         double ratio = 1 + (106.0 / 42 - 1) * shape;
@@ -1254,6 +1329,18 @@ sealed class Microphone : Form
             var inputs = Native.TextInputs("你好A😀");
             if (inputs.Length != 10 || inputs[0].data.keyboard.scan != '你' || inputs[1].data.keyboard.flags != 6) throw new Exception("Unicode input");
             Directory.CreateDirectory(Path.Combine(root, "work"));
+            using (var shell = new Microphone(Path.Combine(root, ".tmp", Guid.NewGuid().ToString("N")), "")) {
+                shell.recovery = "保留的缓存";
+                shell.copyText = text => shell.copiedInTest = text;
+                shell.Status("error", "原错误");
+                shell.ShortClick(88).GetAwaiter().GetResult();
+                if (shell.copiedInTest != shell.recovery || shell.state != "error") throw new Exception("Error capsule right side must still copy");
+                shell.copiedInTest = "";
+                // A missing Python path makes retry fail synchronously without requiring a model or a message loop.
+                shell.ShortClick(64).GetAwaiter().GetResult();
+                if (shell.copiedInTest.Length != 0 || shell.recovery != "保留的缓存" || !shell.tip.GetToolTip(shell).Contains("左侧重试"))
+                    throw new Exception("Error capsule left side must retry without copying or clearing memory");
+            }
             using (var bitmap = new Bitmap(72, 72)) using (var g = Graphics.FromImage(bitmap)) {
                 Draw(g, "idle");
                 bool softEdge = false;

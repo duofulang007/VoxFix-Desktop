@@ -60,6 +60,36 @@ class Session:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_forced_tail_is_flushed_once_before_stop_or_route_change(self):
+        class ForcedVad(Vad):
+            def accept_waveform(self, audio):
+                super().accept_waveform(audio)
+                if len(self.audio) == 160000:
+                    self.completed.append(self.current_segment)
+                    self.active = False
+
+        for operation in ('stop', 'route'):
+            with self.subTest(operation=operation):
+                engine = Recognition(Session(), ForcedVad())
+                try:
+                    engine.handle({'op': 'start', 'id': 'test'})
+                    for _ in range(10):
+                        self.feed(engine)
+                    cut = engine.last_end
+                    self.assertTrue(engine.carry)
+                    self.assertLess(cut, engine.samples)
+                    if operation == 'route':
+                        engine.handle({'op': 'route', 'id': 'test', 'route': 1})
+                        self.feed(engine, .2)
+                    result = engine.handle({'op': 'stop', 'id': 'test'})
+                    spans = [(s['route'], s['start'], s['end']) for s in result['segments']]
+                    expected = [(0, 0, cut), (0, cut, 160000)]
+                    if operation == 'route':
+                        expected.append((1, 160000, 163200))
+                    self.assertEqual(spans, expected)
+                finally:
+                    engine.clear()
+
     def test_copy_waits_for_inflight_final_after_speech_ends(self):
         class Blocked(Session):
             def __init__(self):

@@ -261,16 +261,22 @@ class Recognition:
                     end = search + int(np.argmin(energy)) * 160 + 80
             if flushing:
                 end = self.samples
-            if end > start:
-                if len(self.pending) >= 24:
-                    raise RuntimeError('识别队列积压，请结束本次录音后重试')
-                self.pending.append((self.route, start, end, self.audio[start:end].copy()))
-                self.last_end = end
-                self.carry = forced
+            self.queue_segment(start, end, forced)
             self.vad.pop()
-            self.draft = None
-            self.active_key = None
-            self.preview = ''
+        # A forced VAD endpoint can leave carry audio after its completed queue is empty.
+        if flushing and self.carry and self.last_end < self.samples:
+            self.queue_segment(self.last_end, self.samples, False)
+
+    def queue_segment(self, start, end, forced):
+        if end > start:
+            if len(self.pending) >= 24:
+                raise RuntimeError('识别队列积压，请结束本次录音后重试')
+            self.pending.append((self.route, start, end, self.audio[start:end].copy()))
+            self.last_end = end
+            self.carry = forced
+        self.draft = None
+        self.active_key = None
+        self.preview = ''
 
     def loop(self):
         try:
