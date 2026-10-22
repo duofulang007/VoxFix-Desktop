@@ -15,7 +15,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.38.0")]
+[assembly: AssemblyVersion("1.6.39.0")]
 
 static class Native
 {
@@ -586,9 +586,9 @@ sealed class DictionaryDialog : Form
         AccessibleName = "个人词典";
 
         Controls.Add(Caption("个人词典", 20, 14, Ink));
-        Controls.Add(Caption("左边选一个词，右边每行写一种被听错的写法；保存后下一句生效，不用重启。", 20, 40, Dim));
-        Controls.Add(Caption("词语", 20, 64, Dim));
-        Controls.Add(Caption("错法（每行一个，可留空）", 206, 64, Dim));
+        Controls.Add(Caption("左边选词，右边一行一种错法；粘贴会自动拆行去重。", 20, 40, Dim));
+        Controls.Add(Caption("词语", 20, 62, Dim));
+        Controls.Add(Caption("错法（每行一个，可留空）", 206, 62, Dim));
 
         list.Bounds = new Rectangle(20, 86, 170, 250);
         list.DrawMode = DrawMode.OwnerDrawFixed; list.ItemHeight = 26; list.BorderStyle = BorderStyle.None;
@@ -597,7 +597,7 @@ sealed class DictionaryDialog : Form
         list.SelectedIndexChanged += OnSelected;
         Controls.Add(list);
 
-        variants.Bounds = new Rectangle(206, 86, 294, 250);
+        variants.Bounds = new Rectangle(206, 92, 294, 244);
         variants.Multiline = true; variants.ScrollBars = ScrollBars.Vertical; variants.BorderStyle = BorderStyle.FixedSingle;
         variants.BackColor = Field; variants.ForeColor = Ink; variants.AcceptsReturn = true;
         variants.TextChanged += (s, e) => { if (!silent) dirty = true; };
@@ -609,8 +609,7 @@ sealed class DictionaryDialog : Form
             }
         };
         Controls.Add(variants);
-        var tidyButton = MakeButton("整理", new Rectangle(440, 60, 60, 22), () => { NormalizeVariants(); });
-        tidyButton.Font = new Font("Microsoft YaHei UI", 8.5f);
+        var tidyButton = MakeButton("整理", new Rectangle(424, 56, 76, 28), () => { NormalizeVariants(); });
         Controls.Add(tidyButton);
 
         entry.Bounds = new Rectangle(20, 350, 250, 26);

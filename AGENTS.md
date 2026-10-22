@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本仓库的操作约定。当前版本 **1.6.38.0**；产品说明见 [README](README.md)，
+本仓库的操作约定。当前版本 **1.6.39.0**；产品说明见 [README](README.md)，
 技术记录从 [docs/README.md](docs/README.md) 读起，工具入口见 [tools/README.md](tools/README.md)。
 
 ## 生产链路
