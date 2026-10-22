@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本仓库的操作约定。当前版本 **1.6.36.0**；产品说明见 [README](README.md)，
+本仓库的操作约定。当前版本 **1.6.37.0**；产品说明见 [README](README.md)，
 技术记录从 [docs/README.md](docs/README.md) 读起，工具入口见 [tools/README.md](tools/README.md)。
 
 ## 生产链路
@@ -39,6 +39,7 @@ Python 测试统一使用 `.venv/Scripts/python.exe`，按改动范围运行：
 | `tools/test_sensevoice.py` | 协议、分段、草稿、标点保留；无需模型或设备 |
 | `tools/test_language_guard.py` | 中英字符边界、外文拒绝与先前定稿恢复；无需模型 |
 | `tools/test_hotwords.py` | 近音触发、接受守卫、失败回退、会话释放与管线接线；无需模型 |
+| `tools/test_tidy.py` | 整理：重复收拢、无标点输入、中英混排、空输入、仓库词典用例；无需模型 |
 | `tools/test_asr_scoring.py` | 中文按字、英文按词、否定、静音与外文计分 |
 | `tools/test_microphone.py` | 真实模型协议、尾音、轻声、坏包恢复、175 秒固定音频连续会话；不访问麦克风 |
 | `tools/evaluate_sensevoice.py` | 默认旧 174 条；`--manifest` 指定新语料，`--output` 指定新结果；不覆盖已有结果，记录音频/模型/源码哈希 |
@@ -88,7 +89,7 @@ Get-Content work\microphone-self-test.txt
     `work/hotword-prototype/p2_prod_eval.py`（生产路径 174 与封存 1,314）。
 11. Win+H 开始/暂停，Esc 收起；不恢复浮动小字提示。UI 几何、材质和动画改动必须验证实际桌面。
 12. 复制未上屏缓存只能由胶囊右侧按钮触发；键盘钩子不得捕获 Ctrl+C（1.6.32.0 起），无缓存、有缓存、复制前后都一样交给原应用。
-13. 右键菜单固定三项：收起 / 词典 / 退出，白色卡片、每行一个矢量图标、行宽按文字自适应（不许留右侧空白）。`词典` 打开 `DictionaryDialog`，保存必须用 `File.Replace` 原子写
+13. 右键菜单固定四项：收起 / 整理 / 词典 / ─ / 退出，白色卡片、每行一个矢量图标、行宽按文字自适应（不许留右侧空白）。「整理」取剪贴板（空则取未上屏缓存），交给 `recognize.py` 的 `tidy_text`，结果写回剪贴板；录音/转写中不执行。`context: "zh"` 规则在整理时对纯英文也生效（`force=True`），实时听写不受影响。`词典` 打开 `DictionaryDialog`，保存必须用 `File.Replace` 原子写
     `dictionary.json`（Python 侧按 mtime 重载），`hotwords` 写全部词、`rules` 只写有错法的词且 `context` 固定 `zh`；
     有未保存修改时关闭要先问。改这个窗口必须跑 `--dictionary-test`（离屏截图 + 往返 JSON 校验），不要弹到桌面。
 13. 悬浮窗是 `WS_EX_NOACTIVATE`，收不到失焦消息，菜单不能指望 WinForms 自动关闭：`ContextMenuStrip` 打开期间必须挂 `MenuDismissHook`（WH_MOUSE_LL），
