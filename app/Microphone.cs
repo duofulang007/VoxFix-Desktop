@@ -854,15 +854,6 @@ sealed class DictionaryDialog : Form
         }
     }
 
-    internal void PrepareForTest() {
-        Reload();
-        ApplyRegion();
-        IntPtr handle = Handle;  // creates the window without showing it
-        GC.KeepAlive(handle);
-    }
-
-    internal int WordCountForTest() { return groups.Count; }
-
     internal string NormalizeForTest(string messy) {
         silent = true;
         variants.Text = messy;
