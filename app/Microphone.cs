@@ -15,7 +15,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.34.0")]
+[assembly: AssemblyVersion("1.6.35.0")]
 
 static class Native
 {
@@ -839,7 +839,7 @@ sealed class Microphone : Form
             if (previous != null) previous.Dispose();
         };
         menu.Items.Add("收起", null, async (s, e) => await Dismiss());
-        menu.Items.Add("词典…", null, (s, e) => ShowDictionary());
+        menu.Items.Add("词典", null, (s, e) => ShowDictionary());
         menu.Items.Add("退出", null, (s, e) => Close());
         foreach (ToolStripItem item in menu.Items) { item.AutoSize = false; item.Size = new Size(88, 28); }
         menu.MinimumSize = new Size(88, 88);
@@ -2623,7 +2623,7 @@ sealed class Microphone : Form
                 if (!MenuDismissHook.Outside(menuSurface, new Point(60, 140)) || MenuDismissHook.Outside(menuSurface, new Point(120, 120)))
                     throw new Exception("Only clicks outside the menu surface may dismiss it");
                 if (shell.menu.Items.Count != 3 || shell.menu.Items[0].Text != "收起" ||
-                    shell.menu.Items[1].Text != "词典…" || shell.menu.Items[2].Text != "退出")
+                    shell.menu.Items[1].Text != "词典" || shell.menu.Items[2].Text != "退出")
                     throw new Exception("Menu must contain dismiss, dictionary and exit");
                 shell.menu.Show(shell, new Point(0, 0));
                 if (!shell.menu.Visible || shell.menuGuard == null) throw new Exception("Open menu must install the outside-click guard");
