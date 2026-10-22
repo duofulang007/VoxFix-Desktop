@@ -89,127 +89,6 @@ def apply_dictionary(text, rules, force=False):
     return text
 
 
-_CJK = re.compile(r'[\u3400-\u9fff]')
-_TIDY_HARD = re.compile(r'[。！？；!?;\n]')
-_TIDY_SOFT = re.compile(r'[、，,：:\s]')
-_TIDY_VOWELS = frozenset('aeiouy')
-
-
-def _tidypieces(text, rules):
-    """Split `text` into tokens at word boundaries and rewrite known spellings.
-
-    No punctuation format is assumed: the scan walks the string, prefers the
-    longest word-list match at each position (so "col death" is one token, not
-    two), otherwise takes the next latin word or CJK run. Each token remembers
-    how strongly it was separated from the previous one ("hard" for 。！？, "soft"
-    for spaces and commas) so joining can put the same kind of break back.
-    """
-    tokens = []
-    pos, pending = 0, None
-    while pos < len(text):
-        hit = None
-        for pattern, canonical, _zh in rules:
-            match = pattern.match(text, pos)
-            if match and match.end() > pos and (hit is None or match.end() > hit[2]):
-                hit = (canonical, True, match.end())
-        if hit is not None:
-            tokens.append({'text': hit[0], 'word': True, 'sep': pending})
-            pos, pending = hit[2], None
-            continue
-        char = text[pos]
-        if _TIDY_HARD.match(char):
-            pending = 'hard' if tokens else pending
-            pos += 1
-            continue
-        if _TIDY_SOFT.match(char):
-            if tokens and pending is None:
-                pending = 'soft'
-            pos += 1
-            continue
-        if char.isascii() and (char.isalnum() or char in "'-"):
-            end = pos
-            while end < len(text):
-                probe = text[end]
-                if probe.isascii() and (probe.isalnum() or probe in "'-"):
-                    end += 1
-                else:
-                    break
-            tokens.append({'text': text[pos:end], 'word': True, 'sep': pending})
-            pos, pending = end, None
-            continue
-        end = pos
-        while end < len(text) and _CJK.match(text[end]):
-            end += 1
-        end = max(end, pos + 1)
-        tokens.append({'text': text[pos:end], 'word': False, 'sep': pending})
-        pos, pending = end, None
-    return tokens
-
-
-def _skeleton(text):
-    return ''.join(char for char in text.lower() if char not in _TIDY_VOWELS and char.isalnum())
-
-
-def _tidy_similar(left, right):
-    a, b = left.lower(), right.lower()
-    if a == b:
-        return True
-    if not a or not b or _CJK.search(a) or _CJK.search(b):
-        return False
-    if min(len(a), len(b)) < 3:
-        return False
-    if _skeleton(a) == _skeleton(b):
-        return True
-    limit = 1 if max(len(a), len(b)) <= 5 else 2
-    return _edit_distance(a, b, limit) <= limit
-
-
-def _edit_distance(a, b, limit):
-    if abs(len(a) - len(b)) > limit:
-        return limit + 1
-    previous = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        row, best = [i], i
-        for j, cb in enumerate(b, 1):
-            value = min(row[-1] + 1, previous[j] + 1, previous[j - 1] + (ca != cb))
-            row.append(value)
-            best = min(best, value)
-        if best > limit:
-            return limit + 1
-        previous = row
-    return previous[-1]
-
-
-def tidy_text(text, rules):
-    """Merge repeated attempts of the same word and tidy the spacing.
-
-    "col death。koex。koex。colexs。cols。" -> "Codex" once the word list maps
-    those spellings to Codex; repeats of one word with no punctuation in between
-    ("koex koex koex") work the same way, and a word list hit wins over a lookalike
-    token. Manual action, so `context: "zh"` rules apply to pure-English text too.
-    """
-    kept, dropped = [], 0
-    for token in _tidypieces(text or '', rules):
-        if kept and _tidy_similar(kept[-1]['text'], token['text']):
-            if token['word'] and not kept[-1]['word']:
-                kept[-1] = {'text': token['text'], 'word': True, 'sep': kept[-1]['sep']}
-            dropped += 1
-            continue
-        kept.append(token)
-    if not kept:
-        return '', 0
-    out = kept[0]['text']
-    for token in kept[1:]:
-        left, right = out[-1:], token['text'][:1]
-        latin = (left.isascii() and left.isalnum()) or (right.isascii() and right.isalnum())
-        if token['sep'] == 'hard':
-            out += '。' if (_CJK.search(left) or _CJK.search(right)) else '. '
-        elif token['sep'] == 'soft' and latin:
-            out += ' '
-        out += token['text']
-    return out, dropped
-
-
 def load_hotwords(path):
     """Decode-time bias list. Only an explicit `hotwords` field enables the rescue path."""
     try:
@@ -568,16 +447,7 @@ def main():
               'preview': True, 'model': 'SenseVoiceSmall INT8', 'backend': backend})
         for line in sys.stdin:
             try:
-                request = json.loads(line)
-                if isinstance(request, dict) and request.get('op') == 'tidy':
-                    # Manual clean-up of text the user already has (clipboard or
-                    # cache): no recording involved, so it is answered here.
-                    text, dropped = tidy_text(request.get('text') or '',
-                                              recognition.dictionary.current())
-                    send({'op': 'tidy', 'id': request.get('id'), 'text': text,
-                          'dropped': dropped})
-                    continue
-                send(recognition.handle(request))
+                send(recognition.handle(json.loads(line)))
             except Exception as error:
                 recovery, draft = recognition.committed, recognition.preview
                 segments = list(recognition.segments)

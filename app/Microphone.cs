@@ -15,7 +15,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.37.0")]
+[assembly: AssemblyVersion("1.6.38.0")]
 
 static class Native
 {
@@ -477,16 +477,6 @@ static class MenuIcons
                     } else if (name == "power") {
                         g.DrawArc(pen, 3.5f * Scale, 4.0f * Scale, 9.0f * Scale, 9.0f * Scale, 300, 300);
                         g.DrawLine(pen, 8 * Scale, 2.6f * Scale, 8 * Scale, 7.6f * Scale);
-                    } else if (name == "funnel") {
-                        using (var shape = new GraphicsPath()) {
-                            shape.AddLine(3.6f * Scale, 4.0f * Scale, 12.4f * Scale, 4.0f * Scale);
-                            shape.AddLine(12.4f * Scale, 4.0f * Scale, 9.3f * Scale, 8.4f * Scale);
-                            shape.AddLine(9.3f * Scale, 8.4f * Scale, 9.3f * Scale, 12.8f * Scale);
-                            shape.AddLine(9.3f * Scale, 12.8f * Scale, 6.7f * Scale, 12.8f * Scale);
-                            shape.AddLine(6.7f * Scale, 12.8f * Scale, 6.7f * Scale, 8.4f * Scale);
-                            shape.AddLine(6.7f * Scale, 8.4f * Scale, 3.6f * Scale, 4.0f * Scale);
-                            g.DrawPath(pen, shape);
-                        }
                     }
                 }
             }
@@ -611,7 +601,17 @@ sealed class DictionaryDialog : Form
         variants.Multiline = true; variants.ScrollBars = ScrollBars.Vertical; variants.BorderStyle = BorderStyle.FixedSingle;
         variants.BackColor = Field; variants.ForeColor = Ink; variants.AcceptsReturn = true;
         variants.TextChanged += (s, e) => { if (!silent) dirty = true; };
+        // Pasting a messy run ("col death。koex。koex。colsexs") splits it into one
+        // variant per line and drops repeats; the button does the same on demand.
+        variants.KeyDown += (s, e) => {
+            if (e.Control && e.KeyCode == Keys.V && !silent) {
+                BeginInvoke(new Action(() => { if (!silent) NormalizeVariants(); }));
+            }
+        };
         Controls.Add(variants);
+        var tidyButton = MakeButton("整理", new Rectangle(440, 60, 60, 22), () => { NormalizeVariants(); });
+        tidyButton.Font = new Font("Microsoft YaHei UI", 8.5f);
+        Controls.Add(tidyButton);
 
         entry.Bounds = new Rectangle(20, 350, 250, 26);
         entry.BorderStyle = BorderStyle.FixedSingle; entry.BackColor = Field; entry.ForeColor = Ink;
@@ -743,6 +743,36 @@ sealed class DictionaryDialog : Form
         ShowWord(target);
     }
 
+    static readonly char[] VariantSeparators = {
+        '。', '！', '？', '；', '，', '、', ',', ';', '|', '｜', '\r', '\n', '\t', '\u3000'
+    };
+
+    // One variant per line: split on any common separator, tidy the spacing,
+    // drop repeats (case-insensitive). Spaces inside a variant are kept, so
+    // "col death" stays one entry.
+    internal string NormalizeVariants() {
+        string before = variants.Text;
+        var kept = new List<string>();
+        foreach (var piece in before.Split(VariantSeparators)) {
+            var text = string.Join(" ", piece.Split(new[] { ' ', '\u3000' }, StringSplitOptions.RemoveEmptyEntries));
+            text = text.Trim().Trim('"', '\'', '(', ')', '「', '」', ' ');
+            if (text.Length == 0) continue;
+            bool duplicate = false;
+            foreach (var seen in kept)
+                if (string.Equals(seen, text, StringComparison.OrdinalIgnoreCase)) { duplicate = true; break; }
+            if (!duplicate) kept.Add(text);
+        }
+        string after = string.Join("\r\n", kept.ToArray());
+        if (after != before) {
+            silent = true;
+            variants.Text = after;
+            silent = false;
+        }
+        dirty = true;
+        status.Text = kept.Count == 0 ? "没有可整理的写法" : "已整理成 " + kept.Count + " 行，记得保存";
+        return after;
+    }
+
     void Commit() {
         if (current < 0 || current >= groups.Count) return;
         var edited = new List<string>();
@@ -826,6 +856,13 @@ sealed class DictionaryDialog : Form
     }
 
     internal int WordCountForTest() { return groups.Count; }
+
+    internal string NormalizeForTest(string messy) {
+        silent = true;
+        variants.Text = messy;
+        silent = false;
+        return NormalizeVariants();
+    }
 
     internal string DumpForTest() {
         var text = new StringBuilder("current=" + current + " text=" + variants.Text.Length);
@@ -923,7 +960,7 @@ sealed class Microphone : Form
         probeOnly = test == "--focus-test" || test == "--idle-focus-test";
         if (memoryTest || streamTest || smokeTest) playEarcon = (name, wait) => { };
         copyText = streamTest || memoryTest ? new Action<string>(text => copiedInTest = text) : new Action<string>(Clipboard.SetText);
-        menu = CreateMenu(() => { var ignored = Dismiss(); }, () => { var ignored = Tidy(); }, ShowDictionary, Close);
+        menu = CreateMenu(() => { var ignored = Dismiss(); }, ShowDictionary, Close);
         // WinForms relies on deactivation to auto-close a menu, and this window never activates.
         // So the first real click outside the menu surface closes it explicitly.
         menu.Opened += (s, e) => {
@@ -1109,7 +1146,7 @@ sealed class Microphone : Form
     }
     // White card, one icon per row, and every row sizes to its own text so the
     // menu never carries a blank column on the right.
-    internal static ContextMenuStrip CreateMenu(Action dismiss, Action tidy, Action dictionary, Action exit) {
+    internal static ContextMenuStrip CreateMenu(Action dismiss, Action dictionary, Action exit) {
         var menu = new ContextMenuStrip();
         menu.ShowImageMargin = false; menu.ShowCheckMargin = false; menu.ShowItemToolTips = false;
         menu.BackColor = MicrophoneMenuRenderer.Surface;
@@ -1125,7 +1162,6 @@ sealed class Microphone : Form
             if (previous != null) previous.Dispose();
         };
         menu.Items.Add(Entry("收起", "chevron", MicrophoneMenuRenderer.Ink, dismiss));
-        menu.Items.Add(Entry("整理", "funnel", MicrophoneMenuRenderer.Ink, tidy));
         menu.Items.Add(Entry("词典", "book", MicrophoneMenuRenderer.Ink, dictionary));
         menu.Items.Add(new ToolStripSeparator { Margin = new Padding(0, 2, 0, 2) });
         menu.Items.Add(Entry("退出", "power", MicrophoneMenuRenderer.Danger, exit));
@@ -1142,46 +1178,6 @@ sealed class Microphone : Form
         item.Size = new Size(width, 34);
         item.Click += (s, e) => click();
         return item;
-    }
-
-    // "整理": tidy whatever text the user has in the clipboard (or the cached
-    // transcript) — collapse repeated attempts of the same word through the word
-    // list, tidy spacing — then put the result back on the clipboard to paste.
-    async Task Tidy() {
-        if (worker == null) return;
-        if (state == "recording" || state == "busy" || transcribing) {
-            Status(state, "录音或转写中不能整理");
-            return;
-        }
-        string source = "";
-        try { if (Clipboard.ContainsText()) source = Clipboard.GetText(); }
-        catch (Exception) { }
-        bool fromCache = false;
-        if (string.IsNullOrWhiteSpace(source) && recovery.Length > 0) {
-            source = recovery;
-            fromCache = true;
-        }
-        if (string.IsNullOrWhiteSpace(source)) {
-            Status(state, "剪贴板是空的，也没有未上屏文字");
-            return;
-        }
-        Dictionary<string, object> reply;
-        try {
-            await worker.StandardInput.WriteLineAsync(json.Serialize(new { op = "tidy", id = "tidy", text = source }));
-            await worker.StandardInput.FlushAsync();
-            reply = await Reply();
-        } catch (Exception error) {
-            Status(state, "整理失败：" + error.Message);
-            return;
-        }
-        string tidied = Convert.ToString(reply["text"]);
-        int dropped = reply.ContainsKey("dropped") ? Convert.ToInt32(reply["dropped"]) : 0;
-        if (string.IsNullOrWhiteSpace(tidied)) return;
-        try { Clipboard.SetText(tidied); } catch (Exception) { }
-        if (fromCache) { recovery = tidied; UpdateMemoryShape(); }
-        recoveryCopied = true; copyFeedback = 1;
-        Status(state, dropped > 0 ? "已整理 " + dropped + " 处重复，可直接粘贴" : "已整理，可直接粘贴");
-        RefreshSurface(); animation.Start();
     }
 
     void ShowDictionary() {
@@ -2607,7 +2603,7 @@ sealed class Microphone : Form
                 FormBorderStyle = FormBorderStyle.None, ShowInTaskbar = false,
                 StartPosition = FormStartPosition.Manual, Location = new Point(-20000, -20000),
                 Size = new Size(160, 160), BackColor = Color.White }) {
-                var preview = Microphone.CreateMenu(() => { }, () => { }, () => { }, () => { });
+                var preview = Microphone.CreateMenu(() => { }, () => { }, () => { });
                 host.Show();
                 preview.Show(host, new Point(0, 0));
                 Application.DoEvents();
@@ -2638,6 +2634,8 @@ sealed class Microphone : Form
                 }
                 string scratch = Path.Combine(root, "work", "dictionary-roundtrip.json");
                 Console.WriteLine("DICTIONARY-TEST " + dialog.DumpForTest());
+                Console.WriteLine("TIDY-TEST " + dialog.NormalizeForTest(
+                    "col death。koex。koex。colexs,cols；kos|koldex　koex").Replace("\r\n", " / "));
                 dialog.SaveToForTest(scratch);
                 dialog.Close();
             }
@@ -2804,10 +2802,10 @@ sealed class Microphone : Form
                 var menuSurface = new Rectangle(100, 100, 96, 92);
                 if (!MenuDismissHook.Outside(menuSurface, new Point(60, 140)) || MenuDismissHook.Outside(menuSurface, new Point(120, 120)))
                     throw new Exception("Only clicks outside the menu surface may dismiss it");
-                if (shell.menu.Items.Count != 5 || shell.menu.Items[0].Text != "收起" ||
-                    shell.menu.Items[1].Text != "整理" || shell.menu.Items[2].Text != "词典" ||
-                    !(shell.menu.Items[3] is ToolStripSeparator) || shell.menu.Items[4].Text != "退出")
-                    throw new Exception("Menu must contain dismiss, tidy, dictionary, separator and exit");
+                if (shell.menu.Items.Count != 4 || shell.menu.Items[0].Text != "收起" ||
+                    shell.menu.Items[1].Text != "词典" ||
+                    !(shell.menu.Items[2] is ToolStripSeparator) || shell.menu.Items[3].Text != "退出")
+                    throw new Exception("Menu must contain dismiss, dictionary, separator and exit");
                 foreach (ToolStripItem item in shell.menu.Items)
                     if (!(item is ToolStripSeparator) && item.Image == null)
                         throw new Exception("Every menu row must carry an icon");
