@@ -1,12 +1,17 @@
 # AGENTS.md
 
-本仓库的操作约定。当前版本 **1.6.29.0**；产品说明见 [README](README.md)，
+本仓库的操作约定。当前版本 **1.6.31.0**；产品说明见 [README](README.md)，
 技术记录从 [docs/README.md](docs/README.md) 读起，工具入口见 [tools/README.md](tools/README.md)。
 
 ## 生产链路
 
 - `app/Microphone.cs`：单文件 C# WinForms，负责窗口、全局快捷键、采音、焦点、送字与原生自检；无 NuGet、无 .NET SDK。
-- `app/recognize.py`：stdin/stdout 逐行 JSON 子进程，负责 VAD 分段、可修订草稿、标点和按序定稿。
+- `app/recognize.py`：stdin/stdout 逐行 JSON 子进程，负责 VAD 分段、可修订草稿、个人词典、标点和按序定稿。
+  个人词典在项目根 `dictionary.json`（用户可编辑、保存即生效），解码后、标点前替换，
+  草稿与定稿都过词表；文件缺失或损坏时该层自动停用。`context: "zh"` 只在中英混说句替换，防止改坏纯英文短语。
+- `app/hotwords.py`：解码期热词偏置（救援通道）。定稿文本出现词表词的近音片段时才用 ORT 复解该段，
+  命中更多词表词才采用；额外 ONNX 会话惰性创建、闲置 180 秒释放。由 `dictionary.json` 的 `hotwords`
+  字段显式启用，不写则完全不动。
 - SenseVoiceSmall INT8 + Silero VAD + CT-Transformer，CPU 推理；`app/assets/graphite-material.png` 嵌入 EXE。
 - 1.6.29.0 起 `models/sensevoice/model.int8.onnx` 是公开真人语料微调权重（`27377bac…`），
   代码与交互未变。回滚备份 `work/model.int8.onnx.20261018-original` 与 `work/VoxFix Desktop.exe.1.6.28.0`。
@@ -33,6 +38,7 @@ Python 测试统一使用 `.venv/Scripts/python.exe`，按改动范围运行：
 |---|---|
 | `tools/test_sensevoice.py` | 协议、分段、草稿、标点保留；无需模型或设备 |
 | `tools/test_language_guard.py` | 中英字符边界、外文拒绝与先前定稿恢复；无需模型 |
+| `tools/test_hotwords.py` | 近音触发、接受守卫、失败回退、会话释放与管线接线；无需模型 |
 | `tools/test_asr_scoring.py` | 中文按字、英文按词、否定、静音与外文计分 |
 | `tools/test_microphone.py` | 真实模型协议、尾音、轻声、坏包恢复、175 秒固定音频连续会话；不访问麦克风 |
 | `tools/evaluate_sensevoice.py` | 默认旧 174 条；`--manifest` 指定新语料，`--output` 指定新结果；不覆盖已有结果，记录音频/模型/源码哈希 |
@@ -75,7 +81,8 @@ Get-Content work\microphone-self-test.txt
 7. UI 线程不做 UIA/MSAA，生产判定走 `ClassifySafe`：工作线程 + 300ms 熔断 + `stalledWindows`。
 8. 无障碍焦点可能滞后，同一窗口/焦点组合最多重试 3 次；粗粒度宿主继续复查内部焦点。
 9. 成功开始新轮才清旧缓存；停止、收起、启动失败保留，退出清空。离框音频只入缓存，回框只送新话。
-10. Win+H 开始/暂停，Esc 收起；不恢复浮动小字提示。UI 几何、材质和动画改动必须验证实际桌面。
+10. 热词复解只作用于定稿，且只在文本出现词表词近音片段时运行；复解结果必须命中更多词表词、长度不短于原文 60%、不含中英以外字符，任何异常一律保留 sherpa 原文。`hotwords` 未配置时该路径必须完全不创建会话。
+11. Win+H 开始/暂停，Esc 收起；不恢复浮动小字提示。UI 几何、材质和动画改动必须验证实际桌面。
 
 ## 文件、数据与历史
 
