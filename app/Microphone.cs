@@ -15,7 +15,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.35.0")]
+[assembly: AssemblyVersion("1.6.36.0")]
 
 static class Native
 {
@@ -432,8 +432,75 @@ sealed class DictationMotion
     }
 }
 
+// Vector icons for the right-click menu, drawn at 4x and scaled down so the
+// strokes stay smooth at 16 px. Cached per icon+colour; no image assets needed.
+static class MenuIcons
+{
+    static readonly Dictionary<string, Image> cache = new Dictionary<string, Image>();
+    const int Scale = 4;
+
+    internal static Image Get(string name, Color ink) {
+        var key = name + "/" + ink.ToArgb();
+        lock (cache) {
+            Image cached;
+            if (cache.TryGetValue(key, out cached)) return cached;
+            var bitmap = Draw(name, ink);
+            cache[key] = bitmap;
+            return bitmap;
+        }
+    }
+
+    static Image Draw(string name, Color ink) {
+        int side = 16 * Scale;  // coordinates below are in 16 px units, multiplied by Scale
+        using (var big = new Bitmap(side, side)) {
+            using (var g = Graphics.FromImage(big)) {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                using (var pen = new Pen(ink, 1.5f * Scale)) {
+                    pen.StartCap = pen.EndCap = LineCap.Round;
+                    pen.LineJoin = LineJoin.Round;
+                    if (name == "chevron") {
+                        var arm = 3.1f * Scale;
+                        g.DrawLines(pen, new[] {
+                            new PointF(8 * Scale - arm, 6.2f * Scale), new PointF(8 * Scale, 9.4f * Scale),
+                            new PointF(8 * Scale + arm, 6.2f * Scale) });
+                    } else if (name == "book") {
+                        using (var page = new GraphicsPath()) {
+                            page.AddLine(8 * Scale, 4.6f * Scale, 3.4f * Scale, 6.2f * Scale);
+                            page.AddLine(3.4f * Scale, 6.2f * Scale, 3.4f * Scale, 12.2f * Scale);
+                            page.AddLine(3.4f * Scale, 12.2f * Scale, 8 * Scale, 10.6f * Scale);
+                            page.AddLine(8 * Scale, 10.6f * Scale, 12.6f * Scale, 12.2f * Scale);
+                            page.AddLine(12.6f * Scale, 12.2f * Scale, 12.6f * Scale, 6.2f * Scale);
+                            page.AddLine(12.6f * Scale, 6.2f * Scale, 8 * Scale, 4.6f * Scale);
+                            g.DrawPath(pen, page);
+                        }
+                        g.DrawLine(pen, 8 * Scale, 5.0f * Scale, 8 * Scale, 11.2f * Scale);
+                    } else if (name == "power") {
+                        g.DrawArc(pen, 3.5f * Scale, 4.0f * Scale, 9.0f * Scale, 9.0f * Scale, 300, 300);
+                        g.DrawLine(pen, 8 * Scale, 2.6f * Scale, 8 * Scale, 7.6f * Scale);
+                    }
+                }
+            }
+            // The scale-down happens only after the drawing Graphics is disposed.
+            var small = new Bitmap(16, 16);
+            using (var scaled = Graphics.FromImage(small)) {
+                scaled.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                scaled.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                scaled.DrawImage(big, new Rectangle(0, 0, 16, 16));
+            }
+            return small;
+        }
+    }
+}
+
 sealed class MicrophoneMenuRenderer : ToolStripProfessionalRenderer
 {
+    internal static readonly Color Surface = Color.White;
+    internal static readonly Color Ink = Color.FromArgb(43, 48, 56);
+    internal static readonly Color Danger = Color.FromArgb(214, 69, 69);
+    internal static readonly Color Hover = Color.FromArgb(237, 243, 253);
+    internal static readonly Color Border = Color.FromArgb(227, 231, 236);
+    internal static readonly Color Divider = Color.FromArgb(234, 237, 241);
+
     internal static GraphicsPath Outline(Rectangle bounds, int radius) {
         var path = new GraphicsPath();
         int diameter = Math.Min(radius * 2, Math.Min(bounds.Width, bounds.Height));
@@ -443,21 +510,40 @@ sealed class MicrophoneMenuRenderer : ToolStripProfessionalRenderer
         path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
         path.CloseFigure(); return path;
     }
+
     protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e) {
-        e.Graphics.Clear(e.ToolStrip.BackColor);
+        e.Graphics.Clear(Surface);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        using (var path = Outline(new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1), 9))
-            Microphone.DrawMaterial(e.Graphics, path, path.GetBounds(), 0, 0, 0, 0);
+        using (var path = Outline(new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1), 11)) {
+            using (var fill = new SolidBrush(Surface)) e.Graphics.FillPath(fill, path);
+            using (var pen = new Pen(Border)) e.Graphics.DrawPath(pen, path);
+        }
     }
     protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e) { }
+    protected override void OnRenderImageMargin(ToolStripRenderEventArgs e) {
+        using (var brush = new SolidBrush(Surface)) e.Graphics.FillRectangle(brush, e.AffectedBounds);
+    }
     protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e) {
         if (!e.Item.Selected) return;
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        using (var path = Outline(new Rectangle(6, 2, e.Item.Width - 12, e.Item.Height - 4), 5))
-        using (var fill = new SolidBrush(Color.FromArgb(28, 244, 246, 255))) e.Graphics.FillPath(fill, path);
+        using (var path = Outline(new Rectangle(6, 2, e.Item.Width - 12, e.Item.Height - 4), 8))
+        using (var fill = new SolidBrush(Hover)) e.Graphics.FillPath(fill, path);
+    }
+    protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e) {
+        int y = e.Item.Height / 2;
+        using (var pen = new Pen(Divider)) e.Graphics.DrawLine(pen, 14, y, e.Item.Width - 14, y);
     }
     protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e) {
-        e.TextColor = e.ToolStrip.ForeColor;
+        // With no image margin WinForms never asks for the image, so it is drawn
+        // here at a fixed x; the label starts at 30 and the row is sized to fit.
+        if (e.Item.Image != null) {
+            int top = (e.Item.Height - 16) / 2;
+            e.Graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            e.Graphics.DrawImage(e.Item.Image, new Rectangle(8, top, 16, 16));
+        }
+        e.TextColor = e.Item.Tag is Color ? (Color)e.Item.Tag : Ink;
+        e.TextRectangle = new Rectangle(30, 0, Math.Max(0, e.Item.Width - 38), e.Item.Height);
+        e.TextFormat = TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix;
         base.OnRenderItemText(e);
     }
 }
@@ -776,7 +862,7 @@ sealed class Microphone : Form
     Recorder recorder;
     InteractionGuard guard;
     TextDelivery delivery;
-    readonly ContextMenuStrip menu = new ContextMenuStrip();
+    readonly ContextMenuStrip menu;
     MenuDismissHook menuGuard;
     internal int menuDismissRequests;
     DictionaryDialog dictionary;
@@ -827,22 +913,7 @@ sealed class Microphone : Form
         probeOnly = test == "--focus-test" || test == "--idle-focus-test";
         if (memoryTest || streamTest || smokeTest) playEarcon = (name, wait) => { };
         copyText = streamTest || memoryTest ? new Action<string>(text => copiedInTest = text) : new Action<string>(Clipboard.SetText);
-        menu.ShowImageMargin = menu.ShowCheckMargin = false;
-        menu.ShowItemToolTips = false;
-        menu.BackColor = Color.FromArgb(47, 52, 65); menu.ForeColor = Color.FromArgb(245, 246, 250);
-        menu.Font = new Font("Microsoft YaHei UI", 9.5f);
-        menu.Padding = new Padding(4); menu.Renderer = new MicrophoneMenuRenderer();
-        menu.SizeChanged += (s, e) => {
-            if (menu.Width < 2 || menu.Height < 2) return;
-            var previous = menu.Region;
-            using (var outline = MicrophoneMenuRenderer.Outline(new Rectangle(Point.Empty, menu.Size), 9)) menu.Region = new Region(outline);
-            if (previous != null) previous.Dispose();
-        };
-        menu.Items.Add("收起", null, async (s, e) => await Dismiss());
-        menu.Items.Add("词典", null, (s, e) => ShowDictionary());
-        menu.Items.Add("退出", null, (s, e) => Close());
-        foreach (ToolStripItem item in menu.Items) { item.AutoSize = false; item.Size = new Size(88, 28); }
-        menu.MinimumSize = new Size(88, 88);
+        menu = CreateMenu(() => { var ignored = Dismiss(); }, ShowDictionary, Close);
         // WinForms relies on deactivation to auto-close a menu, and this window never activates.
         // So the first real click outside the menu surface closes it explicitly.
         menu.Opened += (s, e) => {
@@ -1026,6 +1097,42 @@ sealed class Microphone : Form
             else Reveal(true);
         } catch (Exception error) { Fail(error.Message); }
     }
+    // White card, one icon per row, and every row sizes to its own text so the
+    // menu never carries a blank column on the right.
+    internal static ContextMenuStrip CreateMenu(Action dismiss, Action dictionary, Action exit) {
+        var menu = new ContextMenuStrip();
+        menu.ShowImageMargin = false; menu.ShowCheckMargin = false; menu.ShowItemToolTips = false;
+        menu.BackColor = MicrophoneMenuRenderer.Surface;
+        menu.ForeColor = MicrophoneMenuRenderer.Ink;
+        menu.Font = new Font("Microsoft YaHei UI", 9.5f);
+        menu.Padding = new Padding(4);
+        menu.ImageScalingSize = new Size(16, 16);
+        menu.Renderer = new MicrophoneMenuRenderer();
+        menu.SizeChanged += (s, e) => {
+            if (menu.Width < 2 || menu.Height < 2) return;
+            var previous = menu.Region;
+            using (var outline = MicrophoneMenuRenderer.Outline(new Rectangle(Point.Empty, menu.Size), 11)) menu.Region = new Region(outline);
+            if (previous != null) previous.Dispose();
+        };
+        menu.Items.Add(Entry("收起", "chevron", MicrophoneMenuRenderer.Ink, dismiss));
+        menu.Items.Add(Entry("词典", "book", MicrophoneMenuRenderer.Ink, dictionary));
+        menu.Items.Add(new ToolStripSeparator { Margin = new Padding(0, 2, 0, 2) });
+        menu.Items.Add(Entry("退出", "power", MicrophoneMenuRenderer.Danger, exit));
+        return menu;
+    }
+
+    static ToolStripMenuItem Entry(string text, string icon, Color ink, Action click) {
+        var item = new ToolStripMenuItem(text);
+        item.Image = MenuIcons.Get(icon, ink);
+        item.Tag = ink;
+        item.AutoSize = false;
+        item.Padding = Padding.Empty;
+        int width = 30 + TextRenderer.MeasureText(text, item.Font).Width + 14;
+        item.Size = new Size(width, 34);
+        item.Click += (s, e) => click();
+        return item;
+    }
+
     void ShowDictionary() {
         if (dictionary == null || dictionary.IsDisposed) dictionary = new DictionaryDialog(root);
         if (!dictionary.Visible) dictionary.Show(); else dictionary.BringToFront();
@@ -2441,6 +2548,30 @@ sealed class Microphone : Form
             }
             return;
         }
+        if (args.Length > 0 && args[0] == "--menu-test") {
+            // Renders the menu offscreen with the first row hovered, so the
+            // layout can be checked without a window ever reaching the desktop.
+            Directory.CreateDirectory(Path.Combine(root, "work"));
+            using (var host = new Form {
+                FormBorderStyle = FormBorderStyle.None, ShowInTaskbar = false,
+                StartPosition = FormStartPosition.Manual, Location = new Point(-20000, -20000),
+                Size = new Size(160, 160), BackColor = Color.White }) {
+                var preview = Microphone.CreateMenu(() => { }, () => { }, () => { });
+                host.Show();
+                preview.Show(host, new Point(0, 0));
+                Application.DoEvents();
+                preview.Items[0].Select();
+                Application.DoEvents();
+                using (var bitmap = new Bitmap(preview.Width, preview.Height)) {
+                    preview.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size));
+                    bitmap.Save(Path.Combine(root, "work", "menu.png"));
+                }
+                Console.WriteLine("MENU-TEST OK " + preview.Width + "x" + preview.Height +
+                                  " rows=" + preview.Items.Count);
+                preview.Close();
+            }
+            return;
+        }
         if (args.Length > 0 && args[0] == "--dictionary-test") {
             // Renders the editor offscreen: the window is parked outside the
             // desktop bounds, so nothing flashes and no focus visibly moves.
@@ -2622,9 +2753,12 @@ sealed class Microphone : Form
                 var menuSurface = new Rectangle(100, 100, 96, 92);
                 if (!MenuDismissHook.Outside(menuSurface, new Point(60, 140)) || MenuDismissHook.Outside(menuSurface, new Point(120, 120)))
                     throw new Exception("Only clicks outside the menu surface may dismiss it");
-                if (shell.menu.Items.Count != 3 || shell.menu.Items[0].Text != "收起" ||
-                    shell.menu.Items[1].Text != "词典" || shell.menu.Items[2].Text != "退出")
-                    throw new Exception("Menu must contain dismiss, dictionary and exit");
+                if (shell.menu.Items.Count != 4 || shell.menu.Items[0].Text != "收起" ||
+                    shell.menu.Items[1].Text != "词典" || !(shell.menu.Items[2] is ToolStripSeparator) ||
+                    shell.menu.Items[3].Text != "退出")
+                    throw new Exception("Menu must contain dismiss, dictionary, separator and exit");
+                if (shell.menu.Items[0].Image == null || shell.menu.Items[1].Image == null || shell.menu.Items[3].Image == null)
+                    throw new Exception("Every menu row must carry an icon");
                 shell.menu.Show(shell, new Point(0, 0));
                 if (!shell.menu.Visible || shell.menuGuard == null) throw new Exception("Open menu must install the outside-click guard");
                 shell.menu.Items[0].Select();
