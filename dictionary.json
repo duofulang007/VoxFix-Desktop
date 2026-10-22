@@ -10,6 +10,11 @@
       "to": "JSON",
       "from": ["Jason", "jason", "J son", "j sen", "j-son"],
       "context": "zh"
+    },
+    {
+      "to": "Codex",
+      "from": ["col death", "koldex", "koex", "colexs", "kolex", "cols", "kos"],
+      "context": "zh"
     }
   ]
 }
