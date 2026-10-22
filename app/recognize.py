@@ -10,6 +10,8 @@ import threading
 
 import numpy as np
 
+from hotwords import HotwordRescue, preimport as preimport_hotwords
+
 ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_RATE = 16000
 VAD_FRAME = SAMPLE_RATE // 10  # Stable gain and endpoints even when capture packets are batched.
@@ -42,6 +44,88 @@ def punctuation_only(original, result):
     # Existing punctuation also carries meaning (for example the dot in .NET).
     remaining = iter(result)
     return all(char in remaining for char in original if not char.isspace())
+
+
+def dictionary_pattern(variant):
+    if not isinstance(variant, str) or not variant.strip():
+        return None
+    variant = variant.strip()
+    escaped = re.escape(variant)
+    if all(char.isascii() and (char.isalnum() or char.isspace() or char == '_') for char in variant):
+        # Word edges keep "get up" from matching inside "forget upper".
+        escaped = r'(?<![A-Za-z0-9_])' + escaped + r'(?![A-Za-z0-9_])'
+    return escaped
+
+
+def load_dictionary(path):
+    """User word list applied after decoding. A missing or broken file disables it."""
+    try:
+        data = json.loads(path.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return ()
+    rules = data.get('rules') if isinstance(data, dict) else data
+    if not isinstance(rules, list):
+        return ()
+    compiled = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        canonical, variants = rule.get('to'), rule.get('from')
+        if not isinstance(canonical, str) or not canonical or not isinstance(variants, list):
+            continue
+        patterns = [pattern for pattern in map(dictionary_pattern, variants) if pattern]
+        if patterns:
+            compiled.append((re.compile('|'.join(patterns), re.IGNORECASE), canonical,
+                             rule.get('context') == 'zh'))
+    return tuple(compiled)
+
+
+def apply_dictionary(text, rules):
+    for pattern, canonical, zh_only in rules:
+        # "zh" keeps common English phrases intact in pure-English dictation.
+        if zh_only and not any('\u4e00' <= char <= '\u9fff' for char in text):
+            continue
+        text = pattern.sub(lambda match, word=canonical: word, text)
+    return text
+
+
+def load_hotwords(path):
+    """Decode-time bias list. Only an explicit `hotwords` field enables the rescue path."""
+    try:
+        data = json.loads(path.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return ()
+    words = data.get('hotwords') if isinstance(data, dict) else None
+    if not isinstance(words, list):
+        return ()
+    return tuple(word.strip() for word in words
+                 if isinstance(word, str) and word.strip())[:64]
+
+
+class Dictionary:
+    """Watches the word list file so edits apply from the next utterance, no restart."""
+
+    def __init__(self, path):
+        self.path = path
+        self.stamp = None
+        self.rules = ()
+        self.words = ()
+
+    def current(self):
+        try:
+            stamp = self.path.stat().st_mtime_ns
+        except OSError:
+            self.stamp, self.rules, self.words = None, (), ()
+            return self.rules
+        if stamp != self.stamp:
+            self.stamp = stamp
+            self.rules = load_dictionary(self.path)
+            self.words = load_hotwords(self.path)
+        return self.rules
+
+    def hotwords(self):
+        self.current()
+        return self.words
 
 
 class QuietBoost:
@@ -109,6 +193,10 @@ class Recognition:
     def __init__(self, session, vad=None):
         self.session = session
         self.vad = vad if vad is not None else create_vad()
+        self.dictionary = Dictionary(ROOT / 'dictionary.json')
+        # Decode-time hotword rescue stays dormant until the word list asks for
+        # it; the extra ONNX session is created on the first real near-miss.
+        self.rescue = HotwordRescue()
         self.condition = threading.Condition()
         self.worker = None
         self.clear()
@@ -301,7 +389,17 @@ class Recognition:
                         key, audio = self.draft
                         self.draft = None
                     self.decoding = True
-                text = re.sub(r'<\|[^|]*\|>', '', self.session.run(QuietBoost().process(audio)).text).strip()
+                audio = QuietBoost().process(audio)
+                text = re.sub(r'<\|[^|]*\|>', '', self.session.run(audio).text).strip()
+                # Rescue runs only on finals and only when the sherpa text looks
+                # like a near-miss of a word in the hotword list; anything it
+                # cannot improve (or any failure) leaves the text untouched.
+                if final and self.rescue is not None:
+                    text = self.rescue.rescore(audio, text, self.dictionary.hotwords())
+                # Word list runs on drafts and finals alike (no flash of a draft that
+                # later rewrites itself) and before punctuation, so punctuation_only
+                # keeps comparing one consistent text.
+                text = apply_dictionary(text, self.dictionary.current())
                 if final and hasattr(self.session, 'punctuate'):
                     text = self.session.punctuate(text)
                 with self.condition:
@@ -344,6 +442,7 @@ def main():
     try:
         session, backend = load_model()
         recognition = Recognition(session)
+        threading.Thread(target=preimport_hotwords, daemon=True).start()
         send({'ready': True, 'streaming': False, 'segmented': True,
               'preview': True, 'model': 'SenseVoiceSmall INT8', 'backend': backend})
         for line in sys.stdin:

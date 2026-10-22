@@ -1,7 +1,10 @@
 """Deterministic production-pipeline tests; no microphone or desktop input."""
 import base64
+import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import threading
 import time
 from types import SimpleNamespace
@@ -10,7 +13,8 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'app'))
-from recognize import Recognition, QuietBoost, SenseVoiceSession, join_text, punctuation_only
+from recognize import (Dictionary, Recognition, QuietBoost, SenseVoiceSession,
+                       apply_dictionary, join_text, punctuation_only)
 
 
 class Vad:
@@ -314,6 +318,72 @@ class PipelineTests(unittest.TestCase):
                     add_punctuation=lambda text: rewritten))
                 self.assertEqual(SenseVoiceSession.punctuate(session, original), original)
         self.assertTrue(punctuation_only('你好，世界', '你好，世界。'))
+
+    def test_dictionary_rewrites_phrases_with_word_edges_and_context(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'dictionary.json'
+            path.write_text(json.dumps({'rules': [
+                {'to': 'GitHub', 'from': ['get up', 'git up'], 'context': 'zh'},
+                {'to': 'PDF', 'from': ['p d f']},
+            ]}, ensure_ascii=False), encoding='utf-8')
+            words = Dictionary(path)
+            rules = words.current()
+            self.assertEqual(apply_dictionary('我说一下 get up 的用法', rules),
+                             '我说一下 GitHub 的用法')
+            self.assertEqual(apply_dictionary('说 Get Up 的人', rules), '说 GitHub 的人')
+            self.assertEqual(apply_dictionary('git up 地址发你', rules), 'GitHub 地址发你')
+            # "zh" rules leave pure-English dictation untouched.
+            self.assertEqual(apply_dictionary('I get up at seven', rules), 'I get up at seven')
+            # Rules without "context" always apply, even in English text.
+            self.assertEqual(apply_dictionary('export the p d f file', rules),
+                             'export the PDF file')
+            # Word edges: "get up" inside "forget upper" must not be rewritten.
+            self.assertEqual(apply_dictionary('forget upper case', rules), 'forget upper case')
+
+    def test_dictionary_watches_edits_and_survives_broken_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'dictionary.json'
+            words = Dictionary(path)
+            self.assertEqual(words.current(), ())
+            path.write_text('{"rules": [{"to": "GitHub", "from": ["get up"]}]}', encoding='utf-8')
+            os.utime(path, ns=(1_000_000, 1_000_000))
+            self.assertEqual(apply_dictionary('get up', words.current()), 'GitHub')
+            path.write_text('{broken json', encoding='utf-8')
+            os.utime(path, ns=(2_000_000, 2_000_000))
+            self.assertEqual(words.current(), ())
+            self.assertEqual(apply_dictionary('get up', ()), 'get up')
+            path.write_text('{"rules": [{"to": "GitHub", "from": ["git up"]}]}', encoding='utf-8')
+            os.utime(path, ns=(3_000_000, 3_000_000))
+            self.assertEqual(apply_dictionary('git up', words.current()), 'GitHub')
+            path.unlink()
+            self.assertEqual(words.current(), ())
+            # Invalid entries are skipped instead of breaking the pipeline.
+            path.write_text(json.dumps({'rules': [
+                'junk', 7, {'to': ''}, {'from': ['x']}, {'to': 'Ok', 'from': ['ok!', '']}
+            ]}), encoding='utf-8')
+            os.utime(path, ns=(4_000_000, 4_000_000))
+            self.assertEqual(apply_dictionary('it is ok! now', words.current()),
+                             'it is Ok now')
+
+    def test_dictionary_applies_to_preview_and_final_through_the_pipeline(self):
+        session = Session()
+        engine = Recognition(session, Vad())
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'dictionary.json'
+            path.write_text('{"rules": [{"to": "GitHub", "from": ["get up"], "context": "zh"}]}',
+                            encoding='utf-8')
+            engine.dictionary = Dictionary(path)
+            try:
+                session.text = '把 get up 链接发我'
+                engine.handle({'op': 'start', 'id': 'test'})
+                self.feed(engine)
+                self.wait_for(engine, 'preview', '把 GitHub 链接发我')
+                session.text = 'I get up early'
+                final = engine.handle({'op': 'stop', 'id': 'test'})
+                self.assertEqual(final['text'], 'I get up early')
+                self.assertEqual(final['segments'][-1]['text'], 'I get up early')
+            finally:
+                engine.clear()
 
     def test_asr_preserves_relative_volume_inside_a_segment(self):
         class Spy(Session):

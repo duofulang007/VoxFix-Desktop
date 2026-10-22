@@ -1,0 +1,10 @@
+{
+  "hotwords": ["GitHub"],
+  "rules": [
+    {
+      "to": "GitHub",
+      "from": ["get up", "git up", "git hub", "get hub", "gethub", "githup"],
+      "context": "zh"
+    }
+  ]
+}
