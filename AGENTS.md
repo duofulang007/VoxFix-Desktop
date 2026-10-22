@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本仓库的操作约定。当前版本 **1.6.39.0**；产品说明见 [README](README.md)，
+本仓库的操作约定。当前版本 **1.6.40.0**；产品说明见 [README](README.md)，
 技术记录从 [docs/README.md](docs/README.md) 读起，工具入口见 [tools/README.md](tools/README.md)。
 
 ## 生产链路
@@ -8,7 +8,8 @@
 - `app/Microphone.cs`：单文件 C# WinForms，负责窗口、全局快捷键、采音、焦点、送字与原生自检；无 NuGet、无 .NET SDK。
 - `app/recognize.py`：stdin/stdout 逐行 JSON 子进程，负责 VAD 分段、可修订草稿、个人词典、标点和按序定稿。
   个人词典在项目根 `dictionary.json`（用户可编辑、保存即生效），解码后、标点前替换，
-  草稿与定稿都过词表；文件缺失或损坏时该层自动停用。`context: "zh"` 只在中英混说句替换，防止改坏纯英文短语。
+  草稿与定稿都过词表；文件缺失或损坏时该层自动停用。`context: "zh"` 只在含中文的整段话里替换（1.6.40.0 起按整段话判断，
+  不再只看当前分段），防止改坏纯英文短语；不写 `context` 的规则在任何语言下都生效。
 - `app/hotwords.py`：解码期热词偏置（救援通道）。定稿文本出现词表词的近音片段时才用 ORT 复解该段，
   命中更多词表词才采用；额外 ONNX 会话惰性创建、闲置 180 秒释放。由 `dictionary.json` 的 `hotwords`
   字段显式启用，不写则完全不动。
@@ -91,7 +92,8 @@ Get-Content work\microphone-self-test.txt
 13. 右键菜单固定三项：收起 / 词典 / ─ / 退出，白色卡片、每行一个矢量图标、行宽按文字自适应（不许留右侧空白）。
     「整理」不挂在菜单上：它是词典窗口「错法」框内的能力——粘贴或点框右上角「整理」，把标点串起来的写法拆成一行一个并去重
     （空格不拆，`col death` 仍是一条）。改这里必须跑 `--dictionary-test`，输出 `TIDY-TEST` 一行。`词典` 打开 `DictionaryDialog`，保存必须用 `File.Replace` 原子写
-    `dictionary.json`（Python 侧按 mtime 重载），`hotwords` 写全部词、`rules` 只写有错法的词且 `context` 固定 `zh`；
+    `dictionary.json`（Python 侧按 mtime 重载），`hotwords` 写全部词、`rules` 只写有错法的词，
+    每条规则的 `context` 沿用文件里的原值（缺省则继续不写），不能一律改成 `zh`；
     有未保存修改时关闭要先问。改这个窗口必须跑 `--dictionary-test`（离屏截图 + 往返 JSON 校验），不要弹到桌面。
 13. 悬浮窗是 `WS_EX_NOACTIVATE`，收不到失焦消息，菜单不能指望 WinForms 自动关闭：`ContextMenuStrip` 打开期间必须挂 `MenuDismissHook`（WH_MOUSE_LL），
     点窗口外任意位置关闭；选任一项、Esc、收起、退出、隐藏窗口、销毁前也必须关闭并释放钩子。改这块要跑 `--self-test` 的菜单段（含钩子回调重放）。
