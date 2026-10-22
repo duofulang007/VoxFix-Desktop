@@ -1,5 +1,5 @@
 {
-  "hotwords": ["GitHub"],
+  "hotwords": ["GitHub", "Python", "API", "JSON", "PDF", "WiFi"],
   "rules": [
     {
       "to": "GitHub",

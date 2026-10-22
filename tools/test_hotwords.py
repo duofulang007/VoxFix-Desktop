@@ -10,7 +10,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'app'))
 import hotwords
-from hotwords import HotwordRescue, compact, hotword_hits, near_miss
+from hotwords import HotwordRescue, compact, hotword_hits, near_miss, strong_hits
 import test_sensevoice as fixtures
 from recognize import Dictionary, Recognition, load_hotwords
 
@@ -39,8 +39,10 @@ class TriggerTests(unittest.TestCase):
 
     def test_near_miss_accepts_spelling_and_spacing_variants(self):
         for text, word in [('我今天用pyython写了一个脚本', 'Python'),
+                           ('所以我上学期也学了pyython', 'Python'),
                            ('请把代码提交到gitthub', 'GitHub'),
                            ('返回的是 J SON 数据', 'JSON'),
+                           ('这个app返回的是数据', 'API'),
                            ('a', 'API')]:
             self.assertIn(word, near_miss(text, [word]), text)
 
@@ -50,13 +52,22 @@ class TriggerTests(unittest.TestCase):
                            ('填 pdf 格式', 'PDF'),
                            ('桌子上那杯水是我的', 'GitHub'),
                            ('今天天气很好', 'Python'),
-                           ('I use Kotlin and Python', 'Kotlin')]:
+                           ('I use Kotlin and Python', 'Kotlin'),
+                           ('I build an android application', 'API'),
+                           ('the main for engine system', 'Android'),
+                           ('I use a lot of tools', 'API')]:
             self.assertEqual(near_miss(text, [word]), [], text)
 
     def test_hotword_hits_counts_words_present(self):
         self.assertEqual(hotword_hits('这个app返回的是JSON数据', ['JSON', 'API']), 1)
         self.assertEqual(hotword_hits('把文件保存成PDF格式', ['PDF', 'GitHub']), 1)
         self.assertEqual(hotword_hits('普通句子', ['PDF']), 0)
+
+    def test_strong_hits_requires_the_word_spelled_out(self):
+        # "J SON" compaction equals JSON, but only one of them is spelled out.
+        self.assertEqual(strong_hits('返回的是 J SON 数据', ['JSON']), 0)
+        self.assertEqual(strong_hits('返回的是 JSON 数据', ['JSON']), 1)
+        self.assertEqual(hotword_hits('返回的是 J SON 数据', ['JSON']), 1)
 
 
 class RescueTests(unittest.TestCase):
@@ -97,6 +108,14 @@ class RescueTests(unittest.TestCase):
         self.assertEqual(rescue.rescore(self.audio, '请把代码提交到gitthub', ['GitHub']),
                          '请把代码提交到gitthub')
         self.assertEqual(rescue.stats['rescued'], 0)
+
+    def test_spacing_variant_is_accepted_even_though_compaction_matches(self):
+        # "J SON" already compacts to "json", so the old guard refused the fix.
+        hotwords.Decoder = lambda: FakeDecoder('这个app返回的是JSON数据')
+        rescue = HotwordRescue()
+        self.assertEqual(rescue.rescore(self.audio, '这个app返回的是J SON数据', ['JSON']),
+                         '这个app返回的是JSON数据')
+        self.assertEqual(rescue.stats['rescued'], 1)
 
     def test_truncated_or_failing_decode_keeps_the_original_text(self):
         hotwords.Decoder = lambda: FakeDecoder('github')

@@ -28,12 +28,11 @@ MODEL = ROOT / 'models/sensevoice/model.int8.onnx'
 TOKENS = ROOT / 'models/sensevoice/tokens.txt'
 SAMPLE_RATE = 16000
 
-BOOST = 2.0           # logit bonus for the next hotword token (P1 sweep: 2.0 == 3.0, >5 overshoots)
+BOOST = 3.0           # logit bonus for the next hotword token (P1 sweep: 3.0 fixes JSON, >5 overshoots)
 TAG_TOKENS = 4        # <|lang|>, <|EMO|>, <|event|>, <|itn|>
-NEAR_MIN = 2          # minimum edit distance that counts as "sounds like"
 IDLE_SECONDS = 180    # release the extra ONNX session after this much silence
 
-_ALNUM = re.compile(r'[^a-z0-9]+')
+_ALNUM = re.compile(r'[a-z0-9]+')
 
 
 def preimport():
@@ -47,7 +46,7 @@ def preimport():
 
 def compact(text):
     """Lowercase alphanumerics only, so `J SON` and `json` compare equal."""
-    return _ALNUM.sub('', text.lower())
+    return re.sub(r'[^a-z0-9]+', '', text.lower())
 
 
 def edit_distance(a, b, limit):
@@ -68,12 +67,26 @@ def edit_distance(a, b, limit):
     return previous[-1]
 
 
-def near_miss(text, words):
-    """Words the text nearly spells: `pyython`/python, `gitthub`/github, `J SON`/json."""
-    flat = compact(text)
-    low = text.lower()
-    if not flat:
+def _candidates(text):
+    """Word-like runs and adjacent pairs, so `J SON` is still one candidate."""
+    runs = _ALNUM.findall(text.lower())
+    if not runs:
         return []
+    return runs + [runs[i] + runs[i + 1] for i in range(len(runs) - 1)]
+
+
+def near_miss(text, words):
+    """Words the text nearly spells: `pyython`/python, `gitthub`/github, `J SON`/json.
+
+    Only whole alphanumeric runs are compared (plus two adjacent runs), so an
+    English word inside a longer word no longer triggers a rescue. One edit is
+    allowed for short words, two for long ones.
+    """
+    low = text.lower()
+    candidates = _candidates(text)
+    if not candidates:
+        return []
+    short_text = len(compact(text))
     found = []
     for word in words:
         target = compact(word)
@@ -81,19 +94,15 @@ def near_miss(text, words):
             continue
         if target in low:
             continue  # already there, ignoring case; nothing to rescue
-        if target in flat:
-            found.append(word)  # right letters, split by spaces ("J SON")
+        limit = 2 if len(target) >= 8 else 1
+        if any(edit_distance(candidate, target, limit) <= limit for candidate in candidates):
+            found.append(word)
             continue
-        limit = max(NEAR_MIN, len(target) // 3)
-        hit = False
-        for size in range(max(1, len(target) - limit), len(target) + limit + 1):
-            for start in range(0, max(0, len(flat) - size) + 1):
-                if edit_distance(flat[start:start + size], target, limit) <= limit:
-                    hit = True
-                    break
-            if hit:
-                break
-        if hit:
+        # Dictating a bare acronym ("API" heard as "a"): only when the whole
+        # utterance is that fragment, so an article "a" in a sentence stays put.
+        if short_text <= len(target) + 2 and any(
+                target.startswith(candidate) and len(candidate) >= 1
+                for candidate in candidates):
             found.append(word)
     return found
 
@@ -101,6 +110,12 @@ def near_miss(text, words):
 def hotword_hits(text, words):
     flat = compact(text)
     return sum(1 for word in words if compact(word) and compact(word) in flat)
+
+
+def strong_hits(text, words):
+    """Words spelled out contiguously, so `J SON` does not count as `JSON`."""
+    low = text.lower()
+    return sum(1 for word in words if compact(word) and compact(word) in low)
 
 
 def load_pieces():
@@ -336,7 +351,12 @@ class HotwordRescue:
         except Exception:
             self.stats['failed'] += 1
             return text
-        if hotword_hits(biased, words) <= hotword_hits(text, words):
+        # Accept only if the rescue spells a word out properly ("J SON" -> "JSON")
+        # or at least puts more of the word list into the text; never fewer.
+        gained = strong_hits(biased, words) - strong_hits(text, words)
+        if gained < 0:
+            return text
+        if gained == 0 and hotword_hits(biased, words) <= hotword_hits(text, words):
             return text
         if len(biased) < 0.6 * len(text):
             return text
