@@ -47,7 +47,10 @@ Python 测试统一使用 `.venv/Scripts/python.exe`，按改动范围运行：
 | `tools/test_evaluation.py` | 新评测的评分、结果防覆盖、音频校验与压力变换；无需模型 |
 | `tools/test_desktop_window.py` | 实际交互桌面的窗口可见性与表面绘制，须已有可见 VoxFix 窗口 |
 
-原生测试用 `Start-Process` 等待退出，不能在 PowerShell 直接把带引号路径当命令：
+原生测试用 `Start-Process` 等待退出，不能在 PowerShell 直接把带引号路径当命令。本机若环境里同时存在
+`HTTPS_PROXY` 与 `https_proxy`（Windows 环境变量不区分大小写），`Start-Process` 会报「字典中的关键字重复」，
+此时改用管道调用：`$out = & '.\bin\VoxFix Desktop.exe' --dictionary-test 2>&1 | Out-String`，
+管道会等进程退出，`DICTIONARY-TEST` / `TIDY-TEST` 也能直接落盘。
 
 ```powershell
 $p = Start-Process '.\bin\VoxFix Desktop.exe' -ArgumentList '--self-test' -Wait -PassThru
@@ -89,13 +92,13 @@ Get-Content work\microphone-self-test.txt
     `work/hotword-prototype/p2_prod_eval.py`（生产路径 174 与封存 1,314）。
 11. Win+H 开始/暂停，Esc 收起；不恢复浮动小字提示。UI 几何、材质和动画改动必须验证实际桌面。
 12. 复制未上屏缓存只能由胶囊右侧按钮触发；键盘钩子不得捕获 Ctrl+C（1.6.32.0 起），无缓存、有缓存、复制前后都一样交给原应用。
-13. 右键菜单固定三项：收起 / 词典 / ─ / 退出，白色卡片、每行一个矢量图标、行宽按文字自适应（不许留右侧空白）。
+13. 右键菜单固定为三条命令加一条分隔线：收起 / 词典 / ─ / 退出，白色卡片、每行一个矢量图标、行宽按文字自适应（不许留右侧空白）。
     「整理」不挂在菜单上：它是词典窗口「错法」框内的能力——粘贴或点框右上角「整理」，把标点串起来的写法拆成一行一个并去重
     （空格不拆，`col death` 仍是一条）。改这里必须跑 `--dictionary-test`，输出 `TIDY-TEST` 一行。`词典` 打开 `DictionaryDialog`，保存必须用 `File.Replace` 原子写
     `dictionary.json`（Python 侧按 mtime 重载），`hotwords` 写全部词、`rules` 只写有错法的词，
     每条规则的 `context` 沿用文件里的原值（缺省则继续不写），不能一律改成 `zh`；
     有未保存修改时关闭要先问。改这个窗口必须跑 `--dictionary-test`（离屏截图 + 往返 JSON 校验），不要弹到桌面。
-13. 悬浮窗是 `WS_EX_NOACTIVATE`，收不到失焦消息，菜单不能指望 WinForms 自动关闭：`ContextMenuStrip` 打开期间必须挂 `MenuDismissHook`（WH_MOUSE_LL），
+14. 悬浮窗是 `WS_EX_NOACTIVATE`，收不到失焦消息，菜单不能指望 WinForms 自动关闭：`ContextMenuStrip` 打开期间必须挂 `MenuDismissHook`（WH_MOUSE_LL），
     点窗口外任意位置关闭；选任一项、Esc、收起、退出、隐藏窗口、销毁前也必须关闭并释放钩子。改这块要跑 `--self-test` 的菜单段（含钩子回调重放）。
 
 ## 文件、数据与历史

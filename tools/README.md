@@ -1,6 +1,6 @@
 # 工具索引
 
-版本 1.6.29.0；日期 2026-10-22。生产只运行 `app/` 中的两个入口，以下均为维护工具。
+版本 1.6.40.0；日期 2026-10-23。生产只运行 `app/` 中的两个入口，以下均为维护工具。
 Python 脚本使用项目 `.venv/Scripts/python.exe`，原生测试参数与结果文件见 [AGENTS.md](../AGENTS.md)。
 
 ## 现行测试
@@ -9,6 +9,7 @@ Python 脚本使用项目 `.venv/Scripts/python.exe`，原生测试参数与结�
 |---|---|
 | `test_sensevoice.py` | 无模型的协议、分段、草稿、尾音和标点契约 |
 | `test_language_guard.py` | 外文结果拒绝与先前定稿保留 |
+| `test_hotwords.py` | 近音触发、接受守卫、失败回退、会话释放与管线接线，无需模型 |
 | `test_asr_scoring.py` | 共享评分函数的边界回归 |
 | `test_microphone.py` | 真实模型、固定音频与 175 秒连续会话，不访问麦克风 |
 | `evaluate_sensevoice.py` | 默认旧 174 条；支持 `--manifest`、`--output`，重新推理并记录音频/模型/源码哈希、分组错误率；结果不覆盖 |
