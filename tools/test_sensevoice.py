@@ -170,9 +170,11 @@ class PipelineTests(unittest.TestCase):
             self.feed(engine)
             result = self.wait_for(engine, 'preview', '暂时识别')
             self.assertEqual(result['text'], '')
+            self.assertEqual(result['preview_segment'], {'route': 0, 'start': 0, 'text': '暂时识别'})
             session.text = '最终识别。'
             final = engine.handle({'op': 'stop', 'id': 'test'})
             self.assertEqual(final['text'], '最终识别。')
+            self.assertIsNone(final['preview_segment'])
             self.assertEqual(final['samples'], 16000)
             self.assertIsNone(engine.worker)
             engine.handle({'op': 'start', 'id': 'test'})
@@ -194,6 +196,44 @@ class PipelineTests(unittest.TestCase):
             self.feed(engine)
             self.wait_for(engine, 'preview', session.text)
             self.assertEqual(engine.handle({'op': 'stop', 'id': 'test'})['text'], session.text)
+        finally:
+            engine.clear()
+
+    def test_preview_identity_clears_on_route_change_and_final_keeps_punctuation(self):
+        session = Session()
+        session.punctuate = lambda text: text + '。'
+        engine = Recognition(session, Vad())
+        try:
+            engine.handle({'op': 'start', 'id': 'test'})
+            self.feed(engine)
+            self.wait_for(engine, 'preview', session.text)
+            routed = engine.handle({'op': 'route', 'id': 'test', 'route': 1})
+            self.assertIsNone(routed['preview_segment'])
+            session.text = '新的话'
+            self.feed(engine)
+            result = self.wait_for(engine, 'preview', session.text)
+            self.assertEqual(result['preview_segment'], {'route': 1, 'start': 16000, 'text': session.text})
+            final = engine.handle({'op': 'stop', 'id': 'test'})
+            self.assertEqual(final['segments'][-1]['text'], '新的话。')
+        finally:
+            engine.clear()
+
+    def test_initial_silence_keeps_preview_identity_when_stop_expands_audio(self):
+        class LateVad(Vad):
+            @property
+            def current_segment(self):
+                return SimpleNamespace(start=32000, samples=self.audio[32000:])
+
+        engine = Recognition(Session(), LateVad())
+        try:
+            engine.handle({'op': 'start', 'id': 'test'})
+            for _ in range(3):
+                self.feed(engine)
+            preview = self.wait_for(engine, 'preview', '暂时识别')['preview_segment']
+            final = engine.handle({'op': 'stop', 'id': 'test'})['segments'][0]
+            self.assertEqual(final['start'], 0)
+            self.assertEqual(final['preview_start'], preview['start'])
+            self.assertNotEqual(final['start'], preview['start'])
         finally:
             engine.clear()
 

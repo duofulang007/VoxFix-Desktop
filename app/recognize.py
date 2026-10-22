@@ -133,6 +133,7 @@ class Recognition:
             self.pending = deque()
             self.draft = None
             self.active_key = None
+            self.preview_key = None
             self.committed = self.preview = self.error = ''
             self.ending = False
             self.decoding = False
@@ -144,6 +145,8 @@ class Recognition:
                 raise RuntimeError(self.error)
             return {'event': event, 'id': self.id, 'text': self.committed,
                     'preview': self.preview, 'samples': self.samples, 'level': self.level,
+                    'preview_segment': ({'start': self.preview_key[0], 'route': self.preview_key[1],
+                                         'text': self.preview} if self.preview and self.preview_key else None),
                     'speaking': bool(self.vad.is_speech_detected()),
                     'transcribing': bool(self.vad.is_speech_detected() or self.pending or self.draft is not None or self.decoding),
                     'segments': list(self.segments)}
@@ -232,7 +235,7 @@ class Recognition:
         if self.vad.is_speech_detected():
             current = self.vad.current_segment
             start = self.last_end if self.carry else max(self.last_end, self.vad_offset + current.start - BOUNDARY_PAD)
-            self.active_key = (self.vad_offset + current.start, self.route)
+            self.active_key = (start, self.route)
             if self.samples - start >= MIN_PREVIEW and self.samples - self.last_preview >= PREVIEW_STEP:
                 self.draft = (self.active_key, self.audio[start:self.samples].copy())
                 self.last_preview = self.samples
@@ -273,7 +276,8 @@ class Recognition:
         if end > start:
             if len(self.pending) >= 24:
                 raise RuntimeError('识别队列积压，请结束本次录音后重试')
-            self.pending.append((self.route, start, end, self.audio[start:end].copy()))
+            preview_start = self.active_key[0] if self.active_key is not None else start
+            self.pending.append((self.route, start, end, preview_start, self.audio[start:end].copy()))
             self.last_end = end
             self.carry = forced
         self.draft = None
@@ -289,7 +293,7 @@ class Recognition:
                         return
                     if self.pending:
                         final, key = True, None
-                        route, start, end, audio = self.pending.popleft()
+                        route, start, end, preview_start, audio = self.pending.popleft()
                     elif self.ending:
                         return
                     else:
@@ -312,9 +316,11 @@ class Recognition:
                         previous = self.committed
                         self.committed = join_text(previous, text)
                         self.segments.append({'route': route, 'start': start, 'end': end,
+                                              'preview_start': preview_start,
                                               'text': self.committed[len(previous):]})
                     elif key == self.active_key and not self.ending:
                         self.preview = text
+                        self.preview_key = key
         except Exception as error:
             with self.condition:
                 self.decoding = False
@@ -345,8 +351,10 @@ def main():
                 send(recognition.handle(json.loads(line)))
             except Exception as error:
                 recovery, draft = recognition.committed, recognition.preview
+                segments = list(recognition.segments)
                 recognition.clear()
-                send({'error': str(error), 'text': recovery, 'preview': draft})
+                send({'error': str(error), 'text': recovery, 'preview': draft,
+                      'segments': segments})
     except Exception as error:
         send({'error': str(error)})
         return 1

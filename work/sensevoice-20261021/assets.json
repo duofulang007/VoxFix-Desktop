@@ -4,8 +4,9 @@
   "assets": [
     {
       "path": "models\\sensevoice\\model.int8.onnx",
-      "bytes": 239233841,
-      "sha256": "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51"
+      "bytes": 239234125,
+      "sha256": "27377bac3e1f2e2588cbce401c8a5ab48991a4ad9da963357fc7a964ad3adaa6",
+      "note": "2026-10-22 mixed fine-tune (see docs/多源真人语料微调SenseVoice-2026-10-22.md)"
     },
     {
       "path": "models\\sensevoice\\tokens.txt",

@@ -15,7 +15,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.24.0")]
+[assembly: AssemblyVersion("1.6.29.0")]
 
 static class Native
 {
@@ -219,8 +219,14 @@ sealed class ShapeMotion
     }
 }
 
+sealed class DraftText
+{
+    internal string Text = "", Separator = "";
+}
+
 sealed class TextDelivery
 {
+    internal readonly Dictionary<string, DraftText> Drafts = new Dictionary<string, DraftText>();
     internal string Delivered = "", Accounted = "", Latest = "", Paused = "";
     internal bool Cancelled;
     internal bool Invalidated;
@@ -427,6 +433,7 @@ sealed class MicrophoneMenuRenderer : ToolStripProfessionalRenderer
 
 sealed class Microphone : Form
 {
+    const int RenderScale = 4;
     readonly string root;
     readonly bool smokeTest;
     readonly bool streamTest;
@@ -452,7 +459,7 @@ sealed class Microphone : Form
     readonly bool probeOnly;
     readonly bool shortcutCycleTest;
     bool inputFocused;
-    bool recoveryCopied;
+    bool recoveryCopied, shortcutCopyConsumed;
     bool hovered, pressed, pressCancelled;
     float copyFeedback, hoverFeedback, pressFeedback;
     bool heldTriggered;
@@ -703,6 +710,7 @@ sealed class Microphone : Form
         try {
             copyText(recovery);
             recoveryCopied = true;
+            shortcutCopyConsumed = true;
             AccessibleDescription = state == "error" ? "已复制 · 左侧重试 · 右侧重新复制" : "已复制 · 录音时点左侧声纹结束，点右侧重新复制 · 长按清空并开始新录音";
         } catch { AccessibleDescription = "剪贴板暂时不可用，文字仍在图标里，点击重试。"; }
         UpdateMemoryShape();
@@ -741,11 +749,11 @@ sealed class Microphone : Form
             // Otherwise a waiting cache owns the capsule, and with nothing cached the
             // shape still reports whether this focus can receive text right now.
             if (recovery.Length > 0) return true;
-            return !inputFocused && (state == "idle" || state == "error");
+            return !inputFocused && (state == "idle" || state == "error" || state == "busy");
         }
     }
     bool CopyReady { get { return !restarting && recovery.Length > 0 && !transcribing && !speechDetected && state != "busy" && state != "loading"; } }
-    bool ShortcutCopyReady { get { return Visible && CopyReady && !recoveryCopied; } }
+    bool ShortcutCopyReady { get { return Visible && CopyReady && !shortcutCopyConsumed; } }
     void SetInputFocus(bool focused) {
         if (inputFocused == focused) return;
         inputFocused = focused;
@@ -832,13 +840,75 @@ sealed class Microphone : Form
             int index = 0;
             foreach (Dictionary<string, object> segment in (System.Collections.IEnumerable)reply["segments"]) {
                 if (index++ < appliedSegments) continue;
-                ApplyText(delivery.Latest + Convert.ToString(segment["text"]), backupRoutes.Contains(Convert.ToInt32(segment["route"])));
+                ApplySegment(segment, true);
                 appliedSegments = index;
             }
         } else ApplyText(Convert.ToString(reply["text"]));
+        if (delivery != null && reply.ContainsKey("preview_segment") && reply["preview_segment"] != null)
+            ApplySegment((Dictionary<string, object>)reply["preview_segment"], false);
         string preview = reply.ContainsKey("preview") ? Convert.ToString(reply["preview"]) : "";
         if (draft != preview) { draft = preview; UpdateMemoryShape(); }
         UpdateMemoryShape();
+    }
+    void ApplySegment(Dictionary<string, object> segment, bool final) {
+        int route = Convert.ToInt32(segment["route"]);
+        string key = route + ":" + Convert.ToString(segment.ContainsKey("preview_start") ? segment["preview_start"] : segment["start"]);
+        string text = Convert.ToString(segment["text"]).TrimStart();
+        DraftText previous;
+        bool memory = backupRoutes.Contains(route) || delivery.Paused.Length != 0;
+        if (!delivery.Drafts.TryGetValue(key, out previous)) {
+            if (final) { ApplyText(delivery.Latest + Convert.ToString(segment["text"]), memory); return; }
+            if (memory) return;
+            previous = new DraftText();
+            if (delivery.Latest.Length > 0 && text.Length > 0 &&
+                delivery.Latest[delivery.Latest.Length - 1] < 128 && Char.IsLetterOrDigit(delivery.Latest[delivery.Latest.Length - 1]) &&
+                text[0] < 128 && Char.IsLetterOrDigit(text[0])) previous.Separator = " ";
+            delivery.Drafts.Add(key, previous);
+        }
+        if (text.Length > 0) text = previous.Separator + text;
+        if (memory) {
+            if (final) {
+                if (text.StartsWith(previous.Text, StringComparison.Ordinal)) ApplyText(delivery.Latest + text.Substring(previous.Text.Length), true);
+                else KeepRecovery("\n[该句最终识别] " + text);
+            }
+        } else {
+            ReviseText(previous.Text, text);
+            previous.Text = text;
+        }
+        if (final) delivery.Drafts.Remove(key);
+    }
+    void ReviseText(string previous, string text) {
+        int common = CommonPrefix(previous, text);
+        if (common == previous.Length) { ApplyText(delivery.Latest + text.Substring(common)); return; }
+        if (delivery.Latest != delivery.Accounted || !delivery.Latest.EndsWith(previous, StringComparison.Ordinal) ||
+            !delivery.Delivered.EndsWith(previous, StringComparison.Ordinal))
+            throw new IOException("无法确认本轮草稿位置，已停止修订。");
+        if (Native.GetForegroundWindow() != target || targetFocus == IntPtr.Zero || Native.Focus(target) != targetFocus || EditingGestureDown()) {
+            Pause("输入位置已变化，已停止修订并保留最终识别结果。");
+            KeepRecovery("\n[该句最终识别] " + text);
+            return;
+        }
+        int remove = previous.Length - common;
+        string suffix = text.Substring(common);
+        var inputs = new Native.Input[(remove + suffix.Length) * 2];
+        for (int i = 0; i < remove; i++) {
+            inputs[i * 2] = Native.KeyInput(8, false); inputs[i * 2 + 1] = Native.KeyInput(8, true);
+        }
+        var added = Native.TextInputs(suffix); Array.Copy(added, 0, inputs, remove * 2, added.Length);
+        uint sent = Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Native.Input)));
+        int deleted = Math.Min(remove, (int)((sent + 1) / 2));
+        int inserted = Math.Min(suffix.Length, Math.Max(0, (int)((sent + 1) / 2) - remove));
+        delivery.Delivered = delivery.Delivered.Substring(0, delivery.Delivered.Length - deleted) + suffix.Substring(0, inserted);
+        delivery.Latest = delivery.Accounted = delivery.Latest.Substring(0, delivery.Latest.Length - deleted) + suffix.Substring(0, inserted);
+        if (sent != inputs.Length) {
+            Pause("草稿修订未完整送出，已停止修订并保留最终识别结果。");
+            KeepRecovery("\n[该句最终识别] " + text);
+        }
+    }
+    internal static int CommonPrefix(string previous, string text) {
+        int length = 0;
+        while (length < previous.Length && length < text.Length && previous[length] == text[length]) length++;
+        return length;
     }
     internal static string EarconPath(string name) {
         return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "SystemApps", "MicrosoftWindows.Client.CBS_cw5n1h2txyewy", "InputApp", "Assets", "Dictation", name + ".wav");
@@ -869,9 +939,9 @@ sealed class Microphone : Form
             if (runChecks && memoryTest) { await RunMemoryTest(); return; }
             if (runChecks && streamTest) { await RunStreamTest(); return; }
             if (runChecks && smokeTest) {
-                recovery = "上一轮缓存"; recoveryCopied = true;
+                recovery = "上一轮缓存"; recoveryCopied = shortcutCopyConsumed = true;
                 await BeginStream();
-                if (recovery.Length != 0 || recoveryCopied) throw new Exception("New round must clear old cache after backend starts");
+                if (recovery.Length != 0 || recoveryCopied || shortcutCopyConsumed) throw new Exception("New round must clear old cache and rearm Ctrl+C after backend starts");
                 KeepRecovery("本轮已定稿");
                 await FinishRecording(new byte[0]);
                 await Dismiss();
@@ -1087,7 +1157,7 @@ sealed class Microphone : Form
                 if (closing) return;
                 guard = new InteractionGuard(OwnsSurface, reason => Pause(reason + "改变了输入位置，正在重新检测输入框。", true));
                 listening = true; playEarcon("BasicListeningEarcon", false);
-                Status("recording", editable ? "正在录音，停顿后输入 · 点击麦克风结束" : "正在录音，未上屏文字将直接显示为复制按钮 · 右键可结束录音"); limit.Start(); capture.Start();
+                Status("recording", editable ? "正在录音，识别到文字即输入 · 点击麦克风结束" : "正在录音，未上屏文字将直接显示为复制按钮 · 右键可结束录音"); limit.Start(); capture.Start();
                 if (dismissRequested) await EndRecording();
             } catch (Exception error) { Fail(error.Message); }
             return;
@@ -1102,7 +1172,7 @@ sealed class Microphone : Form
         targetEpoch++; nextTargetProbe = 0;
         var reply = await Exchange(new { op = "start", id = recordingId });
         if (Convert.ToString(reply["event"]) != "started") throw new IOException("无法开始流式识别。");
-        recovery = ""; recoveryCopied = false; copyFeedback = readyFeedback = 0;
+        recovery = ""; recoveryCopied = shortcutCopyConsumed = false; copyFeedback = readyFeedback = 0;
         UpdateMemoryShape(); RefreshSurface();
     }
     async Task<Dictionary<string, object>> Exchange(object request) {
@@ -1110,7 +1180,7 @@ sealed class Microphone : Form
         await worker.StandardInput.FlushAsync();
         var reply = await Reply();
         if (reply.ContainsKey("error")) {
-            if (delivery != null && reply.ContainsKey("text")) delivery.Latest = Convert.ToString(reply["text"]);
+            if (delivery != null && reply.ContainsKey("segments")) ApplyReply(reply);
             if (reply.ContainsKey("preview")) draft = Convert.ToString(reply["preview"]);
             throw new IOException(Convert.ToString(reply["error"]));
         }
@@ -1438,8 +1508,8 @@ sealed class Microphone : Form
             var delayed = new Dictionary<string, object> {
                 { "text", "ABCDEFTN" },
                 { "segments", new object[] {
-                    new Dictionary<string, object> { { "route", 100 }, { "text", "T" } },
-                    new Dictionary<string, object> { { "route", 101 }, { "text", "N" } }
+                    new Dictionary<string, object> { { "route", 100 }, { "start", 0 }, { "text", "T" } },
+                    new Dictionary<string, object> { { "route", 101 }, { "start", 1600 }, { "text", "N" } }
                 } }
             };
             ApplyReply(delayed); await Task.Delay(30);
@@ -1462,28 +1532,54 @@ sealed class Microphone : Form
             await Task.Delay(100);
             target = Native.GetForegroundWindow(); targetFocus = Native.Focus(target);
             if (target != form.Handle || targetFocus != box.Handle) throw new Exception("Test target did not receive focus: desktop=" + Native.DesktopName() + "; foreground=" + target + "; expected=" + form.Handle + "; focus=" + targetFocus + "; expectedFocus=" + box.Handle + "; managedFocus=" + box.Focused);
-            if (!await Task.Run(() => HasEditableTarget())) throw new Exception("Editable field was not detected");
+            bool editable = false;
+            for (int attempt = 0; attempt < 3 && !editable; attempt++) {
+                editable = await Task.Run(() => HasEditableTarget());
+                if (!editable) await Task.Delay(100);
+            }
+            if (!editable) throw new Exception("Editable field was not detected");
             box.ReadOnly = true;
             if (await Task.Run(() => HasEditableTarget())) throw new Exception("Read-only field accepted as editable");
             box.ReadOnly = false;
             await BeginStream(); Status("busy", "流式输入测试");
             guard = new InteractionGuard(OwnsSurface, reason => Pause("Test user input: " + reason));
+            var draftSegment = new Dictionary<string, object> { { "route", 0 }, { "start", 0 }, { "text", "金额15元" } };
+            ApplySegment(draftSegment, false); await Task.Delay(50);
+            if (box.Text != "原文：金额15元") throw new Exception("Draft did not reach target immediately: " + delivery.Paused);
+            draftSegment["text"] = "金额1.5元，没有到账";
+            ApplySegment(draftSegment, false); await Task.Delay(50);
+            if (box.Text != "原文：金额1.5元，没有到账") throw new Exception("Draft revision damaged original text or amount: " + box.Text);
+            draftSegment["text"] = "金额1.5元";
+            ApplySegment(draftSegment, false); await Task.Delay(50);
+            if (box.Text != "原文：金额1.5元") throw new Exception("Shorter draft was not revised: " + box.Text);
+            draftSegment["text"] = "金额1.5元。";
+            ApplySegment(draftSegment, true); await Task.Delay(50);
+            if (box.Text != "原文：金额1.5元。") throw new Exception("Final punctuation did not revise draft");
+            // Reset only the dedicated test target before the real-model portion.
+            guard.Dispose(); guard = null;
+            await Exchange(new { op = "cancel", id = recordingId });
+            box.Text = "原文："; box.SelectionStart = box.TextLength;
+            await BeginStream();
+            guard = new InteractionGuard(OwnsSurface, reason => Pause("Test user input: " + reason));
             byte[] source = File.ReadAllBytes(Path.Combine(root, "work", "p0", "wav", "new-short-0.wav"));
             // The real-time long-session contract is tested over the worker protocol;
             // this desktop test needs one endpoint and actual Unicode delivery.
             byte[] wav = new byte[source.Length + 32000]; Array.Copy(source, wav, source.Length);
-            var clock = Stopwatch.StartNew(); int first = -1;
+            var clock = Stopwatch.StartNew(); int first = -1; bool beforeEndpoint = false;
             for (int offset = 44; offset < wav.Length; offset += 3200) {
                 int length = Math.Min(3200, wav.Length - offset); var part = new byte[length]; Array.Copy(wav, offset, part, 0, length);
                 await Feed(part);
-                if (delivery.Delivered.Length > 0 && first < 0) first = (int)clock.ElapsedMilliseconds;
+                if (delivery.Delivered.Length > 0 && first < 0) { first = (int)clock.ElapsedMilliseconds; beforeEndpoint = appliedSegments == 0; }
                 await Task.Delay(Math.Max(1, (int)((offset - 44 + length) / 32) - (int)clock.ElapsedMilliseconds));
             }
             if (first < 0 || first >= clock.ElapsedMilliseconds) throw new Exception("No text before stop: latest=" + delivery.Latest + "; paused=" + delivery.Paused + "; foreground=" + Native.GetForegroundWindow() + "; target=" + target + "; focus=" + Native.Focus(target) + "; expectedFocus=" + targetFocus);
+            if (!beforeEndpoint) throw new Exception("Draft was not delivered before VAD endpoint");
             if (!delivery.Delivered.Contains("你好")) throw new Exception("Endpoint text incomplete: delivered=" + delivery.Delivered.Length + "; latest=" + delivery.Latest.Length + "; paused=" + delivery.Paused);
-            var final = await Exchange(new { op = "stop", id = recordingId }); ApplyText(Convert.ToString(final["text"]));
+            var final = await Exchange(new { op = "stop", id = recordingId }); ApplyReply(final);
             await Task.Delay(100);
             if (!box.Text.Contains("你好") || box.Text != "原文：" + delivery.Delivered || delivery.Paused.Length != 0) throw new Exception("Streaming injection/guard failed: " + box.Text + " / " + delivery.Paused);
+            draftSegment["start"] = 999999; draftSegment["text"] = "没有到账";
+            ApplySegment(draftSegment, false); await Task.Delay(50);
             string original = box.Text;
             ApplyText(delivery.Latest); await Task.Delay(50);
             if (box.Text != original) throw new Exception("Final result was duplicated");
@@ -1493,6 +1589,9 @@ sealed class Microphone : Form
             if (delivery.Paused.Length == 0) throw new Exception("User edits did not pause injection");
             original = box.Text; ApplyText(delivery.Latest + "不得输入"); await Task.Delay(50);
             if (box.Text != original) throw new Exception("Input continued after user editing");
+            draftSegment["text"] = "已经到账。";
+            ApplySegment(draftSegment, false); ApplySegment(draftSegment, true); await Task.Delay(50);
+            if (box.Text != original || !recovery.Contains("已经到账。")) throw new Exception("Revision after user editing changed the target or lost the final");
             delivery = new TextDelivery(); targetFocus = IntPtr.Zero;
             ApplyText("不得输入"); await Task.Delay(50);
             if (box.Text != original || delivery.Paused.Length == 0) throw new Exception("Focus guard failed");
@@ -1532,7 +1631,7 @@ sealed class Microphone : Form
             await BeginStream();
             await FinishRecording(new byte[0]);
             if (delivery != null || state != "idle") throw new Exception("New session after cancellation failed");
-            File.WriteAllText(Path.Combine(root, "work", "VoxFix Desktop-stream-test.txt"), "PASS: paced text before stop / real SenseVoice / real SendInput / existing text preserved / no final duplication / user edit guard / focus guard / manual memory copy (test sink) / clear old cache on successful new round / append only undelivered text / focus changes keep recording / clipboard busy retry / cancellation never copies / restart after cancellation / no transcript window");
+            File.WriteAllText(Path.Combine(root, "work", "VoxFix Desktop-stream-test.txt"), "PASS: immediate draft / number and negation revision / shorter draft / final punctuation / original prefix preserved / draft before VAD endpoint / first text " + first + "ms / real SenseVoice / real SendInput / no final duplication / user edit guard / focus guard / manual memory copy (test sink) / clear old cache on successful new round / focus changes keep recording / clipboard busy retry / cancellation never copies / restart after cancellation / no transcript window");
         }
         Close();
     }
@@ -1549,11 +1648,23 @@ sealed class Microphone : Form
         DrawCurrent(e.Graphics);
     }
     void DrawCurrent(Graphics g) {
-        float progress = RevealProgress;
-        if (progress >= 1) { DrawContent(g); return; }
-        using (var bitmap = new Bitmap(128, 96)) {
-            using (var ink = Graphics.FromImage(bitmap)) DrawContent(ink);
-            DrawReveal(g, bitmap, progress);
+        // Supersample the vector outline so translucent edges cover fractional screen pixels.
+        using (var surface = new Bitmap(128 * RenderScale, 96 * RenderScale, System.Drawing.Imaging.PixelFormat.Format32bppPArgb)) {
+            using (var ink = Graphics.FromImage(surface)) {
+                ink.ScaleTransform(RenderScale, RenderScale);
+                float progress = RevealProgress;
+                if (progress >= 1) DrawContent(ink);
+                else using (var bitmap = new Bitmap(128, 96)) {
+                    using (var content = Graphics.FromImage(bitmap)) DrawContent(content);
+                    DrawReveal(ink, bitmap, progress);
+                }
+            }
+            var saved = g.Save();
+            g.Clear(Color.Transparent);
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            g.DrawImage(surface, new Rectangle(0, 0, 128, 96), 0, 0, surface.Width, surface.Height, GraphicsUnit.Pixel);
+            g.Restore(saved);
         }
     }
     internal static void DrawReveal(Graphics g, Bitmap image, float progress) {
@@ -1650,29 +1761,31 @@ sealed class Microphone : Form
             outline.CloseFigure();
             DrawMaterial(g, outline, outline.GetBounds(), hover, press, activity, now, state == "error");
             var saved = g.Save(); g.SetClip(outline);
-            if (blend > 0) using (var pill = new Bitmap(106, 42)) using (var ink = Graphics.FromImage(pill)) {
+            if (blend > 0) using (var pill = new Bitmap(106 * RenderScale, 42 * RenderScale)) using (var ink = Graphics.FromImage(pill)) {
+                ink.ScaleTransform(RenderScale, RenderScale);
                 DrawMemory(ink, copied, success, hover, press, false, activity, level, now, state == "busy" || state == "loading", pending, voice, transcribing, ready, false, stashed);
-                DrawFade(g, pill, 11, 27, Math.Max(0, 2 * blend - 1));
+                DrawFade(g, pill, 11, 27, Math.Max(0, 2 * blend - 1), 106, 42);
             }
             var motif = g.Save();
             float motifSize = Math.Min(width, height);
             g.TranslateTransform(64 - 29 * (float)shape - motifSize / 2, 48 - motifSize / 2);
             g.ScaleTransform(motifSize / 72, motifSize / 72);
-            using (var circle = new Bitmap(72, 72)) using (var ink = Graphics.FromImage(circle)) {
+            using (var circle = new Bitmap(72 * RenderScale, 72 * RenderScale)) using (var ink = Graphics.FromImage(circle)) {
+                ink.ScaleTransform(RenderScale, RenderScale);
                 DrawListening(ink, state, activity, voice, level, now, false, 1.65f - .05f * blend);
-                DrawFade(g, circle, 0, 0, stashed ? 1 : activity + (1 - activity) * Math.Max(0, 1 - 2 * blend));
+                DrawFade(g, circle, 0, 0, stashed || pending || state == "busy" ? 1 : activity + (1 - activity) * Math.Max(0, 1 - 2 * blend), 72, 72);
             }
             g.Restore(motif);
             g.Restore(saved);
         }
         g.Restore(surfaceState);
     }
-    static void DrawFade(Graphics g, Bitmap image, int x, int y, float opacity) {
+    static void DrawFade(Graphics g, Bitmap image, int x, int y, float opacity, int width = 0, int height = 0) {
         if (opacity <= 0) return;
         using (var attributes = new System.Drawing.Imaging.ImageAttributes()) {
             var matrix = new System.Drawing.Imaging.ColorMatrix { Matrix33 = opacity };
             attributes.SetColorMatrix(matrix);
-            g.DrawImage(image, new Rectangle(x, y, image.Width, image.Height), 0, 0, image.Width, image.Height, GraphicsUnit.Pixel, attributes);
+            g.DrawImage(image, new Rectangle(x, y, width == 0 ? image.Width : width, height == 0 ? image.Height : height), 0, 0, image.Width, image.Height, GraphicsUnit.Pixel, attributes);
         }
     }
     internal static void DrawMemory(Graphics g, bool copied, float success = -1, float hover = 0, float press = 0, bool backdrop = true, float activity = 0, float level = 0, double now = 0, bool processing = false, bool pending = false, float voice = 0, bool transcribing = false, float ready = 1, bool listeningMotif = true, bool stashed = false) {
@@ -1693,7 +1806,7 @@ sealed class Microphone : Form
         }
         var icon = g.Save();
         g.TranslateTransform(2.4f, -.6f); g.ScaleTransform(1.2f, 1.2f);
-        using (var line = new Pen(Color.FromArgb((int)(232 * (1 - success) * (1 - activity)), 232, 234, 233), 1.5f)) {
+        using (var line = new Pen(Color.FromArgb((int)(232 * (1 - success) * (1 - activity) * (pending || transcribing ? 0 : 1)), 232, 234, 233), 1.5f)) {
             line.LineJoin = LineJoin.Round; line.StartCap = line.EndCap = LineCap.Round;
             g.DrawLines(line, new[] { new PointF(14, 12), new PointF(12, 12), new PointF(12, 22), new PointF(14, 22) });
             using (var page = new GraphicsPath()) {
@@ -1701,7 +1814,7 @@ sealed class Microphone : Form
                 page.AddArc(20, 22, 3, 3, 0, 90); page.AddArc(15, 22, 3, 3, 90, 90); page.CloseFigure(); g.DrawPath(line, page);
             }
         }
-        using (var line = new Pen(Color.FromArgb((int)(255 * success * (1 - activity)), 220, 236, 226), 1.8f)) {
+        using (var line = new Pen(Color.FromArgb((int)(255 * success * (1 - activity) * (pending || transcribing ? 0 : 1)), 220, 236, 226), 1.8f)) {
             line.StartCap = line.EndCap = LineCap.Round; line.LineJoin = LineJoin.Round;
             g.DrawLines(line, new[] { new PointF(12.5f, 18), new PointF(16.5f, 22), new PointF(23.5f, 14.5f) });
         }
@@ -1763,19 +1876,19 @@ sealed class Microphone : Form
                 DrawMaterial(g, outline, outline.GetBounds(), 0, 0, activity, milliseconds, state == "error");
             }
         }
-        bool processing = state == "busy" || state == "loading";
         for (int i = 0; i < 2; i++) {
-            float phase = milliseconds == 0 ? i * .5f : (float)((milliseconds / (processing ? 1000 : 1400) + i * .5) % 1);
+            float phase = milliseconds == 0 ? i * .5f : (float)((milliseconds / 1400 + i * .5) % 1);
             float diameter = 48 + 21 * phase;
             using (var ring = new Pen(Color.FromArgb((int)(100 * activity * (1 - phase)), 233, 241, 255), 1.3f))
                 g.DrawEllipse(ring, 36 - diameter / 2, 36 - diameter / 2, diameter, diameter);
         }
-        float bars = processing ? 1 : voice;
+        // Short start/stop work must not flash a waveform or reset the listening rings.
+        float bars = voice;
         Color inkColor = Color.FromArgb(245, 246, 250);
         var glyph = g.Save();
         g.TranslateTransform(36, 36); g.ScaleTransform(glyphScale, glyphScale); g.TranslateTransform(-36, -36);
         float barOpacity = Math.Max(0, bars * 2 - 1);
-        if (barOpacity > .001f) DrawVoice(g, 36, 36, barOpacity, level, milliseconds, processing, inkColor);
+        if (barOpacity > .001f) DrawVoice(g, 36, 36, barOpacity, level, milliseconds, false, inkColor);
         float microphone = Math.Max(0, 1 - bars * 2);
         if (microphone <= .001f) { g.Restore(glyph); return; }
         var saved = g.Save();
@@ -2065,13 +2178,24 @@ sealed class Microphone : Form
                             foreach (int message in new[] { 0x201, 0x204, 0x207, 0x20B }) mouseCallback.DynamicInvoke(0, new IntPtr(message), mouseData);
                             if (Volatile.Read(ref edits) != 4) throw new Exception("Mouse button presses must still guard text delivery");
                         } finally { Marshal.FreeHGlobal(mouseData); }
+                        hook.Available = 1;
+                        for (int i = 0; i < 10; i++) {
+                            if (Native.SendInput((uint)copy.Length, copy, Marshal.SizeOf(typeof(Native.Input))) != copy.Length)
+                                throw new Exception("Ordinary Ctrl+C test injection failed");
+                            var wait = Stopwatch.StartNew();
+                            while (Volatile.Read(ref edits) < 5 + i && wait.ElapsedMilliseconds < 1000) {
+                                Application.DoEvents(); Thread.Sleep(5);
+                            }
+                            if (Volatile.Read(ref edits) != 5 + i || Volatile.Read(ref calls) != 3)
+                                throw new Exception("Released Ctrl+C must pass through the real hook on every press");
+                        }
                     } finally {
                         var release = new[] { Native.KeyInput(0x48, true), Native.KeyInput(0x5B, true), Native.KeyInput(0x1B, true), Native.KeyInput(0x43, true), Native.KeyInput(0xA2, true) };
                         Native.SendInput((uint)release.Length, release, Marshal.SizeOf(typeof(Native.Input)));
                     }
                   }
                 }
-                File.WriteAllText(Path.Combine(root, "work", "microphone-hotkey-test.txt"), "PASS: dedicated hook thread / real SendInput Win+H / key repeat suppressed / real Escape / Ctrl+C / shortcuts bypass edit guard / replayed wheel and movement preserve delivery / replayed mouse buttons still guard delivery / Win release masked / clean unhook; no model, audio or clipboard access");
+                File.WriteAllText(Path.Combine(root, "work", "microphone-hotkey-test.txt"), "PASS: dedicated hook thread / real SendInput Win+H / key repeat suppressed / real Escape / Ctrl+C / 10 ordinary Ctrl+C presses pass after release / shortcuts bypass edit guard / replayed wheel and movement preserve delivery / replayed mouse buttons still guard delivery / Win release masked / clean unhook; no model, audio or clipboard access");
             }
             return;
         }
@@ -2144,6 +2268,10 @@ sealed class Microphone : Form
                 shell.revealAt = shell.motionClock.Elapsed.TotalMilliseconds - 180;
                 if (shell.RevealProgress != 1) throw new Exception("Entrance must finish in 180ms");
                 shell.state = "idle"; shell.recovery = "已定稿的缓存";
+                shell.copyText = text => { throw new ExternalException("Clipboard busy"); };
+                shell.HandleShortcut(3);
+                if (!shell.ShortcutCopyReady) throw new Exception("Failed clipboard write must retain the shortcut retry");
+                shell.copyText = text => shell.copiedInTest = text;
                 shell.HandleShortcut(3);
                 if (shell.copiedInTest != shell.recovery || !shell.recoveryCopied) throw new Exception("Ctrl+C action must copy and retain ready cache");
                 if (shell.ShortcutCopyReady) throw new Exception("Successful cache copy must release Ctrl+C to the target app");
@@ -2151,16 +2279,24 @@ sealed class Microphone : Form
                 shell.HandleShortcut(3);
                 if (shell.copiedInTest.Length != 0) throw new Exception("Repeated Ctrl+C must not overwrite the clipboard with old cache");
                 shell.KeepRecovery("新缓存");
-                if (!shell.ShortcutCopyReady) throw new Exception("New cached text must allow one more shortcut copy");
+                if (shell.ShortcutCopyReady || shell.recoveryCopied) throw new Exception("New cached text must update the button without recapturing Ctrl+C");
+                var ordinaryCopyKeys = new ShortcutKeys();
+                ordinaryCopyKeys.Process(0xA2, true, 1, out swallowed);
+                for (int i = 0; i < 10; i++) {
+                    if (ordinaryCopyKeys.Process(0x43, true, shell.ShortcutCopyReady ? 3 : 1, out swallowed) != 0 || swallowed)
+                        throw new Exception("Repeated ordinary Ctrl+C must pass after new cached segments");
+                    ordinaryCopyKeys.Process(0x43, false, 1, out swallowed);
+                    shell.HandleShortcut(3);
+                    if (shell.copiedInTest.Length != 0) throw new Exception("Late shortcut messages must not overwrite ordinary copies");
+                    shell.KeepRecovery("后续片段");
+                }
                 shell.copyText = text => { throw new ExternalException("Clipboard busy"); };
-                shell.HandleShortcut(3);
-                if (!shell.ShortcutCopyReady) throw new Exception("Failed clipboard write must retain the shortcut retry");
+                shell.CopyRecovery();
+                if (shell.ShortcutCopyReady) throw new Exception("Failed manual recopy must not recapture Ctrl+C");
                 shell.copyText = text => shell.copiedInTest = text;
-                shell.HandleShortcut(3);
-                if (shell.ShortcutCopyReady || shell.copiedInTest != shell.recovery) throw new Exception("Retry must copy new cache then release Ctrl+C");
                 shell.copiedInTest = "";
                 shell.CopyRecovery();
-                if (shell.copiedInTest != shell.recovery) throw new Exception("Copy button must still allow manual recopy");
+                if (shell.copiedInTest != shell.recovery || shell.ShortcutCopyReady) throw new Exception("Copy button must allow manual recopy without recapturing Ctrl+C");
                 shell.startOnReveal = true; shell.state = "loading";
                 if (shell.TakeRevealStart() || !shell.startOnReveal) throw new Exception("Recall must wait for model readiness");
                 shell.state = "idle";
@@ -2171,9 +2307,10 @@ sealed class Microphone : Form
                 if (shell.TakeRevealStart() || shell.startOnReveal) throw new Exception("Recall during recording must not toggle or queue another session");
                 shell.state = "error"; shell.startOnReveal = true;
                 if (!shell.TakeRevealStart()) throw new Exception("Recall must allow worker recovery");
+                string copyTestRecovery = shell.recovery;
                 shell.startOnReveal = true; shell.menu.Items[0].PerformClick();
                 if (shell.startOnReveal || shell.TakeRevealStart()) throw new Exception("Dismiss must cancel queued recording");
-                if (shell.recovery != "已定稿的缓存" + Environment.NewLine + "新缓存") throw new Exception("Dismiss must preserve fallback cache");
+                if (shell.recovery != copyTestRecovery || !shell.shortcutCopyConsumed) throw new Exception("Dismiss must preserve fallback cache and keep Ctrl+C released");
                 shell.Close();
             }
             using (var source = new Bitmap(128, 96)) using (var ink = Graphics.FromImage(source))
@@ -2190,6 +2327,27 @@ sealed class Microphone : Form
                 revealFrames.Save(Path.Combine(root, "work", "reveal-preview.png"));
             }
             if (Marshal.SizeOf(typeof(Native.Input)) != (IntPtr.Size == 8 ? 40 : 28)) throw new Exception("INPUT layout");
+            if (CommonPrefix("你好", "你好世界") != 2 || CommonPrefix("没有到账", "已经到账") != 0 ||
+                CommonPrefix("金额15元", "金额1.5元") != 3 || CommonPrefix("I use Bl", "I use Blender") != 8 ||
+                CommonPrefix("你好世界", "你好") != 2)
+                throw new Exception("Draft correction prefix must preserve numbers, partial words and shorter revisions");
+            using (var shell = new Microphone(root, "--stream-test")) {
+                shell.delivery = new TextDelivery { Latest = "原文", Accounted = "原文", Delivered = "原文", Paused = "测试缓存" };
+                shell.delivery.Drafts.Add("0:0", new DraftText { Text = "原文" });
+                var segment = new Dictionary<string, object> { { "route", 0 }, { "start", 1600 }, { "preview_start", 0 }, { "text", "原文继续。" } };
+                var reply = new Dictionary<string, object> { { "segments", new object[] { segment } }, { "preview", "" } };
+                shell.ApplyReply(reply); shell.ApplyReply(reply);
+                if (shell.recovery != "继续。" || shell.delivery.Delivered != "原文" || shell.delivery.Invalidated)
+                    throw new Exception("Final after focus loss must cache only its unsent suffix, once");
+                shell.delivery.Drafts.Add("0:20", new DraftText { Text = "没有到账" });
+                shell.ApplySegment(new Dictionary<string, object> { { "route", 0 }, { "start", 20 }, { "text", "已经到账。" } }, true);
+                if (!shell.recovery.Contains("已经到账。") || shell.delivery.Delivered != "原文")
+                    throw new Exception("Changed final after focus loss must remain recoverable without modifying the old target");
+                int prefixes = shell.delivery.Drafts.Count;
+                shell.ApplySegment(new Dictionary<string, object> { { "route", 1 }, { "start", 40 }, { "text", "离框草稿" } }, false);
+                if (shell.delivery.Drafts.Count != prefixes || shell.recovery.Contains("离框草稿"))
+                    throw new Exception("Off-target drafts must wait for final before caching");
+            }
             if (!Deliverable(TargetKind.Unknown)) throw new Exception("Unknown target must stay deliverable");
             if (Deliverable(DecideTarget(false, false)) || Deliverable(DecideTarget(true, false)))
                 throw new Exception("Visible non-text or read-only targets must stay in fallback");
@@ -2431,8 +2589,51 @@ sealed class Microphone : Form
                 shell.recovery = "";
                 shell.SetInputFocus(false);
                 if (shell.AccessibleName.Contains("复制")) throw new Exception("Idle capsule without cache must not announce copying");
+                shell.Status("busy", "正在开始录音…");
+                if (!shell.MemoryPill) throw new Exception("Starting without a delivery session must not collapse the capsule");
+                shell.SetInputFocus(true);
+                if (shell.MemoryPill) throw new Exception("Starting in an input box must keep the circle");
+            }
+            foreach (float speech in new[] { 0f, .25f, .75f, 1f })
+            using (var listening = new Bitmap(72, 72)) using (var stopping = new Bitmap(72, 72)) {
+                using (var ink = Graphics.FromImage(listening)) DrawListening(ink, "recording", 1, speech, .6f, 600, false);
+                using (var ink = Graphics.FromImage(stopping)) DrawListening(ink, "busy", 1, speech, .6f, 600, false);
+                for (int x = 0; x < 72; x++) for (int y = 0; y < 72; y++)
+                    if (listening.GetPixel(x, y) != stopping.GetPixel(x, y))
+                        throw new Exception("Start/stop must preserve the current glyph and ring phase instead of flashing a processing waveform");
+            }
+            using (var idle = new Bitmap(128, 96)) using (var starting = new Bitmap(128, 96)) {
+                using (var ink = Graphics.FromImage(idle)) DrawShape(ink, 1, "idle", false, 0, 0, 0, stashed: true);
+                using (var ink = Graphics.FromImage(starting)) DrawShape(ink, 1, "busy", false, 0, 0, 0, transcribing: true);
+                for (int x = 24; x < 49; x++) for (int y = 32; y < 65; y++)
+                    if (idle.GetPixel(x, y) != starting.GetPixel(x, y))
+                        throw new Exception("An empty capsule must retain its microphone without flashing a copy icon while starting");
             }
             var morph = new ShapeMotion();
+            var edgeMetrics = new List<string>();
+            using (var shell = new Microphone(root, "--stream-test")) {
+                shell.state = "idle";
+                foreach (double phase in new[] { 0.0, .5, 1.0 })
+                using (var actual = new Bitmap(128, 96, System.Drawing.Imaging.PixelFormat.Format32bppPArgb))
+                using (var reference = new Bitmap(512, 384, System.Drawing.Imaging.PixelFormat.Format32bppPArgb))
+                using (var expected = new Bitmap(128, 96, System.Drawing.Imaging.PixelFormat.Format32bppPArgb)) {
+                    shell.shape.Value = phase;
+                    using (var ink = Graphics.FromImage(actual)) shell.DrawCurrent(ink);
+                    using (var ink = Graphics.FromImage(reference)) { ink.ScaleTransform(4, 4); shell.DrawContent(ink); }
+                    using (var ink = Graphics.FromImage(expected)) {
+                        ink.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        ink.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                        ink.DrawImage(reference, new Rectangle(0, 0, 128, 96), 0, 0, 512, 384, GraphicsUnit.Pixel);
+                    }
+                    long difference = 0;
+                    for (int x = 0; x < 128; x++) for (int y = 0; y < 96; y++)
+                        difference += Math.Abs(actual.GetPixel(x, y).A - expected.GetPixel(x, y).A);
+                    double error = difference / (128.0 * 96);
+                    edgeMetrics.Add("shape=" + phase + " alpha coverage error=" + error);
+                    if (error > .1) throw new Exception("Circle, capsule and intermediate edges must retain subpixel vector coverage");
+                }
+            }
+            File.WriteAllLines(Path.Combine(root, "work", "smooth-edge-rendering-test.txt"), edgeMetrics.ToArray());
             double circleArea = 0;
             foreach (double phase in new[] { 0, .25, .5, 1, 1.16 }) using (var cell = new Bitmap(128, 96)) using (var ink = Graphics.FromImage(cell)) {
                 DrawShape(ink, phase, "idle", false, 0, 0, 0);
