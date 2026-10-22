@@ -5,6 +5,11 @@
       "to": "GitHub",
       "from": ["get up", "git up", "git hub", "get hub", "gethub", "githup"],
       "context": "zh"
+    },
+    {
+      "to": "JSON",
+      "from": ["Jason", "jason", "J son", "j sen", "j-son"],
+      "context": "zh"
     }
   ]
 }

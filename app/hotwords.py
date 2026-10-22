@@ -75,12 +75,27 @@ def _candidates(text):
     return runs + [runs[i] + runs[i + 1] for i in range(len(runs) - 1)]
 
 
+_VOWELS = frozenset('aeiouy')
+
+
+def _skeleton(text):
+    """Consonant skeleton, so `Jason` and `json` both collapse to `jsn`.
+
+    Vowel confusion is the most common way short English acronyms go wrong
+    (JSON -> Jason, WiFi -> wiifi); plain edit distance misses both because
+    two characters differ. Only used for words of four characters or more so
+    the skeletons stay discriminating (`API` would collapse to `p`).
+    """
+    return ''.join(char for char in text if char not in _VOWELS)
+
+
 def near_miss(text, words):
-    """Words the text nearly spells: `pyython`/python, `gitthub`/github, `J SON`/json.
+    """Words the text nearly spells: `pyython`/python, `gitthub`/github, `Jason`/json.
 
     Only whole alphanumeric runs are compared (plus two adjacent runs), so an
     English word inside a longer word no longer triggers a rescue. One edit is
-    allowed for short words, two for long ones.
+    allowed for short words, two for long ones, plus a consonant-skeleton match
+    for words of four characters or more.
     """
     low = text.lower()
     candidates = _candidates(text)
@@ -98,6 +113,11 @@ def near_miss(text, words):
         if any(edit_distance(candidate, target, limit) <= limit for candidate in candidates):
             found.append(word)
             continue
+        if len(target) >= 4:
+            bones = _skeleton(target)
+            if len(bones) >= 2 and any(_skeleton(candidate) == bones for candidate in candidates):
+                found.append(word)
+                continue
         # Dictating a bare acronym ("API" heard as "a"): only when the whole
         # utterance is that fragment, so an article "a" in a sentence stays put.
         if short_text <= len(target) + 2 and any(

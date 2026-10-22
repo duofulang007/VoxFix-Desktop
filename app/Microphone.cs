@@ -15,7 +15,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.31.0")]
+[assembly: AssemblyVersion("1.6.34.0")]
 
 static class Native
 {
@@ -287,6 +287,37 @@ sealed class InteractionGuard : IDisposable
     }
 }
 
+// The pill never activates, so it never receives WM_KILLFOCUS and a ContextMenuStrip shown from it
+// cannot rely on deactivation to close. While the menu is open we watch real clicks ourselves and
+// dismiss it when one lands anywhere outside its surface.
+sealed class MenuDismissHook : IDisposable
+{
+    delegate IntPtr Hook(int code, IntPtr message, IntPtr data);
+    [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int type, Hook callback, IntPtr module, uint thread);
+    [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hook);
+    [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr message, IntPtr data);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
+    [StructLayout(LayoutKind.Sequential)] struct Mouse { public Point point; public uint data, flags, time; public UIntPtr extra; }
+    readonly Hook callback;
+    IntPtr handle;
+    internal static bool Outside(Rectangle surface, Point point) { return !surface.Contains(point); }
+    internal MenuDismissHook(Func<Rectangle> surface, Action dismiss) {
+        callback = (code, message, data) => {
+            long kind = message.ToInt64();
+            if (code >= 0 && (kind == 0x201 || kind == 0x204 || kind == 0x207 || kind == 0x20B)) {
+                var value = (Mouse)Marshal.PtrToStructure(data, typeof(Mouse));
+                if (Outside(surface(), value.point)) dismiss();
+            }
+            return CallNextHookEx(IntPtr.Zero, code, message, data);
+        };
+        handle = SetWindowsHookEx(14, callback, GetModuleHandle(null), 0);
+    }
+    public void Dispose() {
+        if (handle != IntPtr.Zero) { UnhookWindowsHookEx(handle); handle = IntPtr.Zero; }
+        GC.KeepAlive(callback);
+    }
+}
+
 sealed class ShortcutKeys
 {
     readonly HashSet<int> held = new HashSet<int>(), captured = new HashSet<int>();
@@ -298,9 +329,9 @@ sealed class ShortcutKeys
         bool win = held.Contains(0x5B) || held.Contains(0x5C);
         bool ctrl = held.Contains(0xA2) || held.Contains(0xA3);
         bool extra = held.Contains(0xA0) || held.Contains(0xA1) || held.Contains(0xA4) || held.Contains(0xA5);
+        // Ctrl+C is never captured: the cached transcript is copied by the capsule button only.
         int command = !extra && win && !ctrl && key == 0x48 ? 1 :
-            !extra && !win && !ctrl && key == 0x1B && (available & 1) != 0 ? 2 :
-            !extra && !win && ctrl && key == 0x43 && (available & 2) != 0 ? 3 : 0;
+            !extra && !win && !ctrl && key == 0x1B && (available & 1) != 0 ? 2 : 0;
         if (command != 0) { captured.Add(key); swallow = true; }
         return command;
     }
@@ -431,6 +462,299 @@ sealed class MicrophoneMenuRenderer : ToolStripProfessionalRenderer
     }
 }
 
+sealed class WordGroup
+{
+    public string Word;
+    public readonly List<string> Variants = new List<string>();
+}
+
+// Personal dictionary editor: pick a word on the left, list the ways it gets
+// misheard on the right. Saving rewrites dictionary.json (atomic replace); the
+// recogniser already watches that file, so the next utterance uses the new list
+// without a restart.
+sealed class DictionaryDialog : Form
+{
+    static readonly Color Face = Color.FromArgb(47, 52, 65);
+    static readonly Color Ink = Color.FromArgb(245, 246, 250);
+    static readonly Color Dim = Color.FromArgb(176, 184, 199);
+    static readonly Color Field = Color.FromArgb(35, 40, 54);
+    static readonly Color Edge = Color.FromArgb(86, 95, 115);
+    static readonly Color ButtonFace = Color.FromArgb(58, 65, 82);
+
+    string path;
+    readonly List<WordGroup> groups = new List<WordGroup>();
+    readonly ListBox list = new ListBox();
+    readonly TextBox variants = new TextBox();
+    readonly TextBox entry = new TextBox();
+    readonly Label status = new Label();
+    int current = -1;
+    bool silent, dirty;
+    Point dragFrom;
+
+    public DictionaryDialog(string root) {
+        path = Path.Combine(root, "dictionary.json");
+        Text = "个人词典"; FormBorderStyle = FormBorderStyle.None; ShowInTaskbar = false;
+        StartPosition = FormStartPosition.CenterScreen; TopMost = true;
+        ClientSize = new Size(520, 430); BackColor = Face; ForeColor = Ink;
+        Font = new Font("Microsoft YaHei UI", 9.5f); DoubleBuffered = true;
+        AccessibleName = "个人词典";
+
+        Controls.Add(Caption("个人词典", 20, 14, Ink));
+        Controls.Add(Caption("左边选一个词，右边每行写一种被听错的写法；保存后下一句生效，不用重启。", 20, 40, Dim));
+        Controls.Add(Caption("词语", 20, 64, Dim));
+        Controls.Add(Caption("错法（每行一个，可留空）", 206, 64, Dim));
+
+        list.Bounds = new Rectangle(20, 86, 170, 250);
+        list.DrawMode = DrawMode.OwnerDrawFixed; list.ItemHeight = 26; list.BorderStyle = BorderStyle.None;
+        list.BackColor = Field; list.ForeColor = Ink; list.IntegralHeight = false;
+        list.DrawItem += PaintRow;
+        list.SelectedIndexChanged += OnSelected;
+        Controls.Add(list);
+
+        variants.Bounds = new Rectangle(206, 86, 294, 250);
+        variants.Multiline = true; variants.ScrollBars = ScrollBars.Vertical; variants.BorderStyle = BorderStyle.FixedSingle;
+        variants.BackColor = Field; variants.ForeColor = Ink; variants.AcceptsReturn = true;
+        variants.TextChanged += (s, e) => { if (!silent) dirty = true; };
+        Controls.Add(variants);
+
+        entry.Bounds = new Rectangle(20, 350, 250, 26);
+        entry.BorderStyle = BorderStyle.FixedSingle; entry.BackColor = Field; entry.ForeColor = Ink;
+        entry.AccessibleName = "新词";
+        entry.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { Add(); e.SuppressKeyPress = true; } };
+        Controls.Add(entry);
+
+        Controls.Add(MakeButton("添加", new Rectangle(280, 348, 70, 30), Add));
+        Controls.Add(MakeButton("删除", new Rectangle(358, 348, 70, 30), Remove));
+        Controls.Add(MakeButton("保存", new Rectangle(310, 388, 90, 30), Save));
+        Controls.Add(MakeButton("关闭", new Rectangle(408, 388, 90, 30), Close));
+
+        status.Bounds = new Rectangle(20, 393, 282, 22); status.ForeColor = Dim; status.Text = "";
+        Controls.Add(status);
+
+        var close = MakeButton("✕", new Rectangle(486, 12, 22, 22), Close);
+        close.FlatAppearance.BorderSize = 0; close.Font = new Font("Microsoft YaHei UI", 8f);
+        Controls.Add(close);
+
+        MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) dragFrom = e.Location; };
+        MouseMove += (s, e) => { if (e.Button == MouseButtons.Left) Location = new Point(Location.X + e.X - dragFrom.X, Location.Y + e.Y - dragFrom.Y); };
+        Shown += (s, e) => { Reload(); ApplyRegion(); };
+        Resize += (s, e) => ApplyRegion();
+    }
+
+    static Label Caption(string text, int x, int y, Color ink) {
+        return new Label { Text = text, AutoSize = true, Location = new Point(x, y), ForeColor = ink };
+    }
+
+    static Button MakeButton(string text, Rectangle bounds, Action click) {
+        var button = new Button {
+            Text = text, Bounds = bounds, FlatStyle = FlatStyle.Flat, TabStop = false,
+            BackColor = ButtonFace, ForeColor = Ink, Font = new Font("Microsoft YaHei UI", 9f) };
+        button.FlatAppearance.BorderColor = Edge; button.FlatAppearance.BorderSize = 1;
+        button.Click += (s, e) => click();
+        return button;
+    }
+
+    void ApplyRegion() {
+        if (Width < 2 || Height < 2) return;
+        var previous = Region;
+        using (var outline = MicrophoneMenuRenderer.Outline(new Rectangle(Point.Empty, Size), 12)) Region = new Region(outline);
+        if (previous != null) previous.Dispose();
+    }
+
+    protected override void OnPaint(PaintEventArgs e) {
+        base.OnPaint(e);
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var outline = MicrophoneMenuRenderer.Outline(new Rectangle(0, 0, Width - 1, Height - 1), 12))
+        using (var pen = new Pen(Color.FromArgb(54, 245, 247, 255))) e.Graphics.DrawPath(pen, outline);
+    }
+
+    void PaintRow(object sender, DrawItemEventArgs e) {
+        if (e.Index < 0 || e.Index >= groups.Count) return;
+        bool selected = (e.State & DrawItemState.Selected) != 0;
+        using (var back = new SolidBrush(selected ? Color.FromArgb(28, 244, 246, 255) : Field))
+            e.Graphics.FillRectangle(back, e.Bounds);
+        TextRenderer.DrawText(e.Graphics, groups[e.Index].Word, Font,
+                              new Rectangle(e.Bounds.X + 10, e.Bounds.Y, e.Bounds.Width - 12, e.Bounds.Height),
+                              selected ? Ink : Color.FromArgb(214, 220, 232), TextFormatFlags.VerticalCenter);
+    }
+
+    void Reload() {
+        groups.Clear();
+        try {
+            var data = new JavaScriptSerializer().DeserializeObject(File.ReadAllText(path)) as Dictionary<string, object>;
+            object words = null, rules = null;
+            if (data != null) { data.TryGetValue("hotwords", out words); data.TryGetValue("rules", out rules); }
+            if (words is object[]) {
+                foreach (var item in (object[])words) {
+                    var word = (item as string);
+                    if (word == null) continue;
+                    word = word.Trim();
+                    if (word.Length == 0 || Index(word) >= 0) continue;
+                    groups.Add(new WordGroup { Word = word });
+                }
+            }
+            if (rules is object[]) {
+                foreach (var item in (object[])rules) {
+                    var rule = item as Dictionary<string, object>;
+                    if (rule == null) continue;
+                    object target = null, source = null;
+                    rule.TryGetValue("to", out target); rule.TryGetValue("from", out source);
+                    var word = (target as string);
+                    if (word == null || word.Trim().Length == 0) continue;
+                    word = word.Trim();
+                    int index = Index(word);
+                    WordGroup group = index >= 0 ? groups[index] : new WordGroup { Word = word };
+                    if (index < 0) groups.Add(group);
+                    if (!(source is object[])) continue;
+                    foreach (var item2 in (object[])source) {
+                        var variant = (item2 as string);
+                        if (variant == null) continue;
+                        variant = variant.Trim();
+                        if (variant.Length > 0 && !group.Variants.Contains(variant)) group.Variants.Add(variant);
+                    }
+                }
+            }
+        } catch (Exception) {
+            status.Text = "dictionary.json 读取失败，保存会重建它";
+        }
+        dirty = false;
+        RefreshList(-1);
+    }
+
+    int Index(string word) {
+        for (int i = 0; i < groups.Count; i++)
+            if (string.Equals(groups[i].Word, word, StringComparison.OrdinalIgnoreCase)) return i;
+        return -1;
+    }
+
+    void ShowWord(int index) {
+        bool was = silent;
+        silent = true;
+        current = index >= 0 && index < groups.Count ? index : -1;
+        variants.Text = current >= 0 ? string.Join("\r\n", groups[current].Variants.ToArray()) : "";
+        silent = was;
+    }
+
+    void RefreshList(int select) {
+        int target = groups.Count == 0 ? -1
+            : Math.Min(select < 0 ? Math.Max(current, 0) : select, groups.Count - 1);
+        silent = true;
+        list.BeginUpdate(); list.Items.Clear();
+        foreach (var group in groups) list.Items.Add(group.Word);
+        list.EndUpdate();
+        if (target >= 0) list.SelectedIndex = target;
+        silent = false;
+        ShowWord(target);
+    }
+
+    void Commit() {
+        if (current < 0 || current >= groups.Count) return;
+        var edited = new List<string>();
+        foreach (var line in variants.Text.Replace("\r\n", "\n").Split('\n')) {
+            var text = line.Trim();
+            if (text.Length > 0 && !edited.Contains(text)) edited.Add(text);
+        }
+        groups[current].Variants.Clear(); groups[current].Variants.AddRange(edited);
+    }
+
+    void OnSelected(object sender, EventArgs e) {
+        if (silent) return;
+        Commit();  // keep edits to the word the user just left
+        ShowWord(list.SelectedIndex);
+    }
+
+    void Add() {
+        var word = entry.Text.Trim();
+        if (word.Length == 0) { status.Text = "先在上面填一个词"; entry.Focus(); return; }
+        int existing = Index(word);
+        if (existing >= 0) {
+            list.SelectedIndex = existing; entry.Text = ""; status.Text = "这个词已经在列表里"; return;
+        }
+        Commit();
+        groups.Add(new WordGroup { Word = word });
+        dirty = true; entry.Text = "";
+        RefreshList(groups.Count - 1);
+        variants.Focus();
+        status.Text = "已添加 " + word + "，记得保存";
+    }
+
+    void Remove() {
+        if (current < 0 || current >= groups.Count) return;
+        var word = groups[current].Word;
+        groups.RemoveAt(current);
+        current = Math.Max(0, current - 1);
+        dirty = true;
+        RefreshList(groups.Count == 0 ? -1 : Math.Min(current, groups.Count - 1));
+        status.Text = "已移除 " + word + "，记得保存";
+    }
+
+    static string Quote(string value) {
+        var text = new StringBuilder("\"");
+        foreach (char c in value) {
+            if (c == '"' || c == '\\') text.Append('\\').Append(c);
+            else if (c < ' ') text.Append("\\u").Append(((int)c).ToString("x4"));
+            else text.Append(c);
+        }
+        return text.Append('"').ToString();
+    }
+
+    void Save() {
+        Commit();
+        var hotwords = new List<string>();
+        foreach (var group in groups) hotwords.Add(Quote(group.Word));
+        var rules = new List<string>();
+        foreach (var group in groups) {
+            if (group.Variants.Count == 0) continue;
+            var from = new List<string>();
+            foreach (var variant in group.Variants) from.Add(Quote(variant));
+            rules.Add("\n    { \"to\": " + Quote(group.Word) + ", \"from\": [" + string.Join(", ", from.ToArray()) + "], \"context\": \"zh\" }");
+        }
+        var body = "{\n  \"hotwords\": [" + string.Join(", ", hotwords.ToArray()) + "],\n  \"rules\": [" +
+                   string.Join(",", rules.ToArray()) + "\n  ]\n}\n";
+        try {
+            var temp = path + ".tmp";
+            File.WriteAllText(temp, body, new UTF8Encoding(false));
+            if (File.Exists(path)) File.Replace(temp, path, null); else File.Move(temp, path);
+            dirty = false;
+            status.Text = "已保存 · 下一句生效";
+        } catch (Exception error) {
+            status.Text = "保存失败：" + error.Message;
+        }
+    }
+
+    internal void PrepareForTest() {
+        Reload();
+        ApplyRegion();
+        IntPtr handle = Handle;  // creates the window without showing it
+        GC.KeepAlive(handle);
+    }
+
+    internal int WordCountForTest() { return groups.Count; }
+
+    internal string DumpForTest() {
+        var text = new StringBuilder("current=" + current + " text=" + variants.Text.Length);
+        foreach (var group in groups) text.Append(" | " + group.Word + ":" + group.Variants.Count);
+        return text.ToString();
+    }
+
+    // Round-trip check: saves through the same writer to a scratch file.
+    internal void SaveToForTest(string target) {
+        string original = path;
+        path = target;
+        try { Save(); } finally { path = original; }
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e) {
+        if (dirty) {
+            var answer = MessageBox.Show(this, "还有未保存的修改，保存吗？", "个人词典",
+                                         MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (answer == DialogResult.Cancel) { e.Cancel = true; return; }
+            if (answer == DialogResult.Yes) Save();
+        }
+        base.OnFormClosing(e);
+    }
+}
+
 sealed class Microphone : Form
 {
     const int RenderScale = 4;
@@ -453,13 +777,16 @@ sealed class Microphone : Form
     InteractionGuard guard;
     TextDelivery delivery;
     readonly ContextMenuStrip menu = new ContextMenuStrip();
+    MenuDismissHook menuGuard;
+    internal int menuDismissRequests;
+    DictionaryDialog dictionary;
     Action<string> copyText;
     string copiedInTest = "";
     readonly bool memoryTest;
     readonly bool probeOnly;
     readonly bool shortcutCycleTest;
     bool inputFocused;
-    bool recoveryCopied, shortcutCopyConsumed;
+    bool recoveryCopied;
     bool hovered, pressed, pressCancelled;
     float copyFeedback, hoverFeedback, pressFeedback;
     bool heldTriggered;
@@ -512,9 +839,21 @@ sealed class Microphone : Form
             if (previous != null) previous.Dispose();
         };
         menu.Items.Add("收起", null, async (s, e) => await Dismiss());
+        menu.Items.Add("词典…", null, (s, e) => ShowDictionary());
         menu.Items.Add("退出", null, (s, e) => Close());
         foreach (ToolStripItem item in menu.Items) { item.AutoSize = false; item.Size = new Size(88, 28); }
-        menu.MinimumSize = new Size(88, 60);
+        menu.MinimumSize = new Size(88, 88);
+        // WinForms relies on deactivation to auto-close a menu, and this window never activates.
+        // So the first real click outside the menu surface closes it explicitly.
+        menu.Opened += (s, e) => {
+            if (menuGuard != null) return;
+            menuGuard = new MenuDismissHook(() => menu.Bounds, () => {
+                menuDismissRequests++;
+                if (closing || !IsHandleCreated) return;
+                try { BeginInvoke(new Action(CloseMenu)); } catch (InvalidOperationException) { }
+            });
+        };
+        menu.Closed += (s, e) => { if (menuGuard != null) { menuGuard.Dispose(); menuGuard = null; } };
         Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         FormBorderStyle = FormBorderStyle.None; ShowInTaskbar = false; TopMost = true;
         AutoScaleMode = AutoScaleMode.None; ClientSize = new Size(128, 96);
@@ -556,7 +895,7 @@ sealed class Microphone : Form
         MouseEnter += (s, e) => { hovered = true; animation.Start(); };
         MouseLeave += (s, e) => { hovered = false; pressCancelled = true; if (!Capture) pressed = false; animation.Start(); };
         MouseCaptureChanged += (s, e) => { if (!Capture) { pressed = false; animation.Start(); } };
-        MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) { down = Cursor.Position; origin = Location; dragged = false; pressed = true; pressCancelled = false; heldTriggered = false; pressedAt = motionClock.Elapsed.TotalMilliseconds; Capture = true; animation.Start(); } };
+        MouseDown += (s, e) => { CloseMenu(); if (e.Button == MouseButtons.Left) { down = Cursor.Position; origin = Location; dragged = false; pressed = true; pressCancelled = false; heldTriggered = false; pressedAt = motionClock.Elapsed.TotalMilliseconds; Capture = true; animation.Start(); } };
         MouseMove += (s, e) => {
             if (e.Button != MouseButtons.Left || !pressed) return;
             Point p = Cursor.Position;
@@ -577,7 +916,7 @@ sealed class Microphone : Form
                 await ShortClick(e.X);
             }
         };
-        VisibleChanged += (s, e) => UpdateShortcutState();
+        VisibleChanged += (s, e) => { UpdateShortcutState(); if (!Visible) CloseMenu(); };
         Shown += async (s, e) => {
             if (shortcutCycleTest || (!probeOnly && !memoryTest && !streamTest && !smokeTest)) {
                 IntPtr window = Handle;
@@ -594,9 +933,11 @@ sealed class Microphone : Form
                 finally { Close(); }
             }
         };
-        FormClosing += (s, e) => SavePosition();
+        FormClosing += (s, e) => { CloseMenu(); SavePosition(); };
         FormClosed += (s, e) => {
-            closing = true; limit.Stop(); limit.Dispose();
+            closing = true; CloseMenu();
+            if (menuGuard != null) { menuGuard.Dispose(); menuGuard = null; }
+            limit.Stop(); limit.Dispose();
             if (shortcut != null) shortcut.Dispose();
             capture.Stop(); capture.Dispose();
             focusWatch.Stop(); focusWatch.Dispose();
@@ -670,13 +1011,13 @@ sealed class Microphone : Form
         base.WndProc(ref message);
     }
     void UpdateShortcutState() {
-        if (shortcut != null) shortcut.Available = closing || (!Visible && !opening) ? 0 : 1 | (ShortcutCopyReady ? 2 : 0);
+        if (shortcut != null) shortcut.Available = closing || (!Visible && !opening) ? 0 : 1;
     }
     async void HandleShortcut(int action) {
         try {
             if (closing) return;
+            CloseMenu();
             if (action == 2) { if (Visible || opening) await Dismiss(); return; }
-            if (action == 3) { if (ShortcutCopyReady) CopyRecovery(); return; }
             if (action != 1) return;
             if (state == "recording") { startOnReveal = false; await EndRecording(); }
             else if (opening || startOnReveal) {
@@ -685,7 +1026,14 @@ sealed class Microphone : Form
             else Reveal(true);
         } catch (Exception error) { Fail(error.Message); }
     }
+    void ShowDictionary() {
+        if (dictionary == null || dictionary.IsDisposed) dictionary = new DictionaryDialog(root);
+        if (!dictionary.Visible) dictionary.Show(); else dictionary.BringToFront();
+        dictionary.Activate();
+    }
+    void CloseMenu() { if (menu.Visible) menu.Close(); }
     async Task Dismiss() {
+        CloseMenu();
         opening = startOnReveal = false; dismissRequested = true;
         pressed = hovered = false; pressCancelled = true; Capture = false;
         hoverFeedback = pressFeedback = 0;
@@ -710,7 +1058,6 @@ sealed class Microphone : Form
         try {
             copyText(recovery);
             recoveryCopied = true;
-            shortcutCopyConsumed = true;
             AccessibleDescription = state == "error" ? "已复制 · 左侧重试 · 右侧重新复制" : "已复制 · 录音时点左侧声纹结束，点右侧重新复制 · 长按清空并开始新录音";
         } catch { AccessibleDescription = "剪贴板暂时不可用，文字仍在图标里，点击重试。"; }
         UpdateMemoryShape();
@@ -753,7 +1100,6 @@ sealed class Microphone : Form
         }
     }
     bool CopyReady { get { return !restarting && recovery.Length > 0 && !transcribing && !speechDetected && state != "busy" && state != "loading"; } }
-    bool ShortcutCopyReady { get { return Visible && CopyReady && !shortcutCopyConsumed; } }
     void SetInputFocus(bool focused) {
         if (inputFocused == focused) return;
         inputFocused = focused;
@@ -939,9 +1285,9 @@ sealed class Microphone : Form
             if (runChecks && memoryTest) { await RunMemoryTest(); return; }
             if (runChecks && streamTest) { await RunStreamTest(); return; }
             if (runChecks && smokeTest) {
-                recovery = "上一轮缓存"; recoveryCopied = shortcutCopyConsumed = true;
+                recovery = "上一轮缓存"; recoveryCopied = true;
                 await BeginStream();
-                if (recovery.Length != 0 || recoveryCopied || shortcutCopyConsumed) throw new Exception("New round must clear old cache and rearm Ctrl+C after backend starts");
+                if (recovery.Length != 0 || recoveryCopied) throw new Exception("New round must clear old cache and copied flag after backend starts");
                 KeepRecovery("本轮已定稿");
                 await FinishRecording(new byte[0]);
                 await Dismiss();
@@ -1172,7 +1518,7 @@ sealed class Microphone : Form
         targetEpoch++; nextTargetProbe = 0;
         var reply = await Exchange(new { op = "start", id = recordingId });
         if (Convert.ToString(reply["event"]) != "started") throw new IOException("无法开始流式识别。");
-        recovery = ""; recoveryCopied = shortcutCopyConsumed = false; copyFeedback = readyFeedback = 0;
+        recovery = ""; recoveryCopied = false; copyFeedback = readyFeedback = 0;
         UpdateMemoryShape(); RefreshSurface();
     }
     async Task<Dictionary<string, object>> Exchange(object request) {
@@ -2095,6 +2441,26 @@ sealed class Microphone : Form
             }
             return;
         }
+        if (args.Length > 0 && args[0] == "--dictionary-test") {
+            // Renders the editor offscreen: the window is parked outside the
+            // desktop bounds, so nothing flashes and no focus visibly moves.
+            Directory.CreateDirectory(Path.Combine(root, "work"));
+            using (var dialog = new DictionaryDialog(root)) {
+                dialog.StartPosition = FormStartPosition.Manual;
+                dialog.Location = new Point(-20000, -20000);
+                dialog.Show();
+                Application.DoEvents();
+                using (var preview = new Bitmap(dialog.Width, dialog.Height)) {
+                    dialog.DrawToBitmap(preview, new Rectangle(Point.Empty, preview.Size));
+                    preview.Save(Path.Combine(root, "work", "dictionary-dialog.png"));
+                }
+                string scratch = Path.Combine(root, "work", "dictionary-roundtrip.json");
+                Console.WriteLine("DICTIONARY-TEST " + dialog.DumpForTest());
+                dialog.SaveToForTest(scratch);
+                dialog.Close();
+            }
+            return;
+        }
         if (args.Length > 0 && args[0] == "--target-probe") { Environment.ExitCode = RunTargetProbe(args, root); return; }
         if (args.Length > 0 && args[0] == "--idle-focus-test") {
             Directory.CreateDirectory(Path.Combine(root, "work"));
@@ -2161,33 +2527,38 @@ sealed class Microphone : Form
                         for (int i = 0; i < escape.Length; i++) escape[i].data.keyboard.extra = UIntPtr.Zero;
                         if (Native.SendInput(2, escape, Marshal.SizeOf(typeof(Native.Input))) != 2) throw new Exception("Escape test injection failed");
                         if (!WaitShortcut(invoked) || Volatile.Read(ref last) != 2 || Volatile.Read(ref calls) != 2 || hook.MaskFailed) throw new Exception("Real Escape hook or Win masking failed");
+                        // Ctrl+C belongs to the target app: the hook must never capture it,
+                        // even with a stale copy bit set and cached text ready.
                         hook.Available = 3;
                         var copy = new[] { Native.KeyInput(0xA2, false), Native.KeyInput(0x43, false), Native.KeyInput(0x43, true), Native.KeyInput(0xA2, true) };
                         for (int i = 0; i < copy.Length; i++) copy[i].data.keyboard.extra = UIntPtr.Zero;
                         if (Native.SendInput((uint)copy.Length, copy, Marshal.SizeOf(typeof(Native.Input))) != copy.Length) throw new Exception("Ctrl+C test injection failed");
-                        if (!WaitShortcut(invoked) || Volatile.Read(ref last) != 3 || Volatile.Read(ref calls) != 3 || Volatile.Read(ref edits) != 0) throw new Exception("Shortcut keys must not pause text delivery as user edits");
+                        var passed = Stopwatch.StartNew();
+                        while (Volatile.Read(ref edits) < 1 && passed.ElapsedMilliseconds < 1000) { Application.DoEvents(); Thread.Sleep(5); }
+                        if (Volatile.Read(ref edits) != 1 || Volatile.Read(ref calls) != 2) throw new Exception("Ctrl+C must always pass through to the target app");
                         // Replay the actual mouse callback without scrolling or clicking the user's page.
                         var mouseCallback = (Delegate)typeof(InteractionGuard).GetField("mouse", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).GetValue(editGuard);
+                        int guarded = Volatile.Read(ref edits);
                         IntPtr mouseData = Marshal.AllocHGlobal(32);
                         try {
                             Marshal.Copy(new byte[32], 0, mouseData, 32);
                             foreach (int message in new[] { 0x20A, 0x20E, 0x200 }) {
                                 mouseCallback.DynamicInvoke(0, new IntPtr(message), mouseData);
-                                if (Volatile.Read(ref edits) != 0) throw new Exception("Scrolling must not pause text delivery when the caret stays in the input box");
+                                if (Volatile.Read(ref edits) != guarded) throw new Exception("Scrolling must not pause text delivery when the caret stays in the input box");
                             }
                             foreach (int message in new[] { 0x201, 0x204, 0x207, 0x20B }) mouseCallback.DynamicInvoke(0, new IntPtr(message), mouseData);
-                            if (Volatile.Read(ref edits) != 4) throw new Exception("Mouse button presses must still guard text delivery");
+                            if (Volatile.Read(ref edits) != guarded + 4) throw new Exception("Mouse button presses must still guard text delivery");
                         } finally { Marshal.FreeHGlobal(mouseData); }
                         hook.Available = 1;
                         for (int i = 0; i < 10; i++) {
                             if (Native.SendInput((uint)copy.Length, copy, Marshal.SizeOf(typeof(Native.Input))) != copy.Length)
-                                throw new Exception("Ordinary Ctrl+C test injection failed");
+                                throw new Exception("Repeated Ctrl+C test injection failed");
                             var wait = Stopwatch.StartNew();
-                            while (Volatile.Read(ref edits) < 5 + i && wait.ElapsedMilliseconds < 1000) {
+                            while (Volatile.Read(ref edits) < guarded + 5 + i && wait.ElapsedMilliseconds < 1000) {
                                 Application.DoEvents(); Thread.Sleep(5);
                             }
-                            if (Volatile.Read(ref edits) != 5 + i || Volatile.Read(ref calls) != 3)
-                                throw new Exception("Released Ctrl+C must pass through the real hook on every press");
+                            if (Volatile.Read(ref edits) != guarded + 5 + i || Volatile.Read(ref calls) != 2)
+                                throw new Exception("Ctrl+C must reach the target app on every press");
                         }
                     } finally {
                         var release = new[] { Native.KeyInput(0x48, true), Native.KeyInput(0x5B, true), Native.KeyInput(0x1B, true), Native.KeyInput(0x43, true), Native.KeyInput(0xA2, true) };
@@ -2195,7 +2566,7 @@ sealed class Microphone : Form
                     }
                   }
                 }
-                File.WriteAllText(Path.Combine(root, "work", "microphone-hotkey-test.txt"), "PASS: dedicated hook thread / real SendInput Win+H / key repeat suppressed / real Escape / Ctrl+C / 10 ordinary Ctrl+C presses pass after release / shortcuts bypass edit guard / replayed wheel and movement preserve delivery / replayed mouse buttons still guard delivery / Win release masked / clean unhook; no model, audio or clipboard access");
+                File.WriteAllText(Path.Combine(root, "work", "microphone-hotkey-test.txt"), "PASS: dedicated hook thread / real SendInput Win+H / key repeat suppressed / real Escape / 11 Ctrl+C presses always reach the target app with no captured action / shortcuts bypass edit guard / replayed wheel and movement preserve delivery / replayed mouse buttons still guard delivery / Win release masked / clean unhook; no model, audio or clipboard access");
             }
             return;
         }
@@ -2217,10 +2588,9 @@ sealed class Microphone : Form
             if (swallowed) throw new Exception("Hidden Escape must pass");
             shortcutKeys.Process(0x1B, false, 0, out swallowed);
             shortcutKeys.Process(0xA3, true, 0, out swallowed);
-            if (shortcutKeys.Process(0x43, true, 3, out swallowed) != 3 || !swallowed) throw new Exception("Ctrl+C must copy ready cache");
+            if (shortcutKeys.Process(0x43, true, 3, out swallowed) != 0 || swallowed) throw new Exception("Ctrl+C must pass through even when cached text is ready");
             shortcutKeys.Process(0x43, false, 0, out swallowed);
-            shortcutKeys.Process(0x43, true, 1, out swallowed);
-            if (swallowed) throw new Exception("Ctrl+C without ready cache must pass");
+            if (shortcutKeys.Process(0x43, true, 1, out swallowed) != 0 || swallowed) throw new Exception("Ctrl+C without cached text must pass");
             shortcutKeys.Process(0x43, false, 0, out swallowed);
             shortcutKeys.Process(0x5C, true, 0, out swallowed);
             shortcutKeys.Process(0x48, true, 3, out swallowed);
@@ -2249,9 +2619,14 @@ sealed class Microphone : Form
                 Point remembered = shell.Location;
                 shell.Reveal();
                 if (shell.animationsEnabled && shell.revealAt != started) throw new Exception("Repeated reveal must not restart entrance");
-                if (shell.menu.Items.Count != 2 || shell.menu.Items[0].Text != "收起" || shell.menu.Items[1].Text != "退出")
-                    throw new Exception("Menu must contain only dismiss and exit");
+                var menuSurface = new Rectangle(100, 100, 96, 92);
+                if (!MenuDismissHook.Outside(menuSurface, new Point(60, 140)) || MenuDismissHook.Outside(menuSurface, new Point(120, 120)))
+                    throw new Exception("Only clicks outside the menu surface may dismiss it");
+                if (shell.menu.Items.Count != 3 || shell.menu.Items[0].Text != "收起" ||
+                    shell.menu.Items[1].Text != "词典…" || shell.menu.Items[2].Text != "退出")
+                    throw new Exception("Menu must contain dismiss, dictionary and exit");
                 shell.menu.Show(shell, new Point(0, 0));
+                if (!shell.menu.Visible || shell.menuGuard == null) throw new Exception("Open menu must install the outside-click guard");
                 shell.menu.Items[0].Select();
                 using (var preview = new Bitmap(shell.menu.Width, shell.menu.Height)) {
                     shell.menu.DrawToBitmap(preview, new Rectangle(Point.Empty, preview.Size));
@@ -2259,8 +2634,28 @@ sealed class Microphone : Form
                 }
                 if (shell.menu.Region == null || shell.menu.Region.IsVisible(Point.Empty) || !shell.menu.Region.IsVisible(20, 20))
                     throw new Exception("Menu must have rounded corners and preserve item hit targets");
+                // Replay the real low-level mouse callback instead of clicking the user's desktop.
+                var menuCallback = (Delegate)typeof(MenuDismissHook).GetField("callback", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).GetValue(shell.menuGuard);
+                IntPtr probe = Marshal.AllocHGlobal(32);
+                try {
+                    Marshal.Copy(new byte[32], 0, probe, 32);
+                    Point inside = shell.menu.Bounds.Location; inside.Offset(8, 8);
+                    Marshal.WriteInt32(probe, 0, inside.X); Marshal.WriteInt32(probe, 4, inside.Y);
+                    menuCallback.DynamicInvoke(0, new IntPtr(0x201), probe);
+                    Application.DoEvents();
+                    if (!shell.menu.Visible || shell.menuDismissRequests != 0) throw new Exception("A click inside the menu must keep it open");
+                    var away = new Point(shell.menu.Bounds.Left - 40, shell.menu.Bounds.Top - 40);
+                    Marshal.WriteInt32(probe, 0, away.X); Marshal.WriteInt32(probe, 4, away.Y);
+                    menuCallback.DynamicInvoke(0, new IntPtr(0x201), probe);
+                    for (int i = 0; i < 40 && shell.menu.Visible; i++) { Application.DoEvents(); Thread.Sleep(5); }
+                    if (shell.menu.Visible || shell.menuDismissRequests != 1 || shell.menuGuard != null)
+                        throw new Exception("A click outside the menu must close it and release the guard");
+                } finally { Marshal.FreeHGlobal(probe); }
                 shell.menu.Close();
+                if (shell.menu.Visible || shell.menuGuard != null) throw new Exception("Closing the menu must release the outside-click guard");
+                shell.menu.Show(shell, new Point(0, 0));
                 shell.menu.Items[0].PerformClick();
+                if (shell.menu.Visible || shell.menuGuard != null) throw new Exception("Dismissing must close the open menu");
                 if (shell.Visible || shell.focusWatch.Enabled || shell.animation.Enabled) throw new Exception("Dismiss must hide and stop idle timers");
                 shell.Reveal();
                 if (!shell.Visible || shell.Location != remembered) throw new Exception("Recall must retain position");
@@ -2269,22 +2664,24 @@ sealed class Microphone : Form
                 if (shell.RevealProgress != 1) throw new Exception("Entrance must finish in 180ms");
                 shell.state = "idle"; shell.recovery = "已定稿的缓存";
                 shell.copyText = text => { throw new ExternalException("Clipboard busy"); };
-                shell.HandleShortcut(3);
-                if (!shell.ShortcutCopyReady) throw new Exception("Failed clipboard write must retain the shortcut retry");
+                shell.CopyRecovery();
+                if (shell.recoveryCopied) throw new Exception("Failed clipboard write must keep the cache uncopied for a retry");
                 shell.copyText = text => shell.copiedInTest = text;
                 shell.HandleShortcut(3);
-                if (shell.copiedInTest != shell.recovery || !shell.recoveryCopied) throw new Exception("Ctrl+C action must copy and retain ready cache");
-                if (shell.ShortcutCopyReady) throw new Exception("Successful cache copy must release Ctrl+C to the target app");
+                if (shell.copiedInTest.Length != 0) throw new Exception("No shortcut action may copy the cache");
+                shell.CopyRecovery();
+                if (shell.copiedInTest != shell.recovery || !shell.recoveryCopied) throw new Exception("Copy button must copy and keep the ready cache");
                 shell.copiedInTest = "";
-                shell.HandleShortcut(3);
-                if (shell.copiedInTest.Length != 0) throw new Exception("Repeated Ctrl+C must not overwrite the clipboard with old cache");
+                shell.CopyRecovery();
+                if (shell.copiedInTest != shell.recovery || !shell.recoveryCopied) throw new Exception("Repeated copy button presses must re-copy the same cache");
+                shell.copiedInTest = "";
                 shell.KeepRecovery("新缓存");
-                if (shell.ShortcutCopyReady || shell.recoveryCopied) throw new Exception("New cached text must update the button without recapturing Ctrl+C");
+                if (shell.recoveryCopied) throw new Exception("New cached text must rearm the copy button");
                 var ordinaryCopyKeys = new ShortcutKeys();
                 ordinaryCopyKeys.Process(0xA2, true, 1, out swallowed);
                 for (int i = 0; i < 10; i++) {
-                    if (ordinaryCopyKeys.Process(0x43, true, shell.ShortcutCopyReady ? 3 : 1, out swallowed) != 0 || swallowed)
-                        throw new Exception("Repeated ordinary Ctrl+C must pass after new cached segments");
+                    if (ordinaryCopyKeys.Process(0x43, true, 3, out swallowed) != 0 || swallowed)
+                        throw new Exception("Ordinary Ctrl+C must pass while cached segments exist");
                     ordinaryCopyKeys.Process(0x43, false, 1, out swallowed);
                     shell.HandleShortcut(3);
                     if (shell.copiedInTest.Length != 0) throw new Exception("Late shortcut messages must not overwrite ordinary copies");
@@ -2292,11 +2689,11 @@ sealed class Microphone : Form
                 }
                 shell.copyText = text => { throw new ExternalException("Clipboard busy"); };
                 shell.CopyRecovery();
-                if (shell.ShortcutCopyReady) throw new Exception("Failed manual recopy must not recapture Ctrl+C");
+                if (shell.recoveryCopied) throw new Exception("Failed manual recopy must keep the cache uncopied");
                 shell.copyText = text => shell.copiedInTest = text;
                 shell.copiedInTest = "";
                 shell.CopyRecovery();
-                if (shell.copiedInTest != shell.recovery || shell.ShortcutCopyReady) throw new Exception("Copy button must allow manual recopy without recapturing Ctrl+C");
+                if (shell.copiedInTest != shell.recovery || !shell.recoveryCopied) throw new Exception("Copy button must allow manual recopy");
                 shell.startOnReveal = true; shell.state = "loading";
                 if (shell.TakeRevealStart() || !shell.startOnReveal) throw new Exception("Recall must wait for model readiness");
                 shell.state = "idle";
@@ -2310,7 +2707,7 @@ sealed class Microphone : Form
                 string copyTestRecovery = shell.recovery;
                 shell.startOnReveal = true; shell.menu.Items[0].PerformClick();
                 if (shell.startOnReveal || shell.TakeRevealStart()) throw new Exception("Dismiss must cancel queued recording");
-                if (shell.recovery != copyTestRecovery || !shell.shortcutCopyConsumed) throw new Exception("Dismiss must preserve fallback cache and keep Ctrl+C released");
+                if (shell.recovery != copyTestRecovery) throw new Exception("Dismiss must preserve fallback cache");
                 shell.Close();
             }
             using (var source = new Bitmap(128, 96)) using (var ink = Graphics.FromImage(source))
@@ -2935,7 +3332,7 @@ sealed class Microphone : Form
             delivery.Sent("C"); delivery.Paused = "再次离开"; delivery.Accept("ABCD");
             if (delivery.TakePending() != "D" || delivery.TakePending() != "" || delivery.Delivered != "AC" || delivery.Accounted != "ABCD")
                 throw new Exception("Interleaved delivery/fallback ledger duplicated or lost text");
-            File.WriteAllText(Path.Combine(root, "work", "microphone-self-test.txt"), "PASS: Win+H and Escape / contextual Ctrl+C / automatic recall start / model readiness / no modifier-release gate / recording no-op / dismiss cancels pending start / reveal fade / repeat recall / no activation / dismiss timers / position parsing and monitor clamp / x64 INPUT / Unicode / coarse-host delivery / read-only and non-text veto / idle shape follows focus / append-only text / English spaces / duplicate and revision guards / audio levels / Windows dictation earcon resources / quiet microphone / fine five-bar waveform in circle and capsule / speech hold / silence return / interruption / reduced motion / embedded wallpaper through morph and overshoot / centered status ink / circle and capsule icon proportions / no midpoint icon disappearance / outward listening and processing rings / unified white glyphs without inner discs / state rendering / smooth critically damped spring / velocity-preserving retargeting / long press restart guard / direct copy pill without dot / manual memory copy (test sink) / clear old cache on successful new round / append only undelivered text / focus changes keep recording / clipboard busy and retry; input devices=" + Recorder.waveInGetNumDevs());
+            File.WriteAllText(Path.Combine(root, "work", "microphone-self-test.txt"), "PASS: Win+H and Escape / Ctrl+C never captured and always reaching the target app / context menu closed by an outside click (real hook callback replayed), a menu item, Esc, dismiss and exit / outside-click predicate / automatic recall start / model readiness / no modifier-release gate / recording no-op / dismiss cancels pending start / reveal fade / repeat recall / no activation / dismiss timers / position parsing and monitor clamp / x64 INPUT / Unicode / coarse-host delivery / read-only and non-text veto / idle shape follows focus / append-only text / English spaces / duplicate and revision guards / audio levels / Windows dictation earcon resources / quiet microphone / fine five-bar waveform in circle and capsule / speech hold / silence return / interruption / reduced motion / embedded wallpaper through morph and overshoot / centered status ink / circle and capsule icon proportions / no midpoint icon disappearance / outward listening and processing rings / unified white glyphs without inner discs / state rendering / smooth critically damped spring / velocity-preserving retargeting / long press restart guard / direct copy pill without dot / button-only memory copy (test sink) / clear old cache on successful new round / append only undelivered text / focus changes keep recording / clipboard busy and retry; input devices=" + Recorder.waveInGetNumDevs());
             } catch (Exception error) {
                 File.WriteAllText(Path.Combine(root, "work", "microphone-self-test.txt"), "FAIL: " + error);
                 Environment.ExitCode = 1;
