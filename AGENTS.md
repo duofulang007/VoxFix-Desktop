@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本仓库的操作约定。当前版本 **1.6.31.0**；产品说明见 [README](README.md)，
+本仓库的操作约定。当前版本 **1.6.34.0**；产品说明见 [README](README.md)，
 技术记录从 [docs/README.md](docs/README.md) 读起，工具入口见 [tools/README.md](tools/README.md)。
 
 ## 生产链路
@@ -57,13 +57,14 @@ Get-Content work\microphone-self-test.txt
 | 参数 | 覆盖 / `work/` 结果文件 |
 |---|---|
 | `--self-test` | 界面、送字规则、形变、音效；`microphone-self-test.txt` |
-| `--hotkey-test` | 真实快捷键拦截，不录音、不操作剪贴板；`microphone-hotkey-test.txt` |
+| `--hotkey-test` | 真实快捷键拦截，不录音；1.6.32.0 起 Ctrl+C 不再被吞，会真实落到当前前台应用（程序自身不读写剪贴板）；`microphone-hotkey-test.txt` |
 | `--hotkey-cycle-test` | 开始、暂停、重开、Esc；短暂采音但不向其他软件送字；`microphone-hotkey-cycle-test.txt` |
 | `--focus-test` / `--idle-focus-test` | 真实窗口焦点、送字和空闲形变；`microphone-focus-test.txt` / `microphone-idle-shape-test.txt` |
 | `--capture-test` | 默认麦克风三次重开与尾缓冲；`VoxFix Desktop-capture-test.txt` |
 | `--smoke-test` | 真实模型启动与缓存换轮；`microphone-ui-test.txt` / `microphone-round-reset-test.txt` |
 | `--stream-test` / `--memory-test` | 真实模型、专用输入框送字与缓存兜底；`VoxFix Desktop-stream-test.txt` / `microphone-memory-test.txt` |
 | `--target-probe [进程名]` | 只读诊断，不抢前台；`target-probe.txt`。仅明确要求时才加会送字的 `--type` |
+| `--dictionary-test` | 离屏渲染词典编辑器（窗口放在桌面范围外）并写 `dictionary-dialog.png`；同时把当前词典写进 `dictionary-roundtrip.json` 供 Python 侧解析校验 |
 
 原生测试在真实交互桌面**串行运行**；同时检查退出码为 0、结果文件更新时间属于本次运行且内容为 PASS。
 旧 `VoxFix Desktop-test-failure.txt` 或旧 PASS 均不能代表本轮结果。真实键鼠操作会干扰焦点和保护机制，
@@ -86,6 +87,12 @@ Get-Content work\microphone-self-test.txt
     任何异常一律保留 sherpa 原文。`hotwords` 未配置时该路径必须完全不创建会话。改这些口径必须重跑
     `work/hotword-prototype/p2_prod_eval.py`（生产路径 174 与封存 1,314）。
 11. Win+H 开始/暂停，Esc 收起；不恢复浮动小字提示。UI 几何、材质和动画改动必须验证实际桌面。
+12. 复制未上屏缓存只能由胶囊右侧按钮触发；键盘钩子不得捕获 Ctrl+C（1.6.32.0 起），无缓存、有缓存、复制前后都一样交给原应用。
+13. 右键菜单固定三项：收起 / 词典… / 退出。`词典…` 打开 `DictionaryDialog`，保存必须用 `File.Replace` 原子写
+    `dictionary.json`（Python 侧按 mtime 重载），`hotwords` 写全部词、`rules` 只写有错法的词且 `context` 固定 `zh`；
+    有未保存修改时关闭要先问。改这个窗口必须跑 `--dictionary-test`（离屏截图 + 往返 JSON 校验），不要弹到桌面。
+13. 悬浮窗是 `WS_EX_NOACTIVATE`，收不到失焦消息，菜单不能指望 WinForms 自动关闭：`ContextMenuStrip` 打开期间必须挂 `MenuDismissHook`（WH_MOUSE_LL），
+    点窗口外任意位置关闭；选任一项、Esc、收起、退出、隐藏窗口、销毁前也必须关闭并释放钩子。改这块要跑 `--self-test` 的菜单段（含钩子回调重放）。
 
 ## 文件、数据与历史
 
