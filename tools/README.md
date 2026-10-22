@@ -1,6 +1,6 @@
 # 工具索引
 
-版本 1.6.24.0；日期 2026-10-21。生产只运行 `app/` 中的两个入口，以下均为维护工具。
+版本 1.6.29.0；日期 2026-10-22。生产只运行 `app/` 中的两个入口，以下均为维护工具。
 Python 脚本使用项目 `.venv/Scripts/python.exe`，原生测试参数与结果文件见 [AGENTS.md](../AGENTS.md)。
 
 ## 现行测试
@@ -11,11 +11,20 @@ Python 脚本使用项目 `.venv/Scripts/python.exe`，原生测试参数与结�
 | `test_language_guard.py` | 外文结果拒绝与先前定稿保留 |
 | `test_asr_scoring.py` | 共享评分函数的边界回归 |
 | `test_microphone.py` | 真实模型、固定音频与 175 秒连续会话，不访问麦克风 |
-| `evaluate_sensevoice.py` | 固定 174 条语料、整段与生产分段对照 |
+| `evaluate_sensevoice.py` | 默认旧 174 条；支持 `--manifest`、`--output`，重新推理并记录音频/模型/源码哈希、分组错误率；结果不覆盖 |
+| `prepare_ascend_test.py` | 已校验的 ASCEND 真人测试集去旧题重合，生成原速、变速、低音量和噪声条件；测试集禁止用于训练 |
+| `test_evaluation.py` | 评分汇总、结果防覆盖、音频校验、衰减和可复现信噪比检查，无需模型 |
 | `test_desktop_window.py` | 实际桌面的窗口、位置和绘制；`--exercise-reopen` 另验证普通二次启动 |
 
-真实模型测试依赖本机权重、运行库、`work/p0/manifest.json` 和 WAV，结果写入
-`work/sensevoice-20261021/`。语料及结果不入库，历史分数不能代替当前测试。
+真实模型测试依赖本机权重、运行库及清单对应的 WAV。旧题库位于 `work/p0/manifest.json`；
+评测默认在 `work/sensevoice-20261021/` 下写带时间和随机编号的新结果，指定 `--output` 也不覆盖已有结果。
+逐条结果先写同名 `.jsonl`，完成后写 `.json`；中途失败的日志不能算完整通过。
+语料及结果不入库，历史分数不能代替当前测试。
+
+新真人基准、来源及运行方式见 [真人新语料基准与训练准备](../docs/真人新语料基准与训练准备-2026-10-22.md)。
+微调实验（两轮）的脚本在仓库外 `F:/VoxFixTrain/scripts/`，语料与产物同在该根下；
+训练环境留在 `D:/VoxFixTrain/venv/`，脚本另在 `work/training-scripts/` 冻存一份。
+复现命令与产物清单见 [多源真人语料微调 SenseVoice](../docs/多源真人语料微调SenseVoice-2026-10-22.md) 第 11 节。
 
 ## 支持工具
 

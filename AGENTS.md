@@ -1,13 +1,15 @@
 # AGENTS.md
 
-本仓库的操作约定。当前版本 **1.6.24.0**；产品说明见 [README](README.md)，
+本仓库的操作约定。当前版本 **1.6.29.0**；产品说明见 [README](README.md)，
 技术记录从 [docs/README.md](docs/README.md) 读起，工具入口见 [tools/README.md](tools/README.md)。
 
 ## 生产链路
 
 - `app/Microphone.cs`：单文件 C# WinForms，负责窗口、全局快捷键、采音、焦点、送字与原生自检；无 NuGet、无 .NET SDK。
-- `app/recognize.py`：stdin/stdout 逐行 JSON 子进程，负责 VAD 分段、可修订草稿、标点和只追加定稿。
+- `app/recognize.py`：stdin/stdout 逐行 JSON 子进程，负责 VAD 分段、可修订草稿、标点和按序定稿。
 - SenseVoiceSmall INT8 + Silero VAD + CT-Transformer，CPU 推理；`app/assets/graphite-material.png` 嵌入 EXE。
+- 1.6.29.0 起 `models/sensevoice/model.int8.onnx` 是公开真人语料微调权重（`27377bac…`），
+  代码与交互未变。回滚备份 `work/model.int8.onnx.20261018-original` 与 `work/VoxFix Desktop.exe.1.6.28.0`。
 
 换模型是产品决策。Qwen3-ASR 准确率更高但延迟、内存不合要求，用户已否决；
 见 `docs/中文与混说-换Qwen伪流式-2026-10-21.md`，不要仅凭准确率换回去。
@@ -33,7 +35,9 @@ Python 测试统一使用 `.venv/Scripts/python.exe`，按改动范围运行：
 | `tools/test_language_guard.py` | 中英字符边界、外文拒绝与先前定稿恢复；无需模型 |
 | `tools/test_asr_scoring.py` | 中文按字、英文按词、否定、静音与外文计分 |
 | `tools/test_microphone.py` | 真实模型协议、尾音、轻声、坏包恢复、175 秒固定音频连续会话；不访问麦克风 |
-| `tools/evaluate_sensevoice.py` | 174 条固定语料，依赖 `work/p0/manifest.json` 与对应 WAV |
+| `tools/evaluate_sensevoice.py` | 默认旧 174 条；`--manifest` 指定新语料，`--output` 指定新结果；不覆盖已有结果，记录音频/模型/源码哈希 |
+| `tools/prepare_ascend_test.py` | 从已校验的 ASCEND 测试集去旧题重合，生成原速/变速/低音量/噪声条件；测试集禁止用于训练 |
+| `tools/test_evaluation.py` | 新评测的评分、结果防覆盖、音频校验与压力变换；无需模型 |
 | `tools/test_desktop_window.py` | 实际交互桌面的窗口可见性与表面绘制，须已有可见 VoxFix 窗口 |
 
 原生测试用 `Start-Process` 等待退出，不能在 PowerShell 直接把带引号路径当命令：
@@ -62,7 +66,7 @@ Get-Content work\microphone-self-test.txt
 
 ## 行为契约
 
-1. 已上屏文字只追加，永不回改、回删。
+1. 草稿识别到文字即送字，并允许修订本轮在同一输入位置写入的当前段；已完成段落与用户原文不回改。手动编辑、焦点变化或送字不完整后停止修订，最终结果或未送出后缀进缓存。分段身份、最长公共前缀、退格范围与送字保护须一起验证。
 2. `punctuation_only()` 同时保护词元及原有标点，标点模型只能添加；验证失败返回原文。
 3. ITN 关闭，否则金额可能被错误改写；不得按评测词句硬编码替换。
 4. SenseVoice 使用 `language='auto'`，不全局锁中英；锁中文会损坏英文整句，锁英文可能使中文全空。
@@ -76,7 +80,8 @@ Get-Content work\microphone-self-test.txt
 ## 文件、数据与历史
 
 - 模型、`runtime/` 二进制、`work/` 实验数据、`bin/`、`.venv/` 不入库；`work/sensevoice-20261021/assets.json` 例外。
-- 不删除模型、语料、窗口位置、个人数据或未知来源的本地实验文件。评测资产可能位于 `D:/VoxFixEval/` 或本机 `work/p0/`。
+- 不删除模型、语料、窗口位置、个人数据或未知来源的本地实验文件。旧题库在本机 `work/p0/`，
+  新真人基准与微调语料在仓库外 `F:/VoxFixTrain/`（可离线，拔盘不影响产品识别）。`D:/VoxFixEval/` 已于 2026-10-22 删除。
 - 当前不使用旧 Nemotron/Qwen 探针。34 个历史脚本从工作树移除，在 Git `5209268` 中保留；按工具索引恢复到独立实验目录，勿冒充当前回归。
 - 不假定 HuggingFace 可直连；本机此前通过 ModelScope 获取权重，下载后按来源和校验值核验。
 - 保留既有未提交工作，提交前检查范围；只提交代码、文档、许可和必要界面资源，不提交凭据或私有转写数据。
