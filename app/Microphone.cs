@@ -15,7 +15,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.39.0")]
+[assembly: AssemblyVersion("1.6.40.0")]
 
 static class Native
 {
@@ -551,6 +551,10 @@ sealed class MicrophoneMenuRenderer : ToolStripProfessionalRenderer
 sealed class WordGroup
 {
     public string Word;
+    // Reference corpus rule: "zh" only rewrites Chinese utterances; empty means
+    // every utterance. Keep whatever the file said, otherwise re-saving the
+    // editor would quietly turn English-only fixes into Chinese-only ones.
+    public string Context = "zh";
     public readonly List<string> Variants = new List<string>();
 }
 
@@ -692,14 +696,16 @@ sealed class DictionaryDialog : Form
                 foreach (var item in (object[])rules) {
                     var rule = item as Dictionary<string, object>;
                     if (rule == null) continue;
-                    object target = null, source = null;
+                    object target = null, source = null, context = null;
                     rule.TryGetValue("to", out target); rule.TryGetValue("from", out source);
+                    rule.TryGetValue("context", out context);
                     var word = (target as string);
                     if (word == null || word.Trim().Length == 0) continue;
                     word = word.Trim();
                     int index = Index(word);
                     WordGroup group = index >= 0 ? groups[index] : new WordGroup { Word = word };
                     if (index < 0) groups.Add(group);
+                    group.Context = (context as string) ?? "";
                     if (!(source is object[])) continue;
                     foreach (var item2 in (object[])source) {
                         var variant = (item2 as string);
@@ -832,7 +838,8 @@ sealed class DictionaryDialog : Form
             if (group.Variants.Count == 0) continue;
             var from = new List<string>();
             foreach (var variant in group.Variants) from.Add(Quote(variant));
-            rules.Add("\n    { \"to\": " + Quote(group.Word) + ", \"from\": [" + string.Join(", ", from.ToArray()) + "], \"context\": \"zh\" }");
+            rules.Add("\n    { \"to\": " + Quote(group.Word) + ", \"from\": [" + string.Join(", ", from.ToArray()) + "]" +
+                      (string.IsNullOrEmpty(group.Context) ? "" : ", \"context\": " + Quote(group.Context)) + " }");
         }
         var body = "{\n  \"hotwords\": [" + string.Join(", ", hotwords.ToArray()) + "],\n  \"rules\": [" +
                    string.Join(",", rules.ToArray()) + "\n  ]\n}\n";

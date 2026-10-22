@@ -1,20 +1,16 @@
 {
-  "hotwords": ["GitHub", "Python", "API", "JSON", "PDF", "WiFi"],
+  "hotwords": ["GitHub", "Python", "API", "JSON", "PDF", "WiFi", "Codex", "VoxFix"],
   "rules": [
-    {
-      "to": "GitHub",
-      "from": ["get up", "git up", "git hub", "get hub", "gethub", "githup"],
-      "context": "zh"
-    },
-    {
-      "to": "JSON",
-      "from": ["Jason", "jason", "J son", "j sen", "j-son"],
-      "context": "zh"
-    },
-    {
-      "to": "Codex",
-      "from": ["col death", "koldex", "koex", "colexs", "kolex", "cols", "kos"],
-      "context": "zh"
-    }
+    { "to": "GitHub", "from": ["get up", "git up", "git hub", "get hub", "gethub", "githup", "github"], "context": "zh" },
+    { "to": "JSON", "from": ["Jason", "jason", "J son", "j sen", "j-son", "js on", "json"], "context": "zh" },
+    { "to": "Codex", "from": ["colex", "col death", "koldex", "koex", "colexs", "kolex", "cols", "kos", "codedes", "code death", "coldex", "colx"], "context": "zh" },
+    { "to": "VoxFix", "from": ["vox fix", "voox fix", "voxfix", "v fix", "box fix"] },
+    { "to": "Kotlin", "from": ["cotland", "coland", "codelin", "kotlin"] },
+    { "to": "API", "from": ["a p i", "api i", "api"] },
+    { "to": "PDF", "from": ["p d f", "pdf"] },
+    { "to": "WiFi", "from": ["wifi", "wi fi", "why fi"] },
+    { "to": "Python", "from": ["python"] },
+    { "to": "git status", "from": ["get status", "gi status"], "context": "zh" },
+    { "to": "git commit", "from": ["get commit", "gi commit"], "context": "zh" }
   ]
 }

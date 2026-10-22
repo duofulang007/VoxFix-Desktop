@@ -80,10 +80,14 @@ def load_dictionary(path):
     return tuple(compiled)
 
 
+def has_chinese(text):
+    return any('\u4e00' <= char <= '\u9fff' for char in text)
+
+
 def apply_dictionary(text, rules, force=False):
     for pattern, canonical, zh_only in rules:
         # "zh" keeps common English phrases intact in pure-English dictation.
-        if zh_only and not force and not any('\u4e00' <= char <= '\u9fff' for char in text):
+        if zh_only and not force and not has_chinese(text):
             continue
         text = pattern.sub(lambda match, word=canonical: word, text)
     return text
@@ -398,8 +402,11 @@ class Recognition:
                     text = self.rescue.rescore(audio, text, self.dictionary.hotwords())
                 # Word list runs on drafts and finals alike (no flash of a draft that
                 # later rewrites itself) and before punctuation, so punctuation_only
-                # keeps comparing one consistent text.
-                text = apply_dictionary(text, self.dictionary.current())
+                # keeps comparing one consistent text. Context "zh" is decided per
+                # utterance: in "这个API。返回的是。js on。" the third segment carries no
+                # Chinese of its own, yet the user is still dictating mixed text.
+                text = apply_dictionary(text, self.dictionary.current(),
+                                        force=has_chinese(self.committed + text))
                 if final and hasattr(self.session, 'punctuate'):
                     text = self.session.punctuate(text)
                 with self.condition:

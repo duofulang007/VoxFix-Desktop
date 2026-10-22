@@ -14,7 +14,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'app'))
 from recognize import (Dictionary, Recognition, QuietBoost, SenseVoiceSession,
-                       apply_dictionary, join_text, punctuation_only)
+                       apply_dictionary, has_chinese, join_text, punctuation_only)
 
 
 class Vad:
@@ -324,6 +324,7 @@ class PipelineTests(unittest.TestCase):
             path = Path(folder) / 'dictionary.json'
             path.write_text(json.dumps({'rules': [
                 {'to': 'GitHub', 'from': ['get up', 'git up'], 'context': 'zh'},
+                {'to': 'JSON', 'from': ['js on'], 'context': 'zh'},
                 {'to': 'PDF', 'from': ['p d f']},
             ]}, ensure_ascii=False), encoding='utf-8')
             words = Dictionary(path)
@@ -334,6 +335,13 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(apply_dictionary('git up 地址发你', rules), 'GitHub 地址发你')
             # "zh" rules leave pure-English dictation untouched.
             self.assertEqual(apply_dictionary('I get up at seven', rules), 'I get up at seven')
+            # Mixed utterances decide "zh" per utterance: a segment without any
+            # Chinese of its own still gets the rule when the rest of it had some.
+            self.assertFalse(has_chinese('js on。'))
+            self.assertTrue(has_chinese('这个API。返回的是。'))
+            self.assertEqual(apply_dictionary('js on', rules), 'js on')
+            self.assertEqual(apply_dictionary('js on', rules,
+                                              force=has_chinese('这个API。返回的是。')), 'JSON')
             # Rules without "context" always apply, even in English text.
             self.assertEqual(apply_dictionary('export the p d f file', rules),
                              'export the PDF file')
