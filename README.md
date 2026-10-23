@@ -1,25 +1,15 @@
 # VoxFix Desktop
 
-Windows x64 本地语音输入，替代 Win+H。当前版本 **1.6.40.0**。
+Windows x64 本地语音输入，替代 Win+H。当前版本 **1.6.46.0**。
 使用 SenseVoiceSmall INT8 + Silero VAD + CT-Transformer，CPU 本地推理；识别与送字不联网。
-1.6.29.0 把识别权重换成本仓库 2026-10-22 用公开真人语料（ASCEND + AISHELL-1 + LibriSpeech）微调的版本；
-1.6.30.0 新增**个人词典**：项目根目录 `dictionary.json` 人工纠正固定错法（如 GitHub→"get up"），
-草稿与定稿都替换、保存即生效。
-1.6.31.0 新增**热词偏置救援**：词典里写 `hotwords` 后，定稿出现"读起来像这个词"的片段时，
-用偏置解码把这段音频复解一次，`pyython→python`、`gitthub→github` 这类错法不再靠逐条枚举。
-1.6.32.0 取消 **Ctrl+C 接管**：复制未上屏缓存只走胶囊右侧按钮，Ctrl+C 在任何状态下都交还原应用。
-1.6.33.0 修好**右键菜单关不掉**：点窗口外任意位置、选任一项、按 Esc、收起或退出都会关闭菜单。
-1.6.34.0 把个人词典做成**右键「词典」里的编辑器**：左侧选词、右侧每行一个错法，保存即生效；
-  同时按辅音骨架认近音（`Jason` 也认成 `JSON`），并给 JSON 补了出厂错法。
-1.6.35.0 菜单项文案改为「词典」（原来带省略号）。
-1.6.36.0 右键菜单改成白色卡片：每行一个图标（收起 / 词典 / 退出），行宽按文字自适应，不再留一条空白的右边。
-1.6.38.0 词典窗口的「错法」框**粘贴即整理**：一串用标点串起来的写法自动拆成一行一个、去掉重复；
-  框右上角另有「整理」按钮手动触发。（1.6.37.0 曾把它做成右键菜单项，已在 1.6.38.0 撤掉。）
-1.6.39.0 修对话框头部：错法标签与「整理」按钮同行对齐、按钮补足高度不再被压扁。
-1.6.40.0 出厂词表补上评测里反复念错的词（VoxFix、Kotlin、git status / git commit，`js on`→JSON、`a p i`→API）；
-  中文规则改成**按整段话判断**，同一句里前半句是中文时，纯英文的小段也会被词表纠正。
-来源、判据与回滚见 [记录](docs/多源真人语料微调SenseVoice-2026-10-22.md) 与
-[热词偏置](docs/热词偏置-救援通道-2026-10-22.md)。
+
+词典支持文字纠正、搜索、未保存内容预览，以及同词多段录音与完整文本标签。
+录音样本只在本机收集，**不会自动训练或立即改变识别效果**；操作见[使用说明](docs/使用说明.md)。
+
+当前生产模型为 R5 INT8。本机权重哈希与[R5 启用记录](docs/R5模型启用-2026-10-23.md)一致。
+6257 条 CS-Dialogue 真人封存比较采用 PyTorch 检查点口径，中文、英文和混说均优于 R4；
+生产 INT8 已过固定音频、启动与送字自检，完整 INT8 独立集和日常麦克风验收仍未完成。
+旧 174 条仅作辅助回归；历次变更与证据见[技术记录索引](docs/README.md)。
 
 ## 使用
 
@@ -33,10 +23,10 @@ Windows x64 本地语音输入，替代 Win+H。当前版本 **1.6.40.0**。
 - 成功开始新轮才清空旧缓存；停止、收起和启动失败保留缓存，退出清空。错误态左侧重试，右侧复制。
 - 拖动可移动并记住位置；右键菜单为“收起 / 词典 / 退出”。点窗口外任意位置、选任一项、按 Esc 或退出都会关闭菜单，不会一直悬在桌面上。退出后恢复系统 Win+H。
 - 识别草稿一有文字就尝试送进当前输入框，不等停顿；继续说话时会修订当前这一段，停顿后补齐最终文字和标点。只修订本轮在原输入位置写入的当前段；手动编辑或切换焦点后停止修订，未送出结果留在缓存。
-- 已完成段落不再回改，当前草稿可修订；标点只允许添加，删除或替换已有标点时保留识别原文。每轮最长三分钟。
-- **个人词典**：根目录 `dictionary.json` 里把识别的固定错法映射到正确写法（默认带 GitHub 一条，只在中英混说句生效），保存即生效，文件损坏时自动停用不影响识别。
-- **热词偏置**：同一文件的 `hotwords` 列表写词语（默认 GitHub、Python、API、JSON、PDF、WiFi），定稿里出现读音接近的片段时复解该段，
-  救不回来就保留原文；不写这个字段则行为与 1.6.30.0 完全一致。首次触发会多约 1 秒（进程内一次性）。
+- 已完成段落不再回改，当前草稿可修订；标点只允许添加，删除或替换已有标点时保留识别原文。识别结果本身已带标点，标点模型不会再叠一个（不再出现 `。。`、`，，`）。每轮最长三分钟。
+- **个人词典**：根目录 `dictionary.json` 里把识别的固定错法映射到正确写法（随附示例以当前文件为准；像 `get up` 这种在英文里也讲得通的写法只在中英混说句生效），保存即生效，文件损坏时自动停用不影响识别。
+- **热词偏置**：同一文件的 `hotwords` 列表写词语（按文件顺序取前 64 个，窗口会提示超额），定稿里出现读音接近的片段时复解该段，
+  救不回来就保留原文；不写这个字段则不启用救援。首次触发会多约 1 秒（进程内一次性）。
 
 Electron、Flutter 等应用优先读取实际焦点，只读预览进入缓存，无法判断的输入目标仍兼容送字。
 交互、材质与状态的完整说明见[使用说明](docs/使用说明.md)。
@@ -69,14 +59,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\install-shortcuts.ps
 
 构建使用系统自带 C# 编译器，无需 .NET SDK 或 NuGet；同时生成项目根目录快捷方式。
 `ExecutionPolicy Bypass` 仅作用于本次进程。模型权重、运行环境和个人实验数据不入库；
-校验值见 [assets.json](work/sensevoice-20261021/assets.json)。
+当前资产校验值见 [assets.json](work/sensevoice-20261021/assets.json)。
 
 ## 验证
 
 ```powershell
 .\.venv\Scripts\python.exe tools/test_sensevoice.py
 .\.venv\Scripts\python.exe tools/test_language_guard.py
+.\.venv\Scripts\python.exe tools/test_dictionary.py
+.\.venv\Scripts\python.exe tools/test_hotwords.py
 .\.venv\Scripts\python.exe tools/test_asr_scoring.py
+.\.venv\Scripts\python.exe tools/test_evaluation.py
 .\.venv\Scripts\python.exe tools/test_microphone.py
 .\.venv\Scripts\python.exe tools/evaluate_sensevoice.py
 Start-Process '.\bin\VoxFix Desktop.exe' -ArgumentList '--self-test' -Wait -PassThru | Select-Object ExitCode
@@ -89,10 +82,11 @@ Start-Process '.\bin\VoxFix Desktop.exe' -ArgumentList '--self-test' -Wait -Pass
 
 ## 文件与资料
 
-- `app/`：两个生产入口和内嵌界面资源。
+- `app/`：桌面与识别入口、共享词典规则、热词救援和内嵌界面资源。
 - `tools/`：现行测试、共享评分、下载与音频转换工具；[索引](tools/README.md)。
 - `models/`、`runtime/`：来源、许可及本地权重和运行库，二进制不入库。
 - `work/`：本机测试结果、语料与窗口位置；除资产校验值外不入库。
+- `user-data/`：私有录音与文本标签；`outputs/`：本机训练输出，两者均不入库。
 - `docs/`：使用说明和带状态的技术记录；从 [docs/README.md](docs/README.md) 开始读。
 
 旧 Nemotron/Qwen 实验脚本已从工作树移除，恢复方式见工具索引。历史技术记录保留，历史结论不代表当前行为。

@@ -1,16 +1,19 @@
 {
-  "hotwords": ["GitHub", "Python", "API", "JSON", "PDF", "WiFi", "Codex", "VoxFix", "Kotlin", "git status", "git commit"],
+  "hotwords": ["Python", "API", "JSON", "PDF", "WiFi", "Codex", "VoxFix", "Kotlin", "Java", "git status", "git commit", "sol", "GitHub", "APP"],
   "rules": [
-    { "to": "GitHub", "from": ["get up", "git up", "git hub", "get hub", "gethub", "githup", "github"], "context": "zh" },
     { "to": "Python", "from": ["python"] },
-    { "to": "API", "from": ["a p i", "api i", "api"] },
-    { "to": "JSON", "from": ["Jason", "jason", "J son", "j sen", "j-son", "js on", "json"], "context": "zh" },
+    { "to": "API", "from": ["a p i", "api i", "api", "A P"] },
+    { "to": "JSON", "from": ["Jason", "J son", "j sen", "j-son", "js on", "j so n", "json"], "context": "zh" },
     { "to": "PDF", "from": ["p d f", "pdf"] },
     { "to": "WiFi", "from": ["wifi", "wi fi", "why fi"] },
-    { "to": "Codex", "from": ["colex", "col death", "koldex", "koex", "colexs", "kolex", "cols", "kos", "codedes", "code death", "coldex", "colx"], "context": "zh" },
+    { "to": "Codex", "from": ["colex", "col death", "koldex", "koex", "colexs", "kolex", "cols", "kos", "codedes", "code death", "coldex", "colx", "codexs", "cold death"], "context": "zh" },
     { "to": "VoxFix", "from": ["vox fix", "voox fix", "voxfix", "v fix", "box fix", "vo fix"] },
-    { "to": "Kotlin", "from": ["cotland", "coland", "codelin", "kotlin"] },
+    { "to": "Kotlin", "from": ["codetland", "klin", "cotland", "codelin", "kotlin"] },
+    { "to": "Java", "from": ["javava", "java"] },
     { "to": "git status", "from": ["get status", "gi status"], "context": "zh" },
-    { "to": "git commit", "from": ["get commit", "gi commit"], "context": "zh" }
+    { "to": "git commit", "from": ["get commit", "gi commit"], "context": "zh" },
+    { "to": "sol", "from": ["soul"], "context": "zh" },
+    { "to": "GitHub", "from": ["gitthub", "gthub", "get up", "kitthub", "github", "git up"], "context": "zh" },
+    { "to": "APP", "from": ["app P", "app P P"] }
   ]
 }

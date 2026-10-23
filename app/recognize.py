@@ -11,6 +11,8 @@ import threading
 import numpy as np
 
 from hotwords import HotwordRescue, preimport as preimport_hotwords
+from dictionary_rules import (apply_dictionary, dictionary_pattern, has_chinese,
+                              load_dictionary, load_hotwords)
 
 ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_RATE = 16000
@@ -22,6 +24,7 @@ BOUNDARY_PAD = 6400
 _RANGES = ((0x0020, 0x007E), (0x2000, 0x206F), (0x3000, 0x303F),
            (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xFE30, 0xFE4F), (0xFF00, 0xFFEF))
 _SYMBOLS = frozenset('£¥©®°±µ·×÷€')
+_PUNCTUATION = frozenset('，。！？；：、,.!?;:')
 
 
 def outside_product_scripts(text):
@@ -46,64 +49,28 @@ def punctuation_only(original, result):
     return all(char in remaining for char in original if not char.isspace())
 
 
-def dictionary_pattern(variant):
-    if not isinstance(variant, str) or not variant.strip():
-        return None
-    variant = variant.strip()
-    escaped = re.escape(variant)
-    if all(char.isascii() and (char.isalnum() or char.isspace() or char == '_') for char in variant):
-        # Word edges keep "get up" from matching inside "forget upper".
-        escaped = r'(?<![A-Za-z0-9_])' + escaped + r'(?![A-Za-z0-9_])'
-    return escaped
+def drop_inserted_punctuation(original, result):
+    """Keep only the marks the model added where nothing had been marked yet.
 
-
-def load_dictionary(path):
-    """User word list applied after decoding. A missing or broken file disables it."""
-    try:
-        data = json.loads(path.read_text(encoding='utf-8-sig'))
-    except (OSError, ValueError):
-        return ()
-    rules = data.get('rules') if isinstance(data, dict) else data
-    if not isinstance(rules, list):
-        return ()
-    compiled = []
-    for rule in rules:
-        if not isinstance(rule, dict):
+    SenseVoice emits punctuation of its own, but the CT-Transformer was trained
+    on unpunctuated text and marks every position, so it stacks a second mark
+    onto an existing one ("。。", "，，", "，。").  Those characters are the
+    model's, never the speaker's: only them are dropped, and the rest of the
+    result is kept byte for byte.
+    """
+    if not result or result == original:
+        return result
+    kept, position = [], 0
+    for index, char in enumerate(result):
+        if position < len(original) and char == original[position]:
+            position += 1
+            kept.append(char)
             continue
-        canonical, variants = rule.get('to'), rule.get('from')
-        if not isinstance(canonical, str) or not canonical or not isinstance(variants, list):
+        if char in _PUNCTUATION and ((kept and kept[-1] in _PUNCTUATION) or
+                                     (index + 1 < len(result) and result[index + 1] in _PUNCTUATION)):
             continue
-        patterns = [pattern for pattern in map(dictionary_pattern, variants) if pattern]
-        if patterns:
-            compiled.append((re.compile('|'.join(patterns), re.IGNORECASE), canonical,
-                             rule.get('context') == 'zh'))
-    return tuple(compiled)
-
-
-def has_chinese(text):
-    return any('\u4e00' <= char <= '\u9fff' for char in text)
-
-
-def apply_dictionary(text, rules, force=False):
-    for pattern, canonical, zh_only in rules:
-        # "zh" keeps common English phrases intact in pure-English dictation.
-        if zh_only and not force and not has_chinese(text):
-            continue
-        text = pattern.sub(lambda match, word=canonical: word, text)
-    return text
-
-
-def load_hotwords(path):
-    """Decode-time bias list. Only an explicit `hotwords` field enables the rescue path."""
-    try:
-        data = json.loads(path.read_text(encoding='utf-8-sig'))
-    except (OSError, ValueError):
-        return ()
-    words = data.get('hotwords') if isinstance(data, dict) else None
-    if not isinstance(words, list):
-        return ()
-    return tuple(word.strip() for word in words
-                 if isinstance(word, str) and word.strip())[:64]
+        kept.append(char)
+    return ''.join(kept)
 
 
 class Dictionary:
@@ -190,7 +157,10 @@ class SenseVoiceSession:
         # Punctuation must never rewrite words, numbers, names or negation.
         if not punctuation_only(text, result):
             return text
-        return result
+        # A mark stacked onto an existing one repeats the speaker's punctuation
+        # instead of adding to it; dropping it may not touch the transcript.
+        result = drop_inserted_punctuation(text, result)
+        return result if punctuation_only(text, result) else text
 
 
 class Recognition:

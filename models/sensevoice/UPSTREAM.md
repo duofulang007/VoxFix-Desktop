@@ -1,8 +1,18 @@
 # sensevoice 权重来源
 
-## 当前部署（2026-10-22 起，VoxFix Desktop 1.6.29.0）
+## 当前部署（2026-10-23，VoxFix Desktop 1.6.46.0）
 
-生产 `model.int8.onnx` 已换成**多源真人语料微调后的权重**，不是上游原始导出：
+生产权重为 R5 整轮微调 INT8，CPU 本地推理：
+
+- `model.int8.onnx`：239,234,182 字节；SHA-256 `a002044fef99b50be903b059c39b012072bc3f131df0ad58e59d548cfde7535d`。
+- 检查点与导出来源、验证边界见 [R5 模型启用](../../docs/R5模型启用-2026-10-23.md)。6257 条封存比较为 PyTorch 口径，不是完整 INT8 独立集重测。
+- R4 回滚：`work/r5-deploy-20261023/rollback/model.int8.onnx.r4`，SHA-256 `3ff553570631f032153331b1474dd8a8016eb0ed13bf380ef99ba9eb38386e8f`。
+- 当前资产清单：[assets.json](../../work/sensevoice-20261021/assets.json)。模型、训练语料和私有样本不入库。
+- 上游 Apache-2.0 许可不等于微调数据的许可；训练与本机使用条件见启用记录，不分发训练数据或微调权重。
+
+## 历史部署：R2（1.6.29.0，已被替换）
+
+当时 `model.int8.onnx` 换成**多源真人语料微调后的权重**，不是上游原始导出：
 
 - SHA-256: `27377bac3e1f2e2588cbce401c8a5ab48991a4ad9da963357fc7a964ad3adaa6`（239,234,125 字节）
 - 来源：`iic/SenseVoiceSmall` 原始 `model.pt` 用 ASCEND + AISHELL-1 + LibriSpeech 三源混合
@@ -24,8 +34,4 @@ ONNX conversion: https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en
 - `tokens.txt` SHA-256: `f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc`
 - License: Apache-2.0 (see LICENSE).
 
-Downloaded and verified by `tools/setup_voice.py`; the APK ships the build-time optimized graph produced by
-`tools/prepare_streaming_models.py` (receipt stays local).
-
-This replaces the 2025-09-09 ASLP-lab Cantonese fine-tune. The general model's language detection is
-required by the Cantonese second-pass adoption policy; the 2025 fine-tune reported `<|yue|>` for every input.
+本桌面仓库使用 `language=auto`、关闭 ITN；无 Android APK 或粤语二遍采用链路。

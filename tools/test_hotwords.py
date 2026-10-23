@@ -1,6 +1,5 @@
 """Hotword rescue: triggers, guards and pipeline wiring; no model or audio device."""
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
@@ -199,11 +198,13 @@ class WiringTests(unittest.TestCase):
         original = hotwords.Decoder
         try:
             engine = Recognition(session, fixtures.Vad())
-            session.text = '请把代码提交到gitthub'
+            # No dictionary spelling in this sentence: the assertion is about the
+            # rescue staying dormant, not about post-decode substitution.
+            session.text = '请把代码提交到仓库'
             engine.handle({'op': 'start', 'id': 'test'})
             self.feed(engine)
             final = engine.handle({'op': 'stop', 'id': 'test'})
-            self.assertEqual(final['text'], '请把代码提交到gitthub')
+            self.assertEqual(final['text'], '请把代码提交到仓库')
         finally:
             hotwords.Decoder = original
             engine.clear()

@@ -14,7 +14,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'app'))
 from recognize import (Dictionary, Recognition, QuietBoost, SenseVoiceSession,
-                       apply_dictionary, has_chinese, join_text, punctuation_only)
+                       apply_dictionary, drop_inserted_punctuation, has_chinese, join_text,
+                       punctuation_only)
 
 
 class Vad:
@@ -405,6 +406,173 @@ class PipelineTests(unittest.TestCase):
         engine.handle({'op': 'audio', 'id': 'test', 'pcm': base64.b64encode(raw.tobytes()).decode()})
         engine.handle({'op': 'stop', 'id': 'test'})
         self.assertTrue(np.allclose(session.audio, raw.astype(np.float32) / 32768))
+
+
+class PunctuationRegressionTests(unittest.TestCase):
+    """The punctuation model must not stack a second mark onto an existing one."""
+
+    # These model outputs are verbatim from the shipped INT8 CT-Transformer:
+    # it emits a mark at every position, so an already punctuated transcript
+    # gains a neighbour ("。。", "，，", "，。").
+    STACKED = [
+        ('你好。', '你好。。', '你好。'),
+        ('好的。', '好的，。。', '好的。'),
+        ('你好，世界。', '你好，，世界。', '你好，世界。'),
+        ('我们明天，如果天气好，就去公园', '我们明天，，如果天气好，就去公园。',
+         '我们明天，如果天气好，就去公园。'),
+    ]
+    ADDED = [
+        ('你好', '你好。', '你好。'),
+        ('你好，世界', '你好，世界。', '你好，世界。'),
+        ('我们明天如果天气好就去公园', '我们明天，如果天气好，就去公园。',
+         '我们明天，如果天气好，就去公园。'),
+    ]
+    KEPT = [
+        # Deliberate punctuation stays as the speaker wrote it.
+        ('他说“好。”', '他说“好。”。', '他说“好。”。'),
+        ('真的？！', '真的？！', '真的？！'),
+        ('金额1.5元', '金额1.5元。', '金额1.5元。'),
+    ]
+
+    def punctuated(self, output):
+        return SimpleNamespace(punctuation=SimpleNamespace(add_punctuation=lambda text: output))
+
+    def test_marks_stacked_on_existing_punctuation_are_dropped(self):
+        for original, output, expected in self.STACKED:
+            with self.subTest(original=original):
+                self.assertEqual(drop_inserted_punctuation(original, output), expected)
+                self.assertEqual(SenseVoiceSession.punctuate(self.punctuated(output), original),
+                                 expected)
+                # Dropping the model's extra mark must leave every original
+                # character — including the punctuation — in place.
+                self.assertTrue(punctuation_only(original, expected))
+
+    def test_marks_added_where_nothing_was_marked_survive(self):
+        for original, output, expected in self.ADDED:
+            with self.subTest(original=original):
+                self.assertEqual(drop_inserted_punctuation(original, output), expected)
+                self.assertEqual(SenseVoiceSession.punctuate(self.punctuated(output), original),
+                                 expected)
+
+    def test_dedupe_never_removes_the_speakers_own_punctuation(self):
+        for original, output, expected in self.KEPT:
+            with self.subTest(original=original):
+                self.assertEqual(drop_inserted_punctuation(original, output), expected)
+                self.assertEqual(SenseVoiceSession.punctuate(self.punctuated(output), original),
+                                 expected)
+
+    def test_model_output_that_rewrites_words_is_still_rejected(self):
+        session = self.punctuated('使用NET。')
+        self.assertEqual(SenseVoiceSession.punctuate(session, '使用.NET'), '使用.NET')
+
+    def test_rejected_and_failed_model_keep_the_transcript(self):
+        class Broken:
+            def add_punctuation(self, text):
+                raise RuntimeError('no model')
+        self.assertEqual(SenseVoiceSession.punctuate(SimpleNamespace(punctuation=Broken()), '原文'),
+                         '原文')
+
+
+class PunctuationPipelineTests(unittest.TestCase):
+    """Draft, revision and segment boundaries must not repeat punctuation."""
+
+    class Fixed(Session):
+        def __init__(self):
+            super().__init__()
+            self.punctuation = SimpleNamespace(add_punctuation=lambda text: text + '。')
+
+        punctuate = SenseVoiceSession.punctuate
+
+    def feed(self, engine, seconds=1):
+        pcm = np.full(int(16000 * seconds), 100, dtype='<i2').tobytes()
+        return engine.handle({'op': 'audio', 'id': 'test', 'pcm': base64.b64encode(pcm).decode()})
+
+    def wait_for(self, engine, key, value):
+        limit = time.monotonic() + 2
+        while time.monotonic() < limit:
+            result = engine.handle({'op': 'poll', 'id': 'test'})
+            if result[key] == value:
+                return result
+            time.sleep(.005)
+        self.fail((key, value, result))
+
+    def test_final_after_punctuated_draft_keeps_a_single_mark(self):
+        session = self.Fixed()
+        session.text = '第一句。'
+        engine = Recognition(session, Vad())
+        try:
+            engine.handle({'op': 'start', 'id': 'test'})
+            self.feed(engine)
+            self.assertEqual(self.wait_for(engine, 'preview', '第一句。')['preview_segment'],
+                             {'route': 0, 'start': 0, 'text': '第一句。'})
+            final = engine.handle({'op': 'stop', 'id': 'test'})
+            self.assertEqual(final['text'], '第一句。')
+            self.assertEqual(final['segments'][-1]['text'], '第一句。')
+        finally:
+            engine.clear()
+
+    def test_final_completes_an_unpunctuated_draft_exactly_once(self):
+        session = self.Fixed()
+        session.text = '第二句'
+        engine = Recognition(session, Vad())
+        try:
+            engine.handle({'op': 'start', 'id': 'test'})
+            self.feed(engine)
+            self.wait_for(engine, 'preview', '第二句')
+            final = engine.handle({'op': 'stop', 'id': 'test'})
+            self.assertEqual(final['text'], '第二句。')
+            self.assertEqual(final['segments'][-1]['text'], '第二句。')
+        finally:
+            engine.clear()
+
+    def test_segment_boundary_and_earlier_segment_stay_clean(self):
+        session = self.Fixed()
+        session.text = '第一句。'
+        engine = Recognition(session, Vad())
+        try:
+            engine.handle({'op': 'start', 'id': 'test'})
+            self.feed(engine)
+            self.wait_for(engine, 'preview', '第一句。')
+            # Leaving and re-entering the input box closes the first segment.
+            engine.handle({'op': 'route', 'id': 'test', 'route': 1})
+            self.wait_for(engine, 'text', '第一句。')
+            session.text = '第二句。'
+            self.feed(engine)
+            self.wait_for(engine, 'preview', '第二句。')
+            final = engine.handle({'op': 'stop', 'id': 'test'})
+            self.assertEqual(final['text'], '第一句。第二句。')
+            self.assertNotIn('。。', final['text'])
+            self.assertNotIn('，，', final['text'])
+            self.assertEqual(final['segments'][0]['text'], '第一句。')
+            self.assertEqual(final['segments'][-1]['text'], '第二句。')
+        finally:
+            engine.clear()
+
+    def test_repeated_drafts_revise_without_stacking_marks(self):
+        class Growing(Session):
+            def __init__(self):
+                super().__init__()
+                self.punctuation = SimpleNamespace(add_punctuation=lambda text: text + '。')
+
+            punctuate = SenseVoiceSession.punctuate
+
+            def run(self, audio):
+                # Same segment, longer audio: the draft is replaced, not queued.
+                self.text = '持续说话' if len(audio) < 24000 else '持续说话，还没说完'
+                return SimpleNamespace(text=self.text)
+
+        engine = Recognition(Growing(), Vad())
+        try:
+            engine.handle({'op': 'start', 'id': 'test'})
+            self.feed(engine)
+            self.wait_for(engine, 'preview', '持续说话')
+            self.feed(engine)
+            self.wait_for(engine, 'preview', '持续说话，还没说完')
+            final = engine.handle({'op': 'stop', 'id': 'test'})
+            self.assertEqual(final['text'], '持续说话，还没说完。')
+            self.assertNotIn('。。', final['text'])
+        finally:
+            engine.clear()
 
 
 if __name__ == '__main__':
