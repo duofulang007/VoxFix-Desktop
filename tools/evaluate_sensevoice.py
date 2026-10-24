@@ -1,4 +1,4 @@
-"""Fresh paired full-clip/production evaluation; defaults to the legacy corpus."""
+"""Fresh paired full-clip/production evaluation of an explicitly selected corpus."""
 import argparse
 import base64
 from collections import defaultdict
@@ -39,7 +39,7 @@ def summarize(rows):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--manifest', type=Path, default=ROOT / 'work/p0/manifest.json')
+    parser.add_argument('--manifest', type=Path, required=True)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
     run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8]

@@ -1,8 +1,6 @@
 """Shared ASR scoring: Chinese characters, English words, and silence protection."""
 
 import re
-
-
 import unicodedata
 
 

@@ -67,11 +67,36 @@ class DictionaryTests(unittest.TestCase):
         from recognize import apply_dictionary as production
         self.assertIs(production, apply_dictionary)
 
+    def test_shipped_app_and_api_spellings_do_not_collide(self):
+        data = json.loads((ROOT / 'dictionary.json').read_text(encoding='utf-8-sig'))
+        for source, expected in [('A P P', 'APP'), ('打开a p p', '打开APP'),
+                                 ('app P', 'APP'), ('app P P', 'APP'),
+                                 ('A P I', 'API'), ('调用a p i', '调用API'),
+                                 ('api i', 'API'), ('APP API', 'APP API'),
+                                 ('A P', 'A P'), ('字母A P', '字母A P')]:
+            with self.subTest(source=source):
+                self.assertEqual(preview(data, source)['text'], expected)
+
     def test_native_limit_matches_python(self):
         source = (ROOT / 'app/Microphone.cs').read_text(encoding='utf-8-sig')
         match = re.search(r'const int HotwordLimit = (\d+);', source)
         self.assertIsNotNone(match)
         self.assertEqual(int(match[1]), HOTWORD_LIMIT)
+
+    def test_personal_dictionary_overrides_all_languages(self):
+        data = json.loads((ROOT / 'dictionary.json').read_text(encoding='utf-8-sig'))
+        self.assertEqual(data['hotwords'], [r['to'] for r in data['rules']])
+        for rule in data['rules']:
+            self.assertNotIn('context', rule)
+            for variant in rule['from']:
+                for prefix in ['', 'open ', '打开']:
+                    with self.subTest(word=rule['to'], variant=variant, prefix=prefix):
+                        self.assertEqual(preview(data, prefix + variant)['text'], prefix + rule['to'])
+        for source, expected in [('git hub', 'GitHub'), ('codex', 'Codex'),
+                                 ('j s o n', 'JSON'), ('forget upper', 'forget upper'),
+                                 ('souls Jasonville', 'souls Jasonville'),
+                                 ('I get up', 'I GitHub'), ('Jason soul', 'JSON sol')]:
+            self.assertEqual(preview(data, source)['text'], expected)
 
 
 if __name__ == '__main__':

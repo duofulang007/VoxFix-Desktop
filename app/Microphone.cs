@@ -15,7 +15,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.46.0")]
+[assembly: AssemblyVersion("1.6.47.0")]
 
 static class Native
 {
@@ -2661,9 +2661,18 @@ sealed class Microphone : Form
         } catch { }
         return TargetKind.Unknown;
     }
+    static TargetKind ConfirmReadOnlyTarget(TargetKind primary, Func<TargetKind> confirm) {
+        if (primary != TargetKind.ReadOnly) return primary;
+        return confirm() == TargetKind.Editable ? TargetKind.Editable : primary;
+    }
     static TargetKind Classify(IntPtr window, IntPtr focus, IntPtr own) {
         if (window == IntPtr.Zero || window == own) return TargetKind.ReadOnly;
-        if (CoarseClass(window)) return ClassifyCoarse(window);
+        // Chromium may expose only a read-only document until UIA activates its input tree.
+        if (CoarseClass(window))
+            return ConfirmReadOnlyTarget(ClassifyCoarse(window), () => ClassifyAutomation(window, focus));
+        return ClassifyAutomation(window, focus);
+    }
+    static TargetKind ClassifyAutomation(IntPtr window, IntPtr focus) {
         if (focus == IntPtr.Zero) return TargetKind.ReadOnly;
         try {
             var element = System.Windows.Automation.AutomationElement.FocusedElement;
@@ -4078,6 +4087,14 @@ sealed class Microphone : Form
                 throw new Exception("Unfocused whole-window placeholder must remain unknown");
             if (DecideAccessibleTarget((int)AccessibleRole.Pane, focusedState) != TargetKind.Unknown)
                 throw new Exception("Coarse host placeholders must not veto custom input controls");
+            if (ConfirmReadOnlyTarget(TargetKind.ReadOnly, () => TargetKind.Editable) != TargetKind.Editable)
+                throw new Exception("A focused writable UIA input must override the coarse read-only document");
+            foreach (var confirmation in new[] { TargetKind.ReadOnly, TargetKind.Unknown })
+                if (ConfirmReadOnlyTarget(TargetKind.ReadOnly, () => confirmation) != TargetKind.ReadOnly)
+                    throw new Exception("Only a confirmed editable input may override a coarse read-only target");
+            foreach (var primary in new[] { TargetKind.Unknown, TargetKind.Editable })
+                if (ConfirmReadOnlyTarget(primary, () => { throw new Exception("Unneeded UIA query"); }) != primary)
+                    throw new Exception("Deliverable MSAA targets must not query UIA");
             var inputs = Native.TextInputs("你好A😀");
             if (inputs.Length != 10 || inputs[0].data.keyboard.scan != '你' || inputs[1].data.keyboard.flags != 6) throw new Exception("Unicode input");
             Directory.CreateDirectory(Path.Combine(root, "work"));

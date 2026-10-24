@@ -1,6 +1,7 @@
 """Small scoring/provenance boundary checks; no model or downloaded data."""
 import tempfile
 import json
+import io
 from pathlib import Path
 import wave
 from unittest.mock import patch
@@ -19,6 +20,15 @@ summary = summarize(rows)['mixed/original']
 assert summary == {'total': 2, 'exact': 1, 'fullExact': 0, 'errors': 1,
                    'unitErrors': 3, 'refUnits': 8, 'unitErrorRate': 3 / 8}
 assert not exact('', '。')
+with patch('sys.argv', ['evaluate_sensevoice.py']), patch('sys.stderr', new_callable=io.StringIO), \
+     patch('evaluate_sensevoice.load_model') as model:
+    try:
+        main()
+    except SystemExit as error:
+        assert error.code == 2
+    else:
+        raise AssertionError('Evaluation requires an explicit corpus; never default to legacy174')
+    model.assert_not_called()
 audio = .1 * np.sin(np.arange(16000) * .1)
 pcm = pcm16(audio)
 assert stress(pcm, 'original', None, 0) == pcm
@@ -38,7 +48,7 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent / 'w
     before = sha256(path)
     write_wav(path, noise)
     assert sha256(path) != before
-    with patch('sys.argv', ['evaluate_sensevoice.py', '--output', str(path)]):
+    with patch('sys.argv', ['evaluate_sensevoice.py', '--manifest', 'unused.json', '--output', str(path)]):
         try:
             main()
         except FileExistsError:

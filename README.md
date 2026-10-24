@@ -1,6 +1,6 @@
 # VoxFix Desktop
 
-Windows x64 本地语音输入，替代 Win+H。当前版本 **1.6.46.0**。
+Windows x64 本地语音输入，替代 Win+H。当前版本 **1.6.47.0**。
 使用 SenseVoiceSmall INT8 + Silero VAD + CT-Transformer，CPU 本地推理；识别与送字不联网。
 
 词典支持文字纠正、搜索、未保存内容预览，以及同词多段录音与完整文本标签。
@@ -24,12 +24,15 @@ Windows x64 本地语音输入，替代 Win+H。当前版本 **1.6.46.0**。
 - 拖动可移动并记住位置；右键菜单为“收起 / 词典 / 退出”。点窗口外任意位置、选任一项、按 Esc 或退出都会关闭菜单，不会一直悬在桌面上。退出后恢复系统 Win+H。
 - 识别草稿一有文字就尝试送进当前输入框，不等停顿；继续说话时会修订当前这一段，停顿后补齐最终文字和标点。只修订本轮在原输入位置写入的当前段；手动编辑或切换焦点后停止修订，未送出结果留在缓存。
 - 已完成段落不再回改，当前草稿可修订；标点只允许添加，删除或替换已有标点时保留识别原文。识别结果本身已带标点，标点模型不会再叠一个（不再出现 `。。`、`，，`）。每轮最长三分钟。
-- **个人词典**：根目录 `dictionary.json` 里把识别的固定错法映射到正确写法（随附示例以当前文件为准；像 `get up` 这种在英文里也讲得通的写法只在中英混说句生效），保存即生效，文件损坏时自动停用不影响识别。
+- **个人词典**：根目录 `dictionary.json` 是你指定的“错法 → 正确词”，当前词表统一在独念、纯英文和混说时生效，包括 `get up → GitHub`、`Jason → JSON`、`soul → sol`。这些是个人纠正偏好，即使原写法是正常英文也会替换；保存即生效，文件损坏时自动停用不影响识别。
 - **热词偏置**：同一文件的 `hotwords` 列表写词语（按文件顺序取前 64 个，窗口会提示超额），定稿里出现读音接近的片段时复解该段，
   救不回来就保留原文；不写这个字段则不启用救援。首次触发会多约 1 秒（进程内一次性）。
 
-Electron、Flutter 等应用优先读取实际焦点，只读预览进入缓存，无法判断的输入目标仍兼容送字。
+Electron、Flutter 等应用优先读取实际焦点；旧接口只读判定会用 UIA 补查，仅当前窗口内确认可编辑的输入框可覆盖该判定。只读预览进入缓存，无法判断的输入目标仍兼容送字。
 交互、材质与状态的完整说明见[使用说明](docs/使用说明.md)。
+
+词典区分拆字缩写：`A P P → APP`、`A P I → API`；单独 `A P` 保留原文，避免猜测缺失的字母。
+词典内容修订 **2026.10.24.1**：统一个人规则的适用语言，新增三种完整写法；程序仍为 1.6.47.0，无需重建或重启。验证与已知取舍见[个人词典统一规则](docs/个人词典统一规则-2026-10-24.md)。
 
 ## 本地运行
 
@@ -71,11 +74,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\install-shortcuts.ps
 .\.venv\Scripts\python.exe tools/test_asr_scoring.py
 .\.venv\Scripts\python.exe tools/test_evaluation.py
 .\.venv\Scripts\python.exe tools/test_microphone.py
-.\.venv\Scripts\python.exe tools/evaluate_sensevoice.py
 Start-Process '.\bin\VoxFix Desktop.exe' -ArgumentList '--self-test' -Wait -PassThru | Select-Object ExitCode
 ```
 
 真实模型测试需要本地模型和 `work/p0/` 评测语料；175 秒连续会话使用固定音频投递，不是真人麦克风准确率。
+准确率评测必须明确指定语料：`tools/evaluate_sensevoice.py --manifest <语料清单.json> --output <新结果.json>`，不再默认运行旧 174 条。个人词典与模型采用应看有相关术语覆盖的当前样本，最终封存集不用于反复调规则。
 原生测试须同时检查退出码和**本次新生成**的 PASS 文件，`--self-test` 写 `work/microphone-self-test.txt`。
 焦点、快捷键、采音和送字测试入口见 [AGENTS.md](AGENTS.md) 与[工具索引](tools/README.md)。
 键鼠操作可能干扰真实桌面测试，应逐项串行运行。
