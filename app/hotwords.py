@@ -338,6 +338,9 @@ class HotwordRescue:
 
     def release(self):
         with self.lock:
+            if self.timer is not None:
+                self.timer.cancel()
+                self.timer = None
             if self.decoder is not None:
                 try:
                     self.decoder.close()
@@ -370,6 +373,7 @@ class HotwordRescue:
                 self._schedule_release()
         except Exception:
             self.stats['failed'] += 1
+            self.release()
             return text
         # Accept only if the rescue spells a word out properly ("J SON" -> "JSON")
         # or at least puts more of the word list into the text; never fewer.

@@ -15,7 +15,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.67.0")]
+[assembly: AssemblyVersion("1.6.71.0")]
 
 static class Native
 {
@@ -1510,19 +1510,22 @@ sealed class TrainingReviewPanel : Panel
         }
     }
     void Apply(Dictionary<string, object> response) {
-        if (IsDisposed) return; string selected = SelectedRunId; runs.Clear(); foreach (object item in ArrayOf(response, "runs")) runs.Add((Dictionary<string, object>)item);
+        if (IsDisposed) return; string selected = SelectedRunId, draftNote = note.Text;
+        bool keepNote = Current != null && TextOf(Current, "status") == "awaiting_retest";
+        runs.Clear(); foreach (object item in ArrayOf(response, "runs")) runs.Add((Dictionary<string, object>)item);
         silent = true; versions.Items.Clear(); foreach (var run in runs) versions.Items.Add(TextOf(run, "name") + " · " + TextOf(run, "displayStatus"));
-        versions.SelectedIndex = Math.Max(-1, runs.FindIndex(item => TextOf(item, "id") == selected)); if (versions.SelectedIndex < 0 && runs.Count > 0) versions.SelectedIndex = 0; silent = false; SelectedRunId = TextOf(Current, "id"); ShowCases();
+        versions.SelectedIndex = runs.FindIndex(item => TextOf(item, "id") == selected); if (versions.SelectedIndex < 0 && runs.Count > 0) versions.SelectedIndex = 0; silent = false; SelectedRunId = TextOf(Current, "id"); ShowCases();
+        if (keepNote && SelectedRunId == selected && TextOf(Current, "status") == "awaiting_retest") note.Text = draftNote;
         if (ArrayOf(response, "errors").Length > 0) notice.Text = "部分验证记录读取失败：" + string.Join("；", Array.ConvertAll(ArrayOf(response, "errors"), Convert.ToString));
         if (RunsChanged != null) RunsChanged(runs);
     }
     internal async Task Reload() { if (busy || IsDisposed) return; busy = true; UpdateActions(); try { Apply(await Execute(new Dictionary<string, object> { { "action", "list" } })); } catch (Exception error) { if (!IsDisposed) notice.Text = "验证记录未读取：" + error.Message; } finally { busy = false; child = null; if (!IsDisposed) UpdateActions(); } }
     async Task Act(string action, Dictionary<string, object> extra) {
         if (busy || Current == null) return; var request = extra ?? new Dictionary<string, object>(); request["action"] = action; request["id"] = TextOf(Current, "id"); busy = true; UpdateActions(); notice.Text = action == "capture" || action == "evaluate" ? "正在对新录音运行原模型和候选对照，原音已保存…" : "正在记录验证结论…";
-        string failure = null, draftNote = note.Text;
+        string failure = null;
         try { Apply(await Execute(request)); if (!IsDisposed) notice.Text = action == "reopen" ? "已撤回结论，返回待复测；原音、对照与历次结论保留。" : action == "decide" ? "验证结论已保存。通过后交给agent校验、启用并准备回滚。" : "识别对照已完成，请核对新录音和正确全文。"; }
         catch (Exception error) { failure = error.Message; }
-        if (failure != null && !IsDisposed) { try { Apply(await Execute(new Dictionary<string, object> { { "action", "list" } })); } catch { } if (!IsDisposed) { note.Text = draftNote; notice.Text = "操作未完成，原音保留：" + failure; } }
+        if (failure != null && !IsDisposed) { try { Apply(await Execute(new Dictionary<string, object> { { "action", "list" } })); } catch { } if (!IsDisposed) notice.Text = "操作未完成，原音保留：" + failure; }
         busy = false; child = null; if (!IsDisposed) UpdateActions();
     }
 
@@ -1565,7 +1568,16 @@ sealed class TrainingReviewPanel : Panel
         check(versions.Items.Count == 0 && !captureButton.Enabled && !passButton.Enabled, "no candidate means no false verification actions");
         string id = Guid.NewGuid().ToString("N");
         var response = HistoryStore.Parse(new JavaScriptSerializer().Serialize(new { runs = new[] { new { id = id, name = "个人微调 · 测试版本", status = "awaiting_retest", displayStatus = "待复测", archives = new[] { new { path = archive, sources = new[] { source } } }, cases = new[] { new { id = "test-case", correctText = "今天不用 Codex，先跑测试。", baselineText = "今天不用扣desks，先跑测试。", candidateText = "今天不用 Codex，先跑测试。", status = "evaluated", durationSeconds = 1.0 } } } }, errors = new string[0] }));
-        Apply(response); check(passButton.Enabled && captureButton.Enabled && details.Text.Contains("原模型") && details.Text.Contains("正确全文"), "fresh comparison and explicit pass affordance");
+        Action refresh = () => Apply(HistoryStore.Parse(new JavaScriptSerializer().Serialize(response)));
+        refresh(); check(passButton.Enabled && captureButton.Enabled && details.Text.Contains("原模型") && details.Text.Contains("正确全文"), "fresh comparison and explicit pass affordance");
+        note.Text = "需要保留的打回原因"; refresh();
+        check(note.Text == "需要保留的打回原因", "refresh of the same pending version retains unsaved verification note");
+        var refreshedRun = (Dictionary<string, object>)ArrayOf(response, "runs")[0];
+        refreshedRun["status"] = "rejected"; refreshedRun["decision"] = new Dictionary<string, object> { { "note", "已保存的正式结论" } }; refresh();
+        check(note.ReadOnly && note.Text == "已保存的正式结论", "saved conclusion replaces draft note after status change");
+        refreshedRun["status"] = "awaiting_retest"; refreshedRun.Remove("decision"); refresh();
+        note.Text = "不能串到其他版本"; refreshedRun["id"] = Guid.NewGuid().ToString("N"); refresh();
+        check(note.Text == "" && SelectedRunId != id, "draft note never leaks to another candidate version");
         note.Clear(); rejectButton.PerformClick(); check(notice.Text.Contains("填写打回原因"), "reject requires an actionable reason");
         var form = FindForm(); using (var bitmap = new Bitmap(form.Width, form.Height)) { form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-verification.png")); }
         var item = (Dictionary<string, object>)cases.Items[0]; item["status"] = "pending"; UpdateActions(); check(!passButton.Enabled && retryButton.Enabled, "pending recognition blocks approval and exposes retry");
@@ -1676,7 +1688,7 @@ sealed class HistoryPanel : Panel
     DictionaryField searchField;
     DictionaryScrollBar rowsScroll, materialScroll;
     HistoryEntry current;
-    bool silent, dirty, loading;
+    bool silent, dirty, loading, exporting;
     long usageBytes;
     int lastFilter;
     string lastSearch = "";
@@ -1861,7 +1873,7 @@ sealed class HistoryPanel : Panel
         if (ArchiveTab && !ArchivedView) materialSummary.Text = "还没有归档批次";
         export.Text = ArchivedView ? (batches[batchChoice.SelectedIndex - 1].Withdrawn ? "恢复归档" : "撤回归档") : "归档批次";
         ((DictionaryButton)export).Primary = !ArchivedView || batches[batchChoice.SelectedIndex - 1].Withdrawn; ((DictionaryButton)export).Outlined = ArchivedView;
-        export.Enabled = ArchivedView || (!ArchiveTab && count > 0);
+        export.Enabled = !exporting && (ArchivedView || (!ArchiveTab && count > 0));
     }
     void BuildMoreMenu() {
         moreMenu.Renderer = new MicrophoneMenuRenderer(); moreMenu.ShowImageMargin = false; moreMenu.Font = Font;
@@ -1930,7 +1942,7 @@ sealed class HistoryPanel : Panel
         bool moved = NextRecord(); Filter(); if (!moved) SetPage(0); RecordVisit(); notice.Text = chosen ? "已保存，并留作训练。" : "已保存。";
     }
     internal Label Notice { get { return notice; } }
-    internal bool Loading { get { return loading; } }
+    internal bool Loading { get { return loading || exporting; } }
     Label Label(string text, int x, int y, int width, int height, float size) { return new DictionaryLabel { Text = text, Bounds = new Rectangle(x, y, width, height), Font = new Font(Font.FontFamily, size), ForeColor = Dim }; }
     Button Button(string text, int x, int y, int width, int height, Action click) { var button = new DictionaryButton { Text = text, Bounds = new Rectangle(x, y, width, height), Font = new Font(Font.FontFamily, 11f), BackColor = Color.White, ForeColor = Ink, Outlined = true }; button.Click += (o, e) => click(); return button; }
     void AddText(TextBox box, Rectangle bounds, bool readOnly, string name) {
@@ -2009,12 +2021,13 @@ sealed class HistoryPanel : Panel
         try { string before = current.Original; store.Save(current, correct.Text, selected.Checked, false); Remember(new List<Change> { new Change { File = current.FileName, Before = before, After = current.Original } }); dirty = false; UpdateSummary(); notice.Text = (selected.Checked ? "已保存，已留作训练，尚未训练。" : "已保存，未选入训练。") + "在录音列表的「已保存」中可查看。"; rows.Invalidate(); return true; }
         catch (Exception error) { notice.Text = "保存失败：" + error.Message; return false; }
     }
-    internal bool Resolve() {
+    internal bool Resolve(DialogResult? answerForTest = null) {
+        if (exporting) { notice.Text = "正在归档批次，请等待复制完成。"; return false; }
         if (capture != null && !capture.IsDisposed && capture.Visible) { capture.Close(); if (capture.Visible) return false; }
         if (reviewPage != null && !reviewPage.ResolveCapture()) return false;
         if (!dirty) return true;
-        var answer = MessageBox.Show(FindForm(), "这条记录的文字或训练选择尚未保存，保存吗？", "听写记录", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
-        if (answer == DialogResult.Cancel) return false; if (answer == DialogResult.Yes) return Save(); dirty = false; return true;
+        var answer = answerForTest ?? MessageBox.Show(FindForm(), "这条记录的文字或训练选择尚未保存，保存吗？", "听写记录", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+        if (answer == DialogResult.Cancel) return false; if (answer == DialogResult.Yes) return Save(); ShowEntry(current); return true;
     }
     void Play() {
         if (playingUntil > 0) { Stop(); return; } if (current == null) return;
@@ -2058,10 +2071,10 @@ sealed class HistoryPanel : Panel
         var chosen = entries.FindAll(item => item.Flag("selectedForTraining") && !item.Flag("ignored") && archiveSelected.Contains(item.FileName)); double seconds = 0; foreach (var item in chosen) seconds += item.Seconds;
         if (chosen.Count == 0) { notice.Text = "请先核对并选择本批次的录音。"; return; }
         if (MessageBox.Show(FindForm(), "批次：" + batchName.Text + "\n将复制 " + chosen.Count + " 条录音，约 " + (seconds / 60).ToString("0.0") + " 分钟，及当前正确文字。\n\n这一步只准备独立批次，不会训练或启用模型。后续见「交接说明」。", "归档批次", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
-        string name = batchName.Text; export.Enabled = false;
+        string name = batchName.Text; exporting = true; Enabled = false; export.Enabled = false; if (NavigationChanged != null) NavigationChanged();
         try { var confirmed = chosen.ConvertAll(item => new HistoryEntry { FileName = item.FileName, Original = item.Original }); latestBatch = await Task.Run(() => store.Export(confirmed, name)); if (IsDisposed) return; foreach (var item in chosen) archiveSelected.Remove(item.FileName); UpdateMaterials(); int index = batches.FindIndex(item => item.Path == latestBatch); if (index >= 0) batchChoice.SelectedIndex = index + 1; batchName.Text = "训练 " + DateTime.Now.ToString("MM-dd HH:mm"); if (IsDisposed) return; notice.Text = "批次已归档，交给agent训练；训练完成后到「验证」录新音复测。"; notice.AccessibleDescription = notice.Text; }
         catch (Exception error) { if (!IsDisposed) notice.Text = "批次未完成：" + error.Message; }
-        finally { if (!IsDisposed) BatchSummary(); }
+        finally { exporting = false; if (!IsDisposed) { Enabled = true; BatchSummary(); if (NavigationChanged != null) NavigationChanged(); } }
     }
     internal static void CheckForTest(string work) {
         Action<bool, string> check = (ok, message) => { if (!ok) throw new Exception("HISTORY-TEST: " + message); };
@@ -2160,6 +2173,15 @@ sealed class HistoryPanel : Panel
             using (var bitmap = new Bitmap(dialog.Width, dialog.Height)) { dialog.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-history-comparison.png")); }
             history.ShowOriginal(false); check(history.correctLabel.Visible && history.correctLabel.Bottom <= history.correct.Parent.Top, "editable label also remains visible without comparison");
             history.filter.SelectedIndex = 0; history.rows.SelectedIndex = 0;
+            history.Navigate(2); history.pendingBatch.PerformClick(); history.materialAll.PerformClick();
+            history.exporting = true; history.export.Enabled = false; history.BatchSummary();
+            check(!history.export.Enabled && !history.Resolve() && history.Export().IsCompleted, "in-flight archive cannot be re-enabled or started twice");
+            history.Navigate(0); check(history.page == 2, "navigation waits until archive copying finishes");
+            history.exporting = false; history.BatchSummary(); history.Navigate(1);
+            string savedCorrection = history.correct.Text, savedRecord = history.current.Original; bool savedChoice = history.selected.Checked;
+            history.correct.Text = "应当放弃的文字"; history.selected.Checked = !savedChoice;
+            check(!history.Resolve(DialogResult.Cancel) && history.dirty && history.correct.Text == "应当放弃的文字", "cancel retains unsaved text and selection");
+            check(history.Resolve(DialogResult.No) && !history.dirty && history.correct.Text == savedCorrection && history.selected.Checked == savedChoice && File.ReadAllText(history.current.FileName) == savedRecord, "discard restores saved text and training choice without writing");
             string beforeCorrection = history.current.Original; history.correct.Clear(); history.SaveAndNext();
             check(history.rows.SelectedIndex == 0 && history.current.Original == beforeCorrection && history.correct.Text == "", "failed save does not advance or lose the edit");
             history.correct.Text = "今天不用 Codex，先跑测试。"; history.selected.Checked = false; history.SaveAndNext();
@@ -3243,6 +3265,10 @@ sealed class Microphone : Form
     readonly bool streamTest;
     readonly System.Windows.Forms.Timer limit = new System.Windows.Forms.Timer { Interval = 180000 };
     readonly System.Windows.Forms.Timer capture = new System.Windows.Forms.Timer { Interval = 40 };
+    readonly System.Windows.Forms.Timer appendPulse = new System.Windows.Forms.Timer { Interval = 16 };
+    DraftText pacedDraft;
+    int appendChunk;
+    double appendDeadline;
     readonly System.Windows.Forms.Timer animation = new System.Windows.Forms.Timer { Interval = 16 };
     // Idle focus watch: the capsule reports whether text would land in a real input box
     // even before recording starts. Cheap when the target pair has not changed.
@@ -3328,6 +3354,10 @@ sealed class Microphone : Form
         AccessibleDescription = "正在加载本地模型…";
         limit.Tick += async (s, e) => { limit.Stop(); await Toggle(); };
         capture.Tick += async (s, e) => await Pump();
+        appendPulse.Tick += (s, e) => {
+            try { DrainAppend(motionClock.Elapsed.TotalMilliseconds >= appendDeadline); }
+            catch (Exception error) { Fail(error.Message); }
+        };
         focusWatch.Tick += async (s, e) => await WatchIdleFocus();
         animation.Tick += async (s, e) => {
             if (!Visible && !startOnReveal) { animation.Stop(); return; }
@@ -3413,6 +3443,7 @@ sealed class Microphone : Form
             if (recorder != null) recorder.Dispose();
             EndListening(true);
             animation.Stop(); animation.Dispose();
+            ClearAppend(); appendPulse.Dispose();
             delivery = null;
             StopWorker();
             if (worker != null) worker.Dispose();
@@ -3715,8 +3746,19 @@ sealed class Microphone : Form
         string key = route + ":" + Convert.ToString(segment.ContainsKey("preview_start") ? segment["preview_start"] : segment["start"]);
         string text = Convert.ToString(segment["text"]).TrimStart();
         DraftText previous;
+        delivery.Drafts.TryGetValue(key, out previous);
+        if (pacedDraft != null) {
+            if (previous == pacedDraft && delivery.Paused.Length == 0) {
+                if (!final && (text.Length == 0 ? "" : previous.Separator + text) == previous.Text) return;
+                // Replace the unseen tail before a new draft can make us type and erase it.
+                previous.Text = previous.Text.Substring(0, previous.Text.Length - delivery.Pending.Length);
+                delivery.Latest = delivery.Accounted;
+                ClearAppend();
+            } else DrainAppend(true);
+        }
+        if (!final && previous != null && OnlyDraftPunctuationChanged(previous.Text, text.Length == 0 ? "" : previous.Separator + text)) return;
         bool memory = backupRoutes.Contains(route) || delivery.Paused.Length != 0;
-        if (!delivery.Drafts.TryGetValue(key, out previous)) {
+        if (previous == null) {
             if (final) { ApplyText(delivery.Latest + Convert.ToString(segment["text"]), memory); return; }
             if (memory) return;
             previous = new DraftText();
@@ -3732,14 +3774,24 @@ sealed class Microphone : Form
                 else KeepRecovery("\n[该句最终识别] " + text);
             }
         } else {
-            ReviseText(previous.Text, text);
+            ReviseText(previous.Text, text, !final && animationsEnabled);
             previous.Text = text;
+            if (delivery.Pending.Length > 0 && delivery.Paused.Length == 0) {
+                pacedDraft = previous;
+                appendDeadline = motionClock.Elapsed.TotalMilliseconds + 64;
+                appendPulse.Start();
+            }
         }
         if (final) delivery.Drafts.Remove(key);
     }
-    void ReviseText(string previous, string text) {
+    void ReviseText(string previous, string text, bool pace = false) {
         int common = CommonPrefix(previous, text);
-        if (common == previous.Length) { ApplyText(delivery.Latest + text.Substring(common)); return; }
+        if (common == previous.Length) {
+            string addition = text.Substring(common);
+            appendChunk = pace && previous.Length > 0 && addition.Length >= 12 ? (addition.Length + 3) / 4 : int.MaxValue;
+            ApplyText(delivery.Latest + addition, false, appendChunk);
+            return;
+        }
         if (delivery.Latest != delivery.Accounted || !delivery.Latest.EndsWith(previous, StringComparison.Ordinal) ||
             !delivery.Delivered.EndsWith(previous, StringComparison.Ordinal))
             throw new IOException("无法确认本轮草稿位置，已停止修订。");
@@ -3769,6 +3821,13 @@ sealed class Microphone : Form
         int length = 0;
         while (length < previous.Length && length < text.Length && previous[length] == text[length]) length++;
         return length;
+    }
+    internal static bool OnlyDraftPunctuationChanged(string previous, string text) {
+        if (previous.Length == 0 || previous == text) return false;
+        int common = CommonPrefix(previous, text);
+        foreach (string tail in new[] { previous.Substring(common), text.Substring(common) })
+            foreach (char value in tail) if ("，。！？；：、!?".IndexOf(value) < 0) return false;
+        return true;
     }
     internal static string EarconPath(string name) {
         return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "SystemApps", "MicrosoftWindows.Client.CBS_cw5n1h2txyewy", "InputApp", "Assets", "Dictation", name + ".wav");
@@ -3858,6 +3917,7 @@ sealed class Microphone : Form
     }
     void Fail(string message) {
         if (closing) return;
+        ClearAppend();
         startOnReveal = false;
         capture.Stop(); limit.Stop();
         if (guard != null) { guard.Dispose(); guard = null; }
@@ -4035,6 +4095,7 @@ sealed class Microphone : Form
         await EndRecording();
     }
     async Task BeginStream() {
+        ClearAppend();
         draft = ""; speechDetected = transcribing = false;
         stalledWindows.Clear();
         recordingId = Guid.NewGuid().ToString("N"); delivery = new TextDelivery(); sentBytes = 0;
@@ -4067,10 +4128,29 @@ sealed class Microphone : Form
             if (!closing) ApplyReply(reply);
         }
     }
-    void ApplyText(string text, bool forceMemory = false) {
+    void ClearAppend() { appendPulse.Stop(); pacedDraft = null; }
+    void DrainAppend(bool all) {
+        if (delivery == null || delivery.Cancelled || closing) { ClearAppend(); return; }
+        SendPendingText(all ? int.MaxValue : appendChunk);
+        if (delivery.Pending.Length == 0) ClearAppend();
+    }
+    internal static int AppendChunkLength(string text, int limit) {
+        int length = Math.Min(text.Length, limit);
+        // Keep an English token or number together, including decimal points and symbols.
+        while (length < text.Length && length > 0 && text[length - 1] > ' ' && text[length - 1] < 127 && text[length] > ' ' && text[length] < 127) length++;
+        return length;
+    }
+    void ApplyText(string text, bool forceMemory = false, int chunk = int.MaxValue) {
         if (delivery == null || closing) return;
-        string suffix = delivery.Accept(text);
+        if (pacedDraft != null) DrainAppend(true);
+        delivery.Accept(text);
         if (forceMemory || delivery.Paused.Length != 0) { KeepRecovery(delivery.TakePending()); return; }
+        SendPendingText(chunk);
+    }
+    void SendPendingText(int chunk) {
+        if (delivery.Paused.Length != 0) { ClearAppend(); KeepRecovery(delivery.TakePending()); return; }
+        string suffix = delivery.Pending;
+        suffix = suffix.Substring(0, AppendChunkLength(suffix, chunk));
         if (suffix.Length == 0 || closing) return;
         if (Native.GetForegroundWindow() != target || targetFocus == IntPtr.Zero || Native.Focus(target) != targetFocus || EditingGestureDown()) {
             Pause("输入位置已变化，继续录音并保存未上屏文字。");
@@ -4117,6 +4197,7 @@ sealed class Microphone : Form
     }
     async Task EndRecording(bool silent = false) {
         if (closing || state != "recording") return;
+        DrainAppend(true);
         limit.Stop(); capture.Stop(); Status("busy", "正在补全尾字…");
         try {
             byte[] tail;
@@ -4131,6 +4212,7 @@ sealed class Microphone : Form
             await pipeline.WaitAsync(); acquired = true;
             if (closing || delivery == null || state == "error") return;
             if (delivery.Cancelled) {
+                ClearAppend();
                 await Exchange(new { op = "cancel", id = recordingId });
                 return;
             }
@@ -4144,6 +4226,7 @@ sealed class Microphone : Form
             if (acquired) pipeline.Release();
             if (guard != null) { guard.Dispose(); guard = null; }
             if (!closing) {
+                DrainAppend(true);
                 if (state != "error") Status("idle", recovery.Length > 0 ? "有未上屏文字 · 点击复制 · 长按开始下一段录音" : "点击说话 · 拖动移动 · 右键退出");
                 delivery = null;
             }
@@ -4389,6 +4472,70 @@ sealed class Microphone : Form
             delivery = null; Status("idle", "输入框恢复测试通过");
         }
     }
+    static async Task AwaitTestText(TextBox box, string expected) {
+        var clock = Stopwatch.StartNew();
+        while (box.Text != expected && clock.ElapsedMilliseconds < 1000) await Task.Delay(10);
+    }
+    async Task CheckPacedAppend(TextBox box) {
+        if (!animationsEnabled) return;
+        var segment = new Dictionary<string, object> { { "route", 0 }, { "start", 0 }, { "text", "开头" } };
+        Action<string, bool> update = (text, final) => { segment["text"] = text; ApplySegment(segment, final); };
+        Action reset = () => { ClearAppend(); delivery = new TextDelivery(); recovery = ""; backupRoutes.Clear(); audioRoute = 0; box.Text = "原文："; box.SelectionStart = box.TextLength; update("开头", false); };
+        string longText = "开头甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉";
+        reset();
+        if (delivery.Delivered != "开头" || pacedDraft != null) throw new Exception("First draft must stay immediate");
+        update("开头短句", false);
+        if (delivery.Delivered != "开头短句" || pacedDraft != null) throw new Exception("Short append must stay immediate");
+        await AwaitTestText(box, "原文：开头短句");
+        reset(); update("开头。", false); update("开头！", false);
+        if (delivery.Delivered != "开头") throw new Exception("Punctuation-only drafts must not churn the visible text");
+        update("开头！", true); await AwaitTestText(box, "原文：开头！");
+        if (box.Text != "原文：开头！") throw new Exception("Final punctuation must still arrive immediately");
+        reset(); update(longText, false); appendPulse.Stop();
+        string visible = delivery.Delivered, waiting = delivery.Pending;
+        double deadline = appendDeadline;
+        if (visible.Length <= 2 || waiting.Length == 0 || visible + waiting != longText) throw new Exception("Long append must send its first chunk immediately");
+        update(longText, false);
+        if (delivery.Pending != waiting || appendDeadline != deadline) throw new Exception("Duplicate drafts must not restart pacing");
+        await AwaitTestText(box, "原文：" + visible);
+        if (box.Text != "原文：" + visible) throw new Exception("Deferred suffix was sent before its pulse");
+        update(visible + "正确尾字", false);
+        await AwaitTestText(box, "原文：" + visible + "正确尾字");
+        if (box.Text != "原文：" + visible + "正确尾字" || delivery.Pending.Length != 0 || pacedDraft != null) throw new Exception("New draft must replace the unseen suffix without stale text");
+        reset(); update(longText, false); appendPulse.Stop(); update("开头金额1.5元，没有到账。", true);
+        await AwaitTestText(box, "原文：开头金额1.5元，没有到账。");
+        if (box.Text != "原文：开头金额1.5元，没有到账。" || pacedDraft != null) throw new Exception("Final number and negation revision must flush atomically");
+        reset(); update(longText, false); appendPulse.Stop(); DrainAppend(true);
+        await AwaitTestText(box, "原文：" + longText);
+        if (box.Text != "原文：" + longText || delivery.Pending.Length != 0) throw new Exception("Stop must drain without waiting for another pulse");
+        reset(); update(longText, false); appendPulse.Stop();
+        ApplySegment(new Dictionary<string, object> { { "route", 0 }, { "start", 1600 }, { "text", "下一段" } }, false);
+        await AwaitTestText(box, "原文：" + longText + "下一段");
+        if (box.Text != "原文：" + longText + "下一段" || pacedDraft != null) throw new Exception("A new segment must follow the complete previous append");
+        reset(); update(longText, false); appendPulse.Stop(); visible = delivery.Delivered; waiting = delivery.Pending;
+        Pause("Test manual edit", true);
+        DrainAppend(false);
+        await AwaitTestText(box, "原文：" + visible);
+        if (box.Text != "原文：" + visible || recovery != waiting || pacedDraft != null) throw new Exception("Manual edit must cache the unseen suffix exactly once");
+        reset(); update(longText, false); appendPulse.Stop(); visible = delivery.Delivered; waiting = delivery.Pending;
+        IntPtr savedFocus = targetFocus; targetFocus = IntPtr.Zero;
+        try { DrainAppend(false); } finally { targetFocus = savedFocus; }
+        await AwaitTestText(box, "原文：" + visible);
+        if (box.Text != "原文：" + visible || recovery != waiting || pacedDraft != null) throw new Exception("Lost focus must stop paced delivery and retain the suffix");
+        reset(); update(longText, false);
+        var elapsed = Stopwatch.StartNew();
+        while (pacedDraft != null && elapsed.ElapsedMilliseconds < 1000) await Task.Delay(10);
+        await AwaitTestText(box, "原文：" + longText);
+        if (box.Text != "原文：" + longText || delivery.Pending.Length != 0 || pacedDraft != null) throw new Exception("Timer must finish paced delivery without duplication");
+        long pacedMs = elapsed.ElapsedMilliseconds;
+        reset(); update(longText, false); appendPulse.Stop(); delivery.Cancelled = true; visible = delivery.Delivered; DrainAppend(true);
+        await AwaitTestText(box, "原文：" + visible);
+        if (box.Text != "原文：" + visible || pacedDraft != null) throw new Exception("Cancelled delivery must not type the queued tail");
+        ClearAppend(); delivery = new TextDelivery(); recovery = "";
+        string report = "PACING-TEST PASS: immediate first and short drafts / punctuation-only draft coalescing / chunked append / duplicate deadline / unseen-tail replacement / atomic correction / stop flush / edit and focus cache / timer drain / cancellation; drain=" + pacedMs + "ms";
+        File.WriteAllText(Path.Combine(root, "work", "microphone-pacing-test.txt"), report);
+        Console.WriteLine(report);
+    }
     async Task RunStreamTest() {
         using (var form = new Form { Text = "VoxFix Desktop test target", Width = 500, Height = 200, TopMost = true })
         using (var box = new TextBox { Multiline = true, Dock = DockStyle.Fill, Text = "原文：" }) {
@@ -4430,19 +4577,21 @@ sealed class Microphone : Form
             await BeginStream(); Status("busy", "流式输入测试");
             guard = new InteractionGuard(OwnsSurface, reason => Pause("Test user input: " + reason));
             var draftSegment = new Dictionary<string, object> { { "route", 0 }, { "start", 0 }, { "text", "金额15元" } };
-            ApplySegment(draftSegment, false); await Task.Delay(50);
+            ApplySegment(draftSegment, false); await AwaitTestText(box, "原文：金额15元");
             if (box.Text != "原文：金额15元") throw new Exception("Draft did not reach target immediately: " + delivery.Paused);
             draftSegment["text"] = "金额1.5元，没有到账";
-            ApplySegment(draftSegment, false); await Task.Delay(50);
+            ApplySegment(draftSegment, false); await AwaitTestText(box, "原文：金额1.5元，没有到账");
             if (box.Text != "原文：金额1.5元，没有到账") throw new Exception("Draft revision damaged original text or amount: " + box.Text);
             draftSegment["text"] = "金额1.5元";
-            ApplySegment(draftSegment, false); await Task.Delay(50);
+            ApplySegment(draftSegment, false); await AwaitTestText(box, "原文：金额1.5元");
             if (box.Text != "原文：金额1.5元") throw new Exception("Shorter draft was not revised: " + box.Text);
             draftSegment["text"] = "金额1.5元。";
-            ApplySegment(draftSegment, true); await Task.Delay(50);
+            ApplySegment(draftSegment, true); await AwaitTestText(box, "原文：金额1.5元。");
             if (box.Text != "原文：金额1.5元。") throw new Exception("Final punctuation did not revise draft");
-            // Reset only the dedicated test target before the real-model portion.
             guard.Dispose(); guard = null;
+            await CheckPacedAppend(box);
+            // Reset only the dedicated test target before the real-model portion.
+            if (guard != null) { guard.Dispose(); guard = null; }
             await Exchange(new { op = "cancel", id = recordingId });
             box.Text = "原文："; box.SelectionStart = box.TextLength;
             await BeginStream();
@@ -4952,6 +5101,23 @@ sealed class Microphone : Form
     [STAThread] static void Main(string[] args) {
         Native.SetProcessDPIAware();
         string root = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+        if (args.Length > 0 && args[0] == "--stop-hotkey-host") {
+            IntPtr host = Native.FindWindow(null, HotkeyHost.WindowTitle);
+            if (host != IntPtr.Zero) Native.PostMessage(host, 0x10, IntPtr.Zero, IntPtr.Zero);
+            return;
+        }
+        if (args.Length > 0 && (args[0] == "--hotkey-host" || args[0] == "--hotkey-host-test")) {
+            Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
+            if (args[0] == "--hotkey-host-test") {
+                try { HotkeyHost.Check(root); }
+                catch (Exception error) { File.WriteAllText(Path.Combine(root, "work", "hotkey-host-test.txt"), "FAIL: " + error); Environment.ExitCode = 1; }
+                return;
+            }
+            bool hostCreated;
+            using (var hostMutex = new Mutex(true, "Local\\VoxFix Desktop hotkey host-" + Native.DesktopName(), out hostCreated))
+                if (hostCreated) using (var host = new HotkeyHost(root)) Application.Run(host);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--dictionary-capture-test") {
             Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
             Directory.CreateDirectory(Path.Combine(root, "work"));
@@ -5908,6 +6074,14 @@ sealed class Microphone : Form
                     bitmap.Save(Path.Combine(frames, i.ToString("D3") + ".png"));
                 }
             }
+            if (!OnlyDraftPunctuationChanged("你好。", "你好！") || !OnlyDraftPunctuationChanged("你好", "你好，") ||
+                OnlyDraftPunctuationChanged("金额15元", "金额1.5元") || OnlyDraftPunctuationChanged("已经到账", "没有到账") ||
+                OnlyDraftPunctuationChanged(".NET", "NET") || OnlyDraftPunctuationChanged("你好", "你好") ||
+                OnlyDraftPunctuationChanged("", "。")) throw new Exception("Draft punctuation coalescing must not delay word, number or symbol corrections");
+            if (AppendChunkLength("甲乙丙丁戊己", 3) != 3 || AppendChunkLength("GitHub API", 3) != 6 ||
+                AppendChunkLength("1.5元", 1) != 3 || AppendChunkLength(".NET后续", 2) != 4 ||
+                AppendChunkLength("", 4) != 0 || AppendChunkLength("短句", int.MaxValue) != 2)
+                throw new Exception("Paced append must preserve complete English tokens and numbers");
             if (delivery.Accept("hello ") != "hello ") throw new Exception("Initial text");
             delivery.Sent("hello ");
             if (delivery.Accept("hello world") != "world") throw new Exception("English boundary");
@@ -5935,6 +6109,7 @@ sealed class Microphone : Form
         // Desktops share the Local namespace; an invisible sandbox instance must not block the user's desktop.
         using (var mutex = new Mutex(true, "Local\\VoxFix Desktop-" + Native.DesktopName() + (testing ? "-test-" + Guid.NewGuid().ToString("N") : ""), out created)) {
             if (!created) {
+                if (args.Length > 0 && args[0] == "--background") return;
                 IntPtr existing = Native.FindWindow(null, "VoxFix Desktop");
                 if (existing != IntPtr.Zero) Native.PostMessage(existing, Native.ShowMicrophone, IntPtr.Zero, IntPtr.Zero);
                 return;

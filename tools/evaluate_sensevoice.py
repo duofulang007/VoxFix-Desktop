@@ -71,9 +71,9 @@ def main():
             full = session.run(np.frombuffer(pcm, dtype='<i2').astype(np.float32) / 32768).text
             engine = Recognition(session)
             identity = str(index) + '-' + run_id
-            engine.handle({'op': 'start', 'id': identity})
             began = time.perf_counter()
             try:
+                engine.handle({'op': 'start', 'id': identity})
                 for offset in range(0, len(pcm), 3200):
                     engine.handle({'op': 'audio', 'id': identity, 'pcm': base64.b64encode(pcm[offset:offset + 3200]).decode()})
                 text = engine.handle({'op': 'stop', 'id': identity})['text']
@@ -81,7 +81,10 @@ def main():
             except Exception as exc:
                 text, error = '', str(exc)
             finally:
-                engine.clear()
+                try:
+                    engine.clear()
+                finally:
+                    engine.rescue.release()
             expected, actual = units(row['expected']), units(text)
             rows.append({'id': row['id'], 'category': row['category'], 'expected': row['expected'],
                          'text': text, 'fullClip': full, 'exact': exact(row['expected'], text),

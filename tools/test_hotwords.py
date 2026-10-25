@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -145,6 +146,32 @@ class RescueTests(unittest.TestCase):
         hotwords.Decoder = lambda: FakeDecoder('请把代码提交到github')
         self.assertEqual(rescue.rescore(self.audio, '请把代码提交到gitthub', ['GitHub']),
                          '请把代码提交到github')
+
+    def test_explicit_release_cancels_the_idle_timer(self):
+        fake = FakeDecoder('请把代码提交到github')
+        hotwords.Decoder = lambda: fake
+        rescue = HotwordRescue()
+        rescue.rescore(self.audio, '请把代码提交到gitthub', ['GitHub'])
+        timer = rescue.timer
+        try:
+            rescue.release()
+            timer.join(1)
+            self.assertFalse(timer.is_alive(), 'discarded evaluation clips must not retain a 180-second timer')
+            self.assertIsNone(rescue.timer)
+            self.assertTrue(fake.closed)
+        finally:
+            timer.cancel()
+
+    def test_decode_failure_closes_a_created_session(self):
+        fake = FakeDecoder('unused')
+        hotwords.Decoder = lambda: fake
+        rescue = HotwordRescue()
+        with patch.object(fake, 'greedy', side_effect=RuntimeError('inference failure')):
+            text = '请把代码提交到gitthub'
+            self.assertEqual(rescue.rescore(self.audio, text, ['GitHub']), text)
+        self.assertTrue(fake.closed)
+        self.assertIsNone(rescue.decoder)
+        self.assertIsNone(rescue.timer)
 
 
 class WiringTests(unittest.TestCase):

@@ -258,6 +258,13 @@ class Reviews:
         self.save(run, expected)
         return run
 
+    def verify_cases(self, run):
+        if not run['cases'] or any(case['status'] != 'evaluated' or case.get('candidateSha256') != run['candidate']['modelSha256'] or case.get('baselineSha256') != run['baseline']['modelSha256'] or not case.get('candidateText', '').strip() for case in run['cases']):
+            raise ValueError('需先完成新录音的原模型/候选模型识别对照')
+        for case in run['cases']:
+            if sha(child(self.path(run['id']).parent, case['audio'])) != case['sha256']:
+                raise ValueError('复测原音已变化，请撤回结论并重新核对')
+
     def decide(self, identity, decision, note):
         run, expected = self.load(identity)
         if run['status'] != 'awaiting_retest' or decision not in ('passed', 'rejected'):
@@ -267,11 +274,7 @@ class Reviews:
         if decision == 'passed':
             self.verify_models(run)
             self.verify_sources(run)
-            if not run['cases'] or any(case['status'] != 'evaluated' or case.get('candidateSha256') != run['candidate']['modelSha256'] or case.get('baselineSha256') != run['baseline']['modelSha256'] or not case.get('candidateText', '').strip() for case in run['cases']):
-                raise ValueError('需先完成新录音的原模型/候选模型识别对照')
-            for case in run['cases']:
-                if sha(child(self.path(identity).parent, case['audio'])) != case['sha256']:
-                    raise ValueError('复测原音已变化，不能通过')
+            self.verify_cases(run)
         run['status'] = decision
         run['decision'] = {'status': decision, 'note': note.strip(), 'createdUtc': now(),
                            'caseIds': [case['id'] for case in run['cases']], 'scope': 'personal_fresh_audio_only'}
@@ -297,6 +300,7 @@ class Reviews:
         if run['status'] != 'passed':
             raise ValueError('必须先人工验收通过')
         self.verify_sources(run)
+        self.verify_cases(run)
         report = Path(report).resolve()
         if not report.is_file() or not report.stat().st_size:
             raise ValueError('需要agent的正式启用与回滚验证报告')

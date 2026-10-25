@@ -3,8 +3,9 @@ import tempfile
 import json
 import io
 from pathlib import Path
+from types import SimpleNamespace
 import wave
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -70,4 +71,39 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent / 'w
         else:
             raise AssertionError('Changed audio must be rejected before inference')
     assert not output.exists(), 'A failed audio check cannot produce a completed report'
-print('PASS: weighted scoring / silence / audio provenance / quiet / seeded SNR / WAV roundtrip')
+
+    for failure in (None, 'start', 'decode', 'clear'):
+        output = Path(temporary) / ('cleanup-' + str(failure) + '.json')
+        manifest.write_text(json.dumps([{'id': 'cleanup', 'category': 'test',
+            'expected': 'hello', 'wav': str(path)}]), encoding='utf-8')
+        events = []
+
+        def handle(request):
+            if request['op'] == 'start' and failure == 'start':
+                raise RuntimeError('synthetic start error')
+            if request['op'] == 'stop' and failure == 'decode':
+                raise RuntimeError('synthetic decode error')
+            return {'text': 'hello'}
+
+        def clear():
+            events.append('clear')
+            if failure == 'clear':
+                raise RuntimeError('synthetic clear error')
+
+        engine = SimpleNamespace(handle=handle, clear=clear,
+            rescue=SimpleNamespace(release=Mock(side_effect=lambda: events.append('release'))))
+        session = SimpleNamespace(run=lambda audio: SimpleNamespace(text='hello'))
+        with patch('sys.argv', ['evaluate_sensevoice.py', '--manifest', str(manifest), '--output', str(output)]), \
+             patch('evaluate_sensevoice.load_model', return_value=(session, 'test')), \
+             patch('evaluate_sensevoice.Recognition', return_value=engine), \
+             patch('evaluate_sensevoice.sha256', return_value='test'), \
+             patch('sys.stdout', new_callable=io.StringIO):
+            try:
+                main()
+            except (AssertionError, RuntimeError):
+                assert failure is not None
+            else:
+                assert failure is None
+        engine.rescue.release.assert_called_once()
+        assert events == ['clear', 'release'], 'release must follow cleanup even when decoding or cleanup fails'
+print('PASS: weighted scoring / silence / audio provenance / quiet / seeded SNR / WAV roundtrip / rescue cleanup on success, start, decode and cleanup errors')

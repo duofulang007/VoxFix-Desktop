@@ -1,17 +1,18 @@
 # VoxFix Desktop
 
-Windows x64 本地语音输入，替代 Win+H。当前版本 **1.6.67.0**。
+Windows x64 本地语音输入，替代 Win+H。当前版本 **1.6.71.0**。
 使用 SenseVoiceSmall INT8 + Silero VAD + CT-Transformer，CPU 本地推理；识别与送字不联网。
 
 词典支持文字纠正、搜索、未保存内容预览，以及集中审核录音与完整文本标签。
 录音样本只在本机收集，**不会自动训练或立即改变识别效果**；操作见[使用说明](docs/使用说明.md)。
 
 当前生产模型为 R5 INT8。本机权重哈希与[R5 启用记录](docs/R5模型启用-2026-10-23.md)一致。
+1.6.71.0 修复放弃编辑后残留改字和训练勾选、验证刷新清空备注，以及归档期间重复操作；见[交互修复记录](docs/交互状态保护修复-2026-10-25.md)。
 6257 条 CS-Dialogue 真人封存比较采用 PyTorch 检查点口径，中文、英文和混说均优于 R4；
 生产 INT8 已过固定音频、启动与送字自检，完整 INT8 独立集和日常麦克风验收仍未完成。
 旧 174 条仅作辅助回归；历次变更与证据见[技术记录索引](docs/README.md)。
 
-词典只保留「词语 / 听写记录」两处入口，重复的「录音纠音」页已移除，主动采样在听写记录上方「补录一句」，无需先建词条。
+词典分为「词语 / 听写记录」，主动采样入口为听写记录的「补录一句」，无需先建词条。
 
 「听写记录」分为 **录音 / 训练 / 验证**。录音单击选中，双击、Enter或「打开录音」进入纠错，直接勾选「留作训练」并保存；训练页在「待归档」填写批次名并二次勾选归档，「已归档」查看快照，已有批次可随时查看。训练交给 agent；完成后在验证页录新音，对照原模型和候选，选择通过或打回。通过后仍由 agent 校验、正式启用和准备回滚。见[使用说明书](docs/录音纠错使用说明书.html)和[交接协议](docs/训练交接与验证协议.md)。
 
@@ -27,8 +28,9 @@ Windows x64 本地语音输入，替代 Win+H。当前版本 **1.6.67.0**。
 - 无输入框或只读目标时继续识别，文字暂存内存；胶囊右侧点击复制。转写完成前不能复制。
 - 未上屏缓存只能点胶囊右侧“复制/已复制”取走，可重复复制；**Ctrl+C 不再被接管**，任何状态下都交给当前应用。
 - 成功开始新轮才清空旧缓存；停止、收起和启动失败保留缓存，退出清空。错误态左侧重试，右侧复制。
-- 拖动可移动并记住位置；右键菜单为“收起 / 词典 / 退出”。点窗口外任意位置、选任一项、按 Esc 或退出都会关闭菜单，不会一直悬在桌面上。退出后恢复系统 Win+H。
+- 拖动可移动并记住位置；右键菜单为“收起 / 词典 / 退出”。点窗口外任意位置、选任一项、按 Esc 或退出都会关闭菜单，不会一直悬在桌面上。启用开机入口后，“退出”关闭主程序与模型，轻量入口继续接管 Win+H，下次按键重新启动 VoxFix；撤销入口并退出主程序才恢复系统 Win+H。
 - 识别草稿一有文字就尝试送进当前输入框，不等停顿；继续说话时会修订当前这一段，停顿后补齐最终文字和标点。只修订本轮在原输入位置写入的当前段；手动编辑或切换焦点后停止修订，未送出结果留在缓存。
+- 首份草稿和短追加立即上屏；较长的纯追加文字短暂分批送出。草稿中仅句尾标点变化时暂缓回改，定稿完整补齐；数字、否定和词语纠错仍即时处理。停止录音立即收齐，编辑或换焦点后未送文字留在缓存。见[出字节奏验证](docs/草稿回改与短分批送字-2026-10-25.md)。
 - 已完成段落不再回改，当前草稿可修订；标点只允许添加，删除或替换已有标点时保留识别原文。识别结果本身已带标点，标点模型不会再叠一个（不再出现 `。。`、`，，`）。每轮最长三分钟。
 - **个人词典**：根目录 `dictionary.json` 是你指定的“错法 → 正确词”，当前词表统一在独念、纯英文和混说时生效，包括 `get up → GitHub`、`Jason → JSON`、`soul → sol`。这些是个人纠正偏好，即使原写法是正常英文也会替换；保存即生效，文件损坏时自动停用不影响识别。
 - **热词偏置**：同一文件的 `hotwords` 列表写词语（按文件顺序取前 64 个，窗口会提示超额），定稿里出现读音接近的片段时复解该段，
@@ -38,7 +40,6 @@ Electron、Flutter 等应用优先读取实际焦点；旧接口只读判定会�
 交互、材质与状态的完整说明见[使用说明](docs/使用说明.md)。
 
 词典区分拆字缩写：`A P P → APP`、`A P I → API`；单独 `A P` 保留原文，避免猜测缺失的字母。
-词典内容修订 **2026.10.24.1**：统一个人规则的适用语言，新增三种完整写法；该次仅改词表，无需重建或重启。验证与已知取舍见[个人词典统一规则](docs/个人词典统一规则-2026-10-24.md)。
 
 ## 本地运行
 
@@ -59,14 +60,15 @@ py -3.13 -m venv .venv
 | CT-Transformer INT8 | `models/punctuation/model.int8.onnx`，[来源](models/punctuation/UPSTREAM.md) |
 
 ```powershell
-# 重建前先退出正在运行的 VoxFix，避免 EXE 被占用。
+# 重建前先退出 VoxFix 主程序和快捷键入口，避免 EXE 被占用。
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
-Start-Process '.\bin\VoxFix Desktop.exe'
-# 可选：当前用户登录后隐藏待命；加 -Remove 撤销。
+Start-Process '.\bin\VoxFix Desktop.exe' -ArgumentList '--hotkey-host' -WindowStyle Hidden
+# 当前用户登录后由轻量 Win+H 入口预热主程序，不录音；加 -Remove 撤销。
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\install-shortcuts.ps1
 ```
 
 构建使用系统自带 C# 编译器，无需 .NET SDK 或 NuGet；同时生成项目根目录快捷方式。
+1.6.69.0 的登录入口使用 `--hotkey-host`，主程序缺席时仍接住 Win+H 并重新启动；直接 `--background` 只启动主程序。重复后台启动不呼出或开始录音。没有卸载或永久禁用 Windows 语音组件；若入口与主程序都被结束，系统快捷键仍会恢复。见[启动与接管验证](docs/WinH后台接管与准确率复核-2026-10-25.md)。
 `ExecutionPolicy Bypass` 仅作用于本次进程。模型权重、运行环境和个人实验数据不入库；
 当前资产校验值见 [assets.json](work/sensevoice-20261021/assets.json)。
 
@@ -76,6 +78,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\install-shortcuts.ps
 .\.venv\Scripts\python.exe tools/test_sensevoice.py
 .\.venv\Scripts\python.exe tools/test_language_guard.py
 .\.venv\Scripts\python.exe tools/test_dictionary.py
+.\.venv\Scripts\python.exe tools/test_dictation_history.py
+.\.venv\Scripts\python.exe tools/test_training_review.py
 .\.venv\Scripts\python.exe tools/test_hotwords.py
 .\.venv\Scripts\python.exe tools/test_asr_scoring.py
 .\.venv\Scripts\python.exe tools/test_evaluation.py
@@ -100,5 +104,3 @@ Start-Process '.\bin\VoxFix Desktop.exe' -ArgumentList '--self-test' -Wait -Pass
 
 旧 Nemotron/Qwen 实验脚本已从工作树移除，恢复方式见工具索引。历史技术记录保留，历史结论不代表当前行为。
 中英混说、英文术语和粤语仍可能识别错误；真人口音、距离、噪声及跨软件长期输入仍需实际验收。
-
-本次提交前检查补齐候选验证的来源原音校验，详情见[提交前检查与整理](docs/提交前检查与整理-2026-10-25.md)。历次界面变化统一查阅[技术记录索引](docs/README.md)。

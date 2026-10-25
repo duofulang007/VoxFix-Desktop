@@ -169,6 +169,31 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(run['status'], 'awaiting_retest')
         self.assertIsNone(run['decision'])
 
+    def test_changed_acceptance_audio_blocks_deployment(self):
+        run = self.add()
+        self.evaluate()
+        self.store.decide(self.run['id'], 'passed', '')
+        (self.root / 'models/sensevoice/model.int8.onnx').write_bytes(self.model.read_bytes())
+        path = self.store.path(self.run['id'])
+        before = path.read_bytes()
+        wav(path.parent / run['cases'][0]['audio'], 5000)
+        with self.assertRaisesRegex(ValueError, '复测原音已变化'):
+            self.store.deployed(self.run['id'], self.report)
+        self.assertEqual(path.read_bytes(), before, 'failed bookkeeping must preserve the approval record')
+
+    def test_incomplete_acceptance_blocks_deployment(self):
+        self.add()
+        self.evaluate()
+        self.store.decide(self.run['id'], 'passed', '')
+        (self.root / 'models/sensevoice/model.int8.onnx').write_bytes(self.model.read_bytes())
+        run, expected = self.store.load(self.run['id'])
+        run['cases'][0]['status'] = 'pending'
+        self.store.save(run, expected)
+        before = self.store.path(run['id']).read_bytes()
+        with self.assertRaisesRegex(ValueError, '完成新录音'):
+            self.store.deployed(run['id'], self.report)
+        self.assertEqual(self.store.path(run['id']).read_bytes(), before)
+
     def test_withdrawn_archive_blocks_new_training_and_acceptance(self):
         self.add()
         self.evaluate()
