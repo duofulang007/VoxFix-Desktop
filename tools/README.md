@@ -1,6 +1,6 @@
 # 工具索引
 
-版本 1.6.47.0；日期 2026-10-24。生产模型为 R5 INT8；6257 条真人封存比较采用 PyTorch 口径，旧 174 条仅作辅助回归；生产 INT8 固定音频与原生送字自检通过。生产识别与词典预览入口位于 `app/`，以下均为维护工具。
+版本 1.6.67.0；日期 2026-10-25。生产模型为 R5 INT8；6257 条真人封存比较采用 PyTorch 口径，旧 174 条仅作辅助回归；生产 INT8 固定音频与原生送字自检通过。生产识别与词典预览入口位于 `app/`，以下均为维护工具。
 Python 脚本使用项目 `.venv/Scripts/python.exe`，原生测试参数与结果文件见 [AGENTS.md](../AGENTS.md)。
 
 ## 现行测试
@@ -10,6 +10,8 @@ Python 脚本使用项目 `.venv/Scripts/python.exe`，原生测试参数与结�
 | `test_sensevoice.py` | 无模型的协议、分段、草稿、尾音和标点契约 |
 | `test_language_guard.py` | 外文结果拒绝与先前定稿保留 |
 | `test_dictionary.py` | 共享词典规则、个人词表全部变体在独念/英文/中文中纠正、个人英文覆盖与词边界、APP/API 区分、预览子进程、最长错法与 64 词边界；不加载模型 |
+| `test_dictation_history.py` | 默认关闭、留档原音及原识别、人工选择默认值、容量和坏设置、生产接线、磁盘失败不影响识别；无模型/麦克风 |
+| `test_training_review.py` | 21项候选来源、批次清单/原音/模型/报告变化、独立新音、失败保留、通过/打回及实际启用哈希门禁、按所选复测重试；无模型/麦克风 |
 | `test_hotwords.py` | 近音触发、接受守卫、失败回退、会话释放与管线接线，无需模型 |
 | `test_asr_scoring.py` | 共享评分函数的边界回归 |
 | `test_microphone.py` | 真实模型、固定音频与 175 秒连续会话，不访问麦克风 |
@@ -55,3 +57,7 @@ git show 5209268:tools/pseudo_batch.py
 需要复现时，在独立实验目录恢复当时的完整调用链与生产源码；仅找回单个脚本不保证接口兼容。
 旧视频探针的 ffmpeg、旧上下文探针的 tokenizer 依赖已清理，必须另行准备。
 模型、语料、原始评测结果与历史技术记录保留；本机训练 `outputs/` 和私有 `user-data/` 均由忽略规则排除。
+
+agent 交接服务：`app/training_review.py` 的 register/list/evaluate/deployed 命令见[交接协议](../docs/训练交接与验证协议.md)。它不启动训练或替换生产模型；原生离屏测试还覆盖 REVIEW-TEST 和验证页截图。
+
+状态往返：原生HISTORY-TEST覆盖归档撤回/恢复；test_training_review.py覆盖通过/打回reopen、来源撤回暂停和历史保留。所有撤回测试用隔离夹具，不触碰真实个人批次。

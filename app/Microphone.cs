@@ -15,7 +15,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.47.0")]
+[assembly: AssemblyVersion("1.6.67.0")]
 
 static class Native
 {
@@ -117,6 +117,41 @@ static class Native
             inputs[i * 2 + 1] = new Input { type = 1, data = new Payload { keyboard = new Keyboard { scan = text[i], flags = 6, extra = InputTag } } };
         }
         return inputs;
+    }
+    [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", SetLastError = true)]
+    static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr first, IntPtr second, uint flags, uint timeout, out UIntPtr result);
+    internal static bool CharacterMessageTarget(string windowClass, string processName) {
+        return windowClass.StartsWith("Qt", StringComparison.Ordinal) &&
+            (string.Equals(processName, "Weixin", StringComparison.OrdinalIgnoreCase) || string.Equals(processName, "WeChat", StringComparison.OrdinalIgnoreCase));
+    }
+    internal static uint SendToTarget(IntPtr window, IntPtr focus, Input[] inputs, Func<bool> permitted = null) {
+        bool direct = false;
+        string windowClass = ClassOf(window);
+        if (windowClass.StartsWith("Qt", StringComparison.Ordinal)) try {
+            uint pid; WindowProcessId(window, out pid);
+            using (var process = Process.GetProcessById((int)pid)) direct = CharacterMessageTarget(windowClass, process.ProcessName);
+        } catch (ArgumentException) { } catch (InvalidOperationException) { } catch (System.ComponentModel.Win32Exception) { }
+        return direct ? SendCharacterMessages(window, focus, inputs, permitted) : SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input)));
+    }
+    [DllImport("user32.dll", EntryPoint = "GetWindowThreadProcessId")] static extern uint WindowProcessId(IntPtr window, out uint process);
+    // WeChat corrupts VK_PACKET after full-width punctuation; retain paired-input accounting.
+    internal static uint SendCharacterMessages(IntPtr window, IntPtr focus, Input[] inputs, Func<bool> permitted = null) {
+        uint completed = 0;
+        for (int i = 0; i + 1 < inputs.Length; i += 2) {
+            if (GetForegroundWindow() != window || focus == IntPtr.Zero || Focus(window) != focus || (permitted != null && !permitted())) break;
+            var down = inputs[i].data.keyboard; UIntPtr result;
+            if (down.flags == 4 && down.vk == 0) {
+                if (down.scan == '\r' || down.scan == '\n') break; // Never turn dictated text into WeChat's send action.
+                if (SendMessageTimeout(focus, 0x102, new IntPtr(down.scan), new IntPtr(1), 3, 80, out result) == IntPtr.Zero) break;
+                completed += 2;
+            } else if (down.vk == 8 && down.flags == 0) {
+                if (SendMessageTimeout(focus, 0x100, new IntPtr(8), new IntPtr(1), 3, 80, out result) == IntPtr.Zero) break;
+                completed++;
+                if (SendMessageTimeout(focus, 0x101, new IntPtr(8), new IntPtr(unchecked((int)0xC0000001)), 3, 80, out result) == IntPtr.Zero) break;
+                completed++;
+            } else break;
+        }
+        return completed;
     }
 }
 
@@ -613,23 +648,166 @@ sealed class DictionaryTextBox : TextBox
     }
 }
 
+sealed class HistoryMenu : ContextMenuStrip
+{
+    internal HistoryMenu() { Renderer = new MicrophoneMenuRenderer(); ShowImageMargin = false; Font = new Font("Microsoft YaHei UI", 11f); Padding = new Padding(4); }
+    internal void Fit() { FitItems(this); }
+    static void FitItems(ToolStripDropDown menu) {
+        int width = 120; foreach (ToolStripItem item in menu.Items) if (!(item is ToolStripSeparator)) width = Math.Max(width, TextRenderer.MeasureText(item.Text, menu.Font).Width + 64);
+        foreach (ToolStripItem item in menu.Items) {
+            item.AutoSize = false; item.Size = new Size(width, item is ToolStripSeparator ? 9 : menu.Font.Height + 16);
+            var child = item as ToolStripMenuItem;
+            if (child != null && child.HasDropDownItems) { child.DropDown.Font = menu.Font; child.DropDown.Renderer = menu.Renderer; var dropdown = child.DropDown as ToolStripDropDownMenu; if (dropdown != null) dropdown.ShowImageMargin = false; FitItems(child.DropDown); }
+        }
+    }
+    protected override void OnOpening(System.ComponentModel.CancelEventArgs e) { Fit(); base.OnOpening(e); }
+}
+
+static class HistoryCard
+{
+    internal const string TextFamily = "Microsoft YaHei UI";
+    internal static readonly Color Canvas = Color.FromArgb(251, 250, 248), Paper = Color.FromArgb(255, 254, 252);
+    internal static readonly Color SelectedPaper = Color.FromArgb(237, 244, 250), MarkInk = Color.FromArgb(49, 92, 129);
+    internal static readonly Color NumberInk = Color.FromArgb(232, 230, 225), SelectedNumberInk = Color.FromArgb(223, 231, 239);
+    internal static Rectangle Bounds(Rectangle row) { return new Rectangle(row.X + 2, row.Y + 3, row.Width - 5, row.Height - 8); }
+    internal static void Draw(Graphics graphics, Rectangle row, int number, Font font, bool current, bool marked, bool hover, bool pressed, bool focus) {
+        var saved = graphics.Save(); graphics.SmoothingMode = SmoothingMode.AntiAlias; graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+        using (var brush = new SolidBrush(Canvas)) graphics.FillRectangle(brush, row);
+        Rectangle bounds = Bounds(row);
+        using (var shape = MicrophoneMenuRenderer.Outline(bounds, 9)) {
+            using (var brush = new SolidBrush(pressed ? Color.FromArgb(225, 233, 240) : marked ? SelectedPaper : hover ? Color.FromArgb(248, 247, 244) : Paper)) graphics.FillPath(brush, shape);
+            using (var pen = new Pen(current ? Color.FromArgb(96, 100, 107) : marked ? MarkInk : hover ? Color.FromArgb(138, 137, 133) : Color.FromArgb(190, 187, 181), current || focus ? 1.5f : 1f)) graphics.DrawPath(pen, shape);
+            graphics.SetClip(shape, CombineMode.Intersect);
+            // Draw the decorative index first: full-width text is allowed over it.
+            using (var numberFont = new Font(font.FontFamily, Math.Min(44, bounds.Height * .66f), FontStyle.Bold, GraphicsUnit.Pixel))
+            using (var brush = new SolidBrush(marked || pressed ? SelectedNumberInk : NumberInk))
+            using (var format = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Far, FormatFlags = StringFormatFlags.NoWrap })
+                graphics.DrawString(number.ToString(), numberFont, brush, new Rectangle(bounds.X + 8, bounds.Y, bounds.Width - 16, bounds.Height + 2), format);
+            if (current) using (var brush = new SolidBrush(Color.FromArgb(96, 100, 107))) graphics.FillRectangle(brush, bounds.X + 1, bounds.Y + 10, 2, bounds.Height - 20);
+        }
+        graphics.Restore(saved);
+    }
+    internal static void Check(Graphics graphics, Rectangle box, bool value, bool hover, bool pressed, bool focus, bool enabled) {
+        var saved = graphics.Save(); graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        if (hover || focus) using (var halo = MicrophoneMenuRenderer.Outline(new Rectangle(box.X - 4, box.Y - 4, box.Width + 8, box.Height + 8), 7)) using (var brush = new SolidBrush(Color.FromArgb(222, 232, 241))) graphics.FillPath(brush, halo);
+        using (var shape = MicrophoneMenuRenderer.Outline(box, 4)) {
+            Color ink = enabled ? MarkInk : Color.FromArgb(151, 152, 153);
+            using (var brush = new SolidBrush(value ? (pressed ? Color.FromArgb(35, 70, 103) : ink) : pressed ? Color.FromArgb(222, 232, 241) : Paper)) graphics.FillPath(brush, shape);
+            using (var pen = new Pen(value || hover || focus ? ink : Color.FromArgb(123, 124, 124), focus ? 2f : 1.3f)) graphics.DrawPath(pen, shape);
+            if (value) using (var pen = new Pen(Color.White, 2f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round }) graphics.DrawLines(pen, new[] { new Point(box.X + 4, box.Y + 9), new Point(box.X + 8, box.Y + 13), new Point(box.X + 14, box.Y + 5) });
+        }
+        graphics.Restore(saved);
+    }
+    internal static void CheckForTest(string work) {
+        using (var bitmap = new Bitmap(538, 304)) using (var graphics = Graphics.FromImage(bitmap)) using (var font = new Font(TextFamily, 11f)) {
+            int[] numbers = { 1, 99, 100, 1000 };
+            for (int i = 0; i < numbers.Length; i++) Draw(graphics, new Rectangle(0, i * 76, 538, 76), numbers[i], font, i == 1, i == 2, i == 3, false, false);
+            if (bitmap.GetPixel(200, 74).ToArgb() != Canvas.ToArgb() || bitmap.GetPixel(200, 12).ToArgb() != Paper.ToArgb()) throw new Exception("CARD-TEST: visible gap separates cards from the list surface");
+            var pixels = new List<Point>(); for (int y = 4; y < 70; y++) for (int x = 380; x < 530; x++) if (bitmap.GetPixel(x, y).ToArgb() == NumberInk.ToArgb()) pixels.Add(new Point(x, y));
+            if (pixels.Count < 10) throw new Exception("CARD-TEST: index is visible at the right edge");
+            using (var brush = new SolidBrush(Color.FromArgb(20, 25, 31))) using (var format = new StringFormat { LineAlignment = StringAlignment.Far, FormatFlags = StringFormatFlags.NoWrap }) graphics.DrawString(new string('W', 50), font, brush, new Rectangle(12, 20, 514, 42), format);
+            bitmap.Save(Path.Combine(work, "dictionary-card-states.png"));
+            if (!pixels.Exists(point => bitmap.GetPixel(point.X, point.Y).R < 100)) throw new Exception("CARD-TEST: full-width text paints over the decorative index");
+        }
+        Console.WriteLine("CARD-TEST PASS: card gaps / 1-4 digit watermarks / full-width text over index / separate current and checked states");
+    }
+}
+
+sealed class DictionaryCheckBox : CheckBox
+{
+    bool hover, pressed;
+    public DictionaryCheckBox() { SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true); Cursor = Cursors.Hand; }
+    protected override void OnPaint(PaintEventArgs e) {
+        e.Graphics.Clear(Parent == null ? BackColor : Parent.BackColor);
+        HistoryCard.Check(e.Graphics, new Rectangle(4, (Height - 18) / 2, 18, 18), Checked, Enabled && hover, Enabled && pressed, Focused && ShowFocusCues, Enabled);
+        TextRenderer.DrawText(e.Graphics, Text, Font, new Rectangle(30, 0, Math.Max(0, Width - 30), Height), Enabled ? ForeColor : SystemColors.GrayText, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+    }
+    protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hover = true; Invalidate(); }
+    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hover = pressed = false; Invalidate(); }
+    protected override void OnMouseDown(MouseEventArgs e) { base.OnMouseDown(e); pressed = e.Button == MouseButtons.Left; Invalidate(); }
+    protected override void OnMouseUp(MouseEventArgs e) { base.OnMouseUp(e); pressed = false; Invalidate(); }
+    protected override void OnKeyDown(KeyEventArgs e) { base.OnKeyDown(e); if (e.KeyCode == Keys.Space) { pressed = true; Invalidate(); } }
+    protected override void OnKeyUp(KeyEventArgs e) { base.OnKeyUp(e); pressed = false; Invalidate(); }
+    protected override void OnCheckedChanged(EventArgs e) { base.OnCheckedChanged(e); Invalidate(); }
+    protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); Invalidate(); }
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); pressed = false; Invalidate(); }
+    internal void CheckForTest() {
+        bool initial = Checked; int changes = 0; EventHandler changed = (o, e) => changes++; CheckedChanged += changed;
+        try {
+            OnClick(EventArgs.Empty); if (Checked == initial || changes != 1) throw new Exception("CHECK-TEST: native check state and change event");
+            if (AccessibilityObject.Role != AccessibleRole.CheckButton) throw new Exception("CHECK-TEST: native checkbox accessibility role");
+            OnClick(EventArgs.Empty); if (Checked != initial || changes != 2) throw new Exception("CHECK-TEST: repeat click restores state");
+            OnKeyDown(new KeyEventArgs(Keys.Space)); if (!pressed) throw new Exception("CHECK-TEST: space press feedback");
+            OnLostFocus(EventArgs.Empty); if (pressed) throw new Exception("CHECK-TEST: focus loss clears pressed feedback");
+        } finally { CheckedChanged -= changed; }
+    }
+}
+
 sealed class DictionaryListBox : ListBox
 {
+    [StructLayout(LayoutKind.Sequential)]
+    struct PaintData { public IntPtr dc; public int erase, left, top, right, bottom, restore, update; [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)] public byte[] reserved; }
+    [DllImport("user32.dll")] static extern IntPtr BeginPaint(IntPtr window, out PaintData data);
+    [DllImport("user32.dll")] static extern bool EndPaint(IntPtr window, ref PaintData data);
+    internal int BufferedPaints;
+    internal int BufferedItems;
     int wheelRemainder;
+    int lastCount = -1, lastTop = -1, lastPage = -1;
+    internal bool CardFeedback;
+    internal int PressedIndex = -1;
+    int hovered = -1;
+    internal int HoverIndex { get { var point = PointToClient(MousePosition); return ClientRectangle.Contains(point) ? IndexFromPoint(point) : -1; } }
     internal Action ViewChanged;
+    protected override void OnDrawItem(DrawItemEventArgs e) {
+        if (!CardFeedback || e.Index < 0 || e.Bounds.Width <= 0 || e.Bounds.Height <= 0) { base.OnDrawItem(e); return; }
+        // Native selection can draw directly without WM_PAINT; buffer that path too.
+        using (var image = new Bitmap(e.Bounds.Width, e.Bounds.Height)) using (var graphics = Graphics.FromImage(image)) {
+            graphics.TranslateTransform(-e.Bounds.X, -e.Bounds.Y);
+            base.OnDrawItem(new DrawItemEventArgs(graphics, e.Font, e.Bounds, e.Index, e.State, e.ForeColor, e.BackColor));
+            e.Graphics.DrawImageUnscaled(image, e.Bounds.Location); BufferedItems++;
+        }
+    }
+    void NotifyView() {
+        int page = Math.Max(1, ClientSize.Height / Math.Max(1, ItemHeight));
+        if (lastCount == Items.Count && lastTop == TopIndex && lastPage == page) return;
+        lastCount = Items.Count; lastTop = TopIndex; lastPage = page;
+        if (ViewChanged != null) ViewChanged();
+    }
+    void InvalidateItem(int index) { if (index >= 0 && index < Items.Count) Invalidate(GetItemRectangle(index)); }
+    protected override void OnMouseMove(MouseEventArgs e) { base.OnMouseMove(e); if (CardFeedback && hovered != HoverIndex) { int previous = hovered; hovered = HoverIndex; InvalidateItem(previous); InvalidateItem(hovered); } }
+    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); if (CardFeedback) { int previous = hovered; hovered = -1; InvalidateItem(previous); } }
+    protected override void OnMouseDown(MouseEventArgs e) { if (CardFeedback && e.Button == MouseButtons.Left) { PressedIndex = IndexFromPoint(e.Location); InvalidateItem(PressedIndex); } base.OnMouseDown(e); }
+    protected override void OnMouseUp(MouseEventArgs e) { if (CardFeedback) { int previous = PressedIndex; PressedIndex = -1; InvalidateItem(previous); } base.OnMouseUp(e); }
+    protected override void OnMouseCaptureChanged(EventArgs e) { base.OnMouseCaptureChanged(e); if (CardFeedback && !Capture) { int previous = PressedIndex; PressedIndex = -1; InvalidateItem(previous); } }
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); if (CardFeedback) InvalidateItem(SelectedIndex); }
+    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); if (CardFeedback) InvalidateItem(SelectedIndex); }
     protected override CreateParams CreateParams {
         get { var value = base.CreateParams; value.Style = (value.Style | 0x1000) & ~0x00200000; return value; }
     }
     protected override void WndProc(ref Message m) {
+        if (CardFeedback && m.Msg == 0x0014) { m.Result = new IntPtr(1); return; }
+        if (CardFeedback && m.Msg == 0x000F && ClientSize.Width > 0 && ClientSize.Height > 0) {
+            PaintData paint; IntPtr dc = BeginPaint(Handle, out paint);
+            try {
+                using (var target = Graphics.FromHdc(dc)) using (var buffer = BufferedGraphicsManager.Current.Allocate(target, ClientRectangle)) {
+                    buffer.Graphics.Clear(BackColor); IntPtr buffered = buffer.Graphics.GetHdc();
+                    try { var print = Message.Create(Handle, 0x0318, buffered, new IntPtr(4)); base.WndProc(ref print); }
+                    finally { buffer.Graphics.ReleaseHdc(buffered); }
+                    buffer.Render(target); BufferedPaints++;
+                }
+            } finally { EndPaint(Handle, ref paint); }
+            NotifyView(); m.Result = IntPtr.Zero; return;
+        }
         if (m.Msg == 0x020A) {
             int page = Math.Max(1, ClientSize.Height / ItemHeight);
             int lines = DictionaryScrollBar.WheelLines(ref wheelRemainder, (short)((long)m.WParam >> 16), page);
             if (Items.Count > 0) TopIndex = Math.Max(0, Math.Min(Math.Max(0, Items.Count - page), TopIndex - lines));
-            if (ViewChanged != null) ViewChanged();
+            NotifyView();
             return;
         }
         base.WndProc(ref m);
-        if (ViewChanged != null && (m.Msg == 0x000F || m.Msg == 0x0115 || m.Msg == 0x020A || m.Msg == 0x0101)) ViewChanged();
+        if (m.Msg == 0x000F || m.Msg == 0x0115 || m.Msg == 0x020A || m.Msg == 0x0101) NotifyView();
     }
 }
 
@@ -640,6 +818,8 @@ sealed class DictionaryScrollBar : Control
     readonly Func<int> count, page, position;
     readonly Action<int> scroll;
     int drag = -1, wheelRemainder;
+    internal static readonly Color IdleInk = Color.FromArgb(132, 132, 136);
+    internal bool CardTrack;
     internal static int WheelLines(ref int remainder, int delta, int page) {
         remainder += delta;
         int steps = remainder / 120; remainder %= 120;
@@ -657,7 +837,8 @@ sealed class DictionaryScrollBar : Control
             if (count() <= page()) return Rectangle.Empty;
             int height = Math.Min(Height, Math.Max(24, Height * page() / Math.Max(1, count())));
             int top = (Height - height) * Math.Min(position(), Math.Max(0, count() - page())) / Math.Max(1, count() - page());
-            return new Rectangle((Width - 4) / 2, top, 4, height);
+            int width = CardTrack ? 6 : 4;
+            return new Rectangle((Width - width) / 2, top, width, height);
         }
     }
     internal bool Overflows { get { return count() > page(); } }
@@ -666,9 +847,10 @@ sealed class DictionaryScrollBar : Control
         Rectangle thumb = Thumb;
         if (thumb.IsEmpty) return;
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        if (CardTrack) using (var track = MicrophoneMenuRenderer.Outline(new Rectangle(1, 0, Width - 2, Height - 1), 5)) using (var brush = new SolidBrush(Color.FromArgb(234, 232, 227))) e.Graphics.FillPath(brush, track);
         using (var shape = MicrophoneMenuRenderer.Outline(thumb, 2))
         using (var ink = new SolidBrush(Capture || ClientRectangle.Contains(PointToClient(MousePosition)) || Focused
-            ? Color.FromArgb(140, 140, 144) : Color.FromArgb(199, 198, 196))) e.Graphics.FillPath(ink, shape);
+            ? Color.FromArgb(102, 106, 113) : IdleInk)) e.Graphics.FillPath(ink, shape);
     }
     void MoveThumb(int y) {
         var thumb = Thumb;
@@ -712,7 +894,9 @@ sealed class DictionaryScrollBar : Control
 
 sealed class DictionaryButton : Button
 {
-    internal bool Primary;
+    internal bool Primary, Outlined, Selected;
+    internal Color? DisabledInk;
+    internal static readonly Color OutlineInk = Color.FromArgb(138, 137, 133);
     internal string Glyph;
     public DictionaryButton() { FlatStyle = FlatStyle.Flat; FlatAppearance.BorderSize = 0; Cursor = Cursors.Hand; }
     protected override void OnPaint(PaintEventArgs e) {
@@ -724,13 +908,15 @@ sealed class DictionaryButton : Button
                     Enabled ? Color.FromArgb(48, 49, 52) : Color.FromArgb(194, 193, 190),
                     Enabled ? Color.FromArgb(39, 40, 43) : Color.FromArgb(194, 193, 190), 90f)) e.Graphics.FillPath(brush, outline);
             } else using (var brush = new SolidBrush(hover ? Color.FromArgb(237, 236, 233) : BackColor)) e.Graphics.FillPath(brush, outline);
+            if (Outlined && !Primary) using (var pen = new Pen(Enabled ? OutlineInk : Color.FromArgb(214, 212, 207))) e.Graphics.DrawPath(pen, outline);
             if (Focused) using (var pen = new Pen(Color.FromArgb(133, 132, 127))) e.Graphics.DrawPath(pen, outline);
         }
-        Rectangle label = ClientRectangle;
+        if (Selected) using (var brush = new SolidBrush(Color.FromArgb(96, 100, 107))) e.Graphics.FillRectangle(brush, 1, 8, 3, Height - 16);
+        Rectangle label = ClientRectangle; if (TextAlign == ContentAlignment.MiddleLeft) { label.X += 14; label.Width -= 28; }
         if (!string.IsNullOrEmpty(Glyph)) {
             int textWidth = (int)Math.Ceiling(e.Graphics.MeasureString(Text, Font).Width);
             int iconX = Text.Length == 0 ? (Width - 20) / 2 : Math.Max(8, (Width - textWidth - 30) / 2);
-            DictionaryGlyph.Draw(e.Graphics, Glyph, new Rectangle(iconX, (Height - 20) / 2, 20, 20), Primary ? Color.White : Enabled ? ForeColor : SystemColors.GrayText);
+            DictionaryGlyph.Draw(e.Graphics, Glyph, new Rectangle(iconX, (Height - 20) / 2, 20, 20), Primary ? Color.White : Enabled ? ForeColor : (DisabledInk ?? SystemColors.GrayText));
             if (Text.Length > 0) label = new Rectangle(iconX + 28, 0, textWidth, Height);
         } else if (Text == "删除" && !Primary) {
             using (var pen = new Pen(Enabled ? ForeColor : SystemColors.GrayText, 1.2f)) {
@@ -744,8 +930,8 @@ sealed class DictionaryButton : Button
             label.X += 25; label.Width -= 25;
         }
         e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-        using (var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-        using (var brush = new SolidBrush(Primary ? Color.White : Enabled ? ForeColor : SystemColors.GrayText))
+        using (var format = new StringFormat { Alignment = TextAlign == ContentAlignment.MiddleLeft ? StringAlignment.Near : StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
+        using (var brush = new SolidBrush(Primary ? Color.White : Enabled ? ForeColor : (DisabledInk ?? SystemColors.GrayText)))
             e.Graphics.DrawString(Text, Font, brush, label, format);
     }
 }
@@ -765,6 +951,7 @@ static class DictionaryGlyph
             else if (kind == "play") { graphics.DrawPolygon(pen, new[] { new Point(8, 4), new Point(20, 12), new Point(8, 20) }); }
             else if (kind == "check") { graphics.DrawLines(pen, new[] { new Point(5, 12), new Point(10, 17), new Point(20, 6) }); }
             else if (kind == "arrow") { graphics.DrawLine(pen, 4, 12, 20, 12); graphics.DrawLines(pen, new[] { new Point(14, 6), new Point(20, 12), new Point(14, 18) }); }
+            else if (kind == "back" || kind == "forward") { int a = kind == "back" ? 18 : 6, b = 24 - a; graphics.DrawLine(pen, a, 12, b, 12); graphics.DrawLines(pen, new[] { new Point(b + (kind == "back" ? 5 : -5), 7), new Point(b, 12), new Point(b + (kind == "back" ? 5 : -5), 17) }); }
             else if (kind == "edit") { graphics.DrawLines(pen, new[] { new Point(4, 16), new Point(15, 5), new Point(20, 10), new Point(9, 21), new Point(3, 22), new Point(4, 16) }); graphics.DrawLine(pen, 13, 7, 18, 12); }
         }
         graphics.Restore(state);
@@ -774,12 +961,15 @@ static class DictionaryGlyph
 sealed class DictionaryField : Panel
 {
     internal string Glyph;
+    internal static readonly Color BorderInk = Color.FromArgb(138, 137, 133);
+    protected override void OnEnter(EventArgs e) { base.OnEnter(e); Invalidate(); }
+    protected override void OnLeave(EventArgs e) { base.OnLeave(e); Invalidate(); }
     public DictionaryField() { DoubleBuffered = true; BackColor = Color.FromArgb(251, 250, 248); }
     protected override void OnPaint(PaintEventArgs e) {
         base.OnPaint(e); e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         using (var shape = MicrophoneMenuRenderer.Outline(new Rectangle(0, 0, Width - 1, Height - 1), 9)) {
             using (var brush = new SolidBrush(Color.FromArgb(246, 245, 243))) e.Graphics.FillPath(brush, shape);
-            using (var pen = new Pen(ContainsFocus ? Color.FromArgb(138, 140, 144) : Color.FromArgb(220, 219, 216))) e.Graphics.DrawPath(pen, shape);
+            using (var pen = new Pen(ContainsFocus ? Color.FromArgb(102, 106, 113) : BorderInk)) e.Graphics.DrawPath(pen, shape);
         }
         if (Glyph != null) DictionaryGlyph.Draw(e.Graphics, Glyph, new Rectangle(13, (Height - 18) / 2, 18, 18), Color.FromArgb(102, 106, 113));
     }
@@ -787,7 +977,7 @@ sealed class DictionaryField : Panel
 
 sealed class VoiceSample
 {
-    public string id, word, correctText, wav, createdUtc, state;
+    public string id, word, correctText, promptText, wav, createdUtc, state;
     public int sampleRate, channels, bitsPerSample;
     public double durationSeconds;
     public override string ToString() { return durationSeconds.ToString("0.0") + " 秒  ·  " + correctText; }
@@ -831,7 +1021,7 @@ sealed class VoiceSampleStore
     }
     internal VoiceSample Save(string word, string text, byte[] pcm) {
         Validate(pcm, word, text); Directory.CreateDirectory(folder);
-        var sample = new VoiceSample { id = Guid.NewGuid().ToString("N"), word = word.Trim(), correctText = text.Trim(), createdUtc = DateTime.UtcNow.ToString("o"), state = "collected", sampleRate = 16000, channels = 1, bitsPerSample = 16, durationSeconds = pcm.Length / 32000.0 };
+        var sample = new VoiceSample { id = Guid.NewGuid().ToString("N"), word = word.Trim(), correctText = text.Trim(), promptText = text.Trim(), createdUtc = DateTime.UtcNow.ToString("o"), state = "collected", sampleRate = 16000, channels = 1, bitsPerSample = 16, durationSeconds = pcm.Length / 32000.0 };
         sample.wav = sample.id + ".wav";
         string audio = Path.Combine(folder, sample.wav), metadata = Path.Combine(folder, sample.id + ".json");
         try {
@@ -851,6 +1041,1274 @@ sealed class VoiceSampleStore
         AudioPath(sample);
         string file = Path.Combine(folder, sample.id + ".json"); File.Move(file, file + ".deleted");
     }
+}
+
+sealed class SampleCaptureDialog : DictionaryWindow
+{
+    readonly TextBox spokenText = new TextBox();
+    readonly Label sampleNotice = new DictionaryLabel();
+    readonly Label captureTime = new DictionaryLabel();
+    readonly Panel meter = new Panel();
+    readonly VoiceSampleStore sampleStore;
+    readonly System.Windows.Forms.Timer sampleTimer = new System.Windows.Forms.Timer { Interval = 80 };
+    readonly Stopwatch sampleClock = new Stopwatch();
+    readonly List<float> sampleLevels = new List<float>();
+    readonly System.Media.SoundPlayer samplePlayer = new System.Media.SoundPlayer();
+    Button recordButton, sampleSaveButton, samplePlayButton, sampleDeleteButton;
+    Recorder sampleRecorder;
+    MemoryStream sampleAudio;
+    byte[] pendingAudio;
+    bool sampleStarting;
+    int sampleStartRevision;
+    double playbackUntil;
+    internal Func<Task> PrepareRecording;
+    internal VoiceSample SavedSample;
+    internal string SavedAudioPath { get { return SavedSample == null ? "" : sampleStore.AudioPath(SavedSample); } }
+    internal bool RecordingBusy { get { return sampleStarting || sampleRecorder != null; } }
+    static readonly Color Face = Color.FromArgb(251, 250, 248), Ink = Color.FromArgb(20, 25, 31), Dim = Color.FromArgb(102, 106, 113), Field = Color.FromArgb(246, 245, 243);
+    readonly Panel captureContent = new Panel();
+    internal SampleCaptureDialog(string root) {
+        sampleStore = new VoiceSampleStore(root); ClientSize = new Size(620, 330); Font = new Font("Segoe UI Variable Text", 14f);
+        FormBorderStyle = FormBorderStyle.None; StartPosition = FormStartPosition.CenterParent; TopMost = true; ShowInTaskbar = false;
+        BackColor = Face; ForeColor = Ink; Text = "补录样本"; AccessibleName = Text;
+        var title = DictionaryDialog.Caption(Text, 30, 20, Ink); title.Font = new Font(Font.FontFamily, 20f, FontStyle.Bold); Controls.Add(title);
+        Controls.Add(IconButton("close", "关闭补录", new Rectangle(550, 20, 40, 40), Close));
+        captureContent.Bounds = new Rectangle(32, 82, 556, 220); captureContent.BackColor = Face; Controls.Add(captureContent); BuildCaptureControls();
+        sampleNotice.Text = "录音仅保存样本 · 不占救援名额，不自动训练"; UpdateSampleControls();
+        KeyPreview = true; KeyDown += (o, e) => { if (e.KeyCode == Keys.Escape) { if (RecordingBusy) StopSampleRecording(); else Close(); e.SuppressKeyPress = true; } };
+    }
+    void BuildCaptureControls() {
+        var label = DictionaryDialog.Caption("朗读内容", 0, 0, Dim); label.Font = new Font(Font.FontFamily, 12f); captureContent.Controls.Add(label);
+        var note = DictionaryDialog.Caption("单词或整句 · 与录音内容一致", 294, 3, Dim); note.Font = new Font(Font.FontFamily, 10f); captureContent.Controls.Add(note);
+        var field = new DictionaryField { Bounds = new Rectangle(0, 32, 556, 64) };
+        spokenText.Bounds = new Rectangle(14, 10, 526, 44); spokenText.Multiline = true; spokenText.MaxLength = 2000;
+        spokenText.Font = new Font(Font.FontFamily, 12f); spokenText.BorderStyle = BorderStyle.None; spokenText.BackColor = Field; spokenText.ForeColor = Ink;
+        spokenText.AccessibleName = "这段录音对应的完整文字"; field.Controls.Add(spokenText); captureContent.Controls.Add(field);
+        recordButton = DictionaryDialog.MakeButton("录音", new Rectangle(0, 110, 124, 44), async () => await ToggleSampleRecording());
+        ((DictionaryButton)recordButton).Glyph = "mic"; ((DictionaryButton)recordButton).Primary = true; captureContent.Controls.Add(recordButton);
+        meter.Bounds = new Rectangle(140, 118, 150, 28); meter.BackColor = Face; meter.AccessibleName = "麦克风声音强度";
+        meter.Paint += (o, e) => {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var pen = new Pen(sampleRecorder != null ? Color.FromArgb(179, 66, 55) : Dim, 2.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                for (int i = 0; i < 25; i++) { float value = i < sampleLevels.Count ? sampleLevels[i] : 0; float half = 1 + Math.Min(11, value * 11); e.Graphics.DrawLine(pen, i * 6 + 2, 14 - half, i * 6 + 2, 14 + half); }
+        }; captureContent.Controls.Add(meter);
+        captureTime.Bounds = new Rectangle(304, 119, 90, 28); captureTime.Font = new Font(Font.FontFamily, 11f); captureTime.ForeColor = Dim; captureTime.Text = "0:00"; captureContent.Controls.Add(captureTime);
+        sampleSaveButton = DictionaryDialog.MakeButton("保存样本", new Rectangle(410, 110, 146, 44), () => { if (SaveSample()) { DialogResult = DialogResult.OK; Close(); } });
+        ((DictionaryButton)sampleSaveButton).Glyph = "check"; captureContent.Controls.Add(sampleSaveButton);
+        sampleNotice.Bounds = new Rectangle(0, 170, 454, 28); sampleNotice.Font = new Font(Font.FontFamily, 10.5f); sampleNotice.ForeColor = Dim;
+        sampleNotice.AutoEllipsis = true; sampleNotice.AccessibleName = "录音样本状态"; captureContent.Controls.Add(sampleNotice);
+        samplePlayButton = IconButton("play", "试听录音", new Rectangle(466, 164, 40, 36), PlaySample);
+        sampleDeleteButton = IconButton("trash", "删除录音", new Rectangle(516, 164, 40, 36), RemoveSample);
+        captureContent.Controls.Add(samplePlayButton); captureContent.Controls.Add(sampleDeleteButton);
+        sampleTimer.Tick += (o, e) => {
+            if (sampleRecorder != null) {
+                try { AppendSampleAudio(sampleRecorder.Read(true)); if (sampleClock.ElapsedMilliseconds >= 60000) { StopSampleRecording(); sampleNotice.Text = "已到 60 秒，请试听后保存"; } }
+                catch (Exception error) { StopSampleRecording(); sampleNotice.Text = "录音中断：" + error.Message; }
+            } else if (playbackUntil > 0 && sampleClock.Elapsed.TotalSeconds >= playbackUntil) StopSamplePlayback();
+        };
+    }
+
+    Button IconButton(string glyph, string name, Rectangle bounds, Action click) {
+        var button = (DictionaryButton)DictionaryDialog.MakeButton("", bounds, click); button.Glyph = glyph;
+        button.AccessibleName = name; button.AccessibleDescription = name; return button;
+    }
+    void UpdateSampleControls() {
+        bool busy = RecordingBusy;
+        recordButton.Text = busy ? "停止" : "录音"; ((DictionaryButton)recordButton).Glyph = busy ? "stop" : "mic";
+        ((DictionaryButton)recordButton).Primary = !busy; recordButton.AccessibleName = busy ? "停止录音" : "开始补录";
+        spokenText.ReadOnly = busy; sampleSaveButton.Enabled = samplePlayButton.Enabled = sampleDeleteButton.Enabled = !busy && pendingAudio != null;
+        recordButton.Invalidate();
+    }
+    async Task ToggleSampleRecording() {
+        if (RecordingBusy) { StopSampleRecording(); return; }
+        if (!ResolvePendingAudio()) return;
+        if (string.IsNullOrWhiteSpace(spokenText.Text)) { sampleNotice.Text = "先填写这段录音的完整文字"; spokenText.Focus(); return; }
+        StopSamplePlayback(); int revision = ++sampleStartRevision; sampleStarting = true; UpdateSampleControls();
+        try {
+            if (PrepareRecording != null) await PrepareRecording();
+            if (IsDisposed || Disposing || revision != sampleStartRevision) return;
+            sampleAudio = new MemoryStream(); sampleLevels.Clear();
+            sampleRecorder = new Recorder(); sampleClock.Restart(); captureTime.Text = "0:00"; sampleTimer.Start(); sampleNotice.Text = "录音中 · 按上方文字自然朗读";
+        } catch (Exception error) {
+            if (sampleRecorder != null) { sampleRecorder.Dispose(); sampleRecorder = null; }
+            if (sampleAudio != null) { sampleAudio.Dispose(); sampleAudio = null; }
+            sampleNotice.Text = error.Message;
+        } finally { if (revision == sampleStartRevision) sampleStarting = false; if (!IsDisposed && !Disposing) UpdateSampleControls(); }
+    }
+    void AppendSampleAudio(byte[] bytes) {
+        int length = Math.Min(bytes.Length, 60 * 32000 - (int)sampleAudio.Length);
+        if (length > 0) sampleAudio.Write(bytes, 0, length);
+        double squares = 0; for (int i = 0; i + 1 < length; i += 2) { double value = BitConverter.ToInt16(bytes, i) / 32768.0; squares += value * value; }
+        float level = length == 0 ? 0 : (float)Math.Min(1, Math.Sqrt(squares / (length / 2)) * 15);
+        sampleLevels.Add(level); while (sampleLevels.Count > 25) sampleLevels.RemoveAt(0);
+        TimeSpan elapsed = TimeSpan.FromSeconds(sampleAudio.Length / 32000.0); captureTime.Text = elapsed.Minutes + ":" + elapsed.Seconds.ToString("00"); meter.Invalidate();
+    }
+    internal void StopSampleRecording() {
+        ++sampleStartRevision; sampleStarting = false; sampleTimer.Stop();
+        if (sampleRecorder != null) {
+            string error = null;
+            try { AppendSampleAudio(sampleRecorder.Stop()); } catch (Exception failure) { error = failure.Message; }
+            finally { sampleRecorder.Dispose(); sampleRecorder = null; }
+            pendingAudio = sampleAudio.ToArray(); sampleAudio.Dispose(); sampleAudio = null;
+            sampleNotice.Text = error == null ? "待保存 · 可试听并核对完整文字" : "录音中断，请试听或重录：" + error;
+        }
+        if (!IsDisposed && !Disposing) { UpdateSampleControls(); meter.Invalidate(); }
+    }
+    void StopSamplePlayback() {
+        samplePlayer.Stop(); if (samplePlayer.Stream != null) { samplePlayer.Stream.Dispose(); samplePlayer.Stream = null; }
+        playbackUntil = 0; if (sampleRecorder == null) sampleTimer.Stop();
+        if (samplePlayButton != null) { ((DictionaryButton)samplePlayButton).Glyph = "play"; samplePlayButton.AccessibleName = "试听录音"; samplePlayButton.Invalidate(); }
+    }
+    void PlaySample() {
+        if (playbackUntil > 0) { StopSamplePlayback(); return; }
+        try {
+            if (pendingAudio == null) return;
+            byte[] audio = VoiceSampleStore.Wave(pendingAudio);
+            StopSamplePlayback(); samplePlayer.Stream = new MemoryStream(audio); samplePlayer.Load(); samplePlayer.Play();
+            sampleClock.Restart(); playbackUntil = Math.Max(.1, (audio.Length - 44) / 32000.0); sampleTimer.Start();
+            ((DictionaryButton)samplePlayButton).Glyph = "stop"; samplePlayButton.AccessibleName = "停止试听"; samplePlayButton.Invalidate();
+        } catch (Exception error) { StopSamplePlayback(); sampleNotice.Text = "试听失败：" + error.Message; }
+    }
+    bool SaveSample() {
+        if (pendingAudio == null || RecordingBusy) return false;
+        try {
+            StopSamplePlayback(); SavedSample = sampleStore.Save("个人补录", spokenText.Text, pendingAudio);
+            pendingAudio = null; UpdateSampleControls(); sampleNotice.Text = "样本已保存 · 请在听写记录中审核和选择"; return true;
+        } catch (Exception error) { sampleNotice.Text = "保存失败：" + error.Message; return false; }
+    }
+    bool ResolvePendingAudio() {
+        if (RecordingBusy) return false;
+        if (pendingAudio == null) return true;
+        var answer = MessageBox.Show(this, "这段录音尚未保存，保存为样本吗？", "录音样本", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+        if (answer == DialogResult.Cancel) return false;
+        if (answer == DialogResult.Yes) return SaveSample();
+        StopSamplePlayback(); pendingAudio = null; UpdateSampleControls(); return true;
+    }
+    void RemoveSample() {
+        if (RecordingBusy || pendingAudio == null) return;
+        using (var confirmation = new DictionaryDeleteDialog("", true)) if (confirmation.ShowDialog(this) != DialogResult.OK) return;
+        StopSamplePlayback(); pendingAudio = null; UpdateSampleControls(); sampleNotice.Text = "已放弃本次未保存录音";
+    }
+    internal static void CheckSamplesForTest(string work) {
+        Action<bool, string> check = (ok, reason) => { if (!ok) throw new Exception("VOICE-SAMPLE-TEST: " + reason); };
+        Action<Action, string> fails = (action, reason) => { bool failed = false; try { action(); } catch (IOException) { failed = true; } check(failed, reason); };
+        string fixture = Path.Combine(work, "voice-sample-check-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(fixture);
+        File.WriteAllText(Path.Combine(fixture, "dictionary.json"), "{\"hotwords\":[\"Example\",\"Other\"],\"rules\":[]}");
+        var pcm = new byte[32000];
+        for (int i = 0; i < pcm.Length / 2; i++) { short value = (short)(Math.Sin(i * .12) * 2000); pcm[2 * i] = (byte)(value & 255); pcm[2 * i + 1] = (byte)(value >> 8); }
+        var store = new VoiceSampleStore(fixture);
+        var first = store.Save("Example", "Example", pcm); var second = store.Save("Example", "打开 Example", pcm); store.Save("Other", "Other", pcm);
+        var saved = store.Load("EXAMPLE"); check(saved.Count == 2 && first.id != second.id && store.Load("Other").Count == 1, "multiple independent clips per word, case insensitive lookup, no word mixing");
+        byte[] wav = File.ReadAllBytes(store.AudioPath(first));
+        check(wav.Length == pcm.Length + 44 && Encoding.ASCII.GetString(wav, 0, 4) == "RIFF" && BitConverter.ToInt32(wav, 24) == 16000 && BitConverter.ToInt16(wav, 22) == 1 && BitConverter.ToInt16(wav, 34) == 16 && BitConverter.ToInt32(wav, 40) == pcm.Length, "valid mono PCM16 16k WAV including exact tail");
+        using (var audio = new MemoryStream(wav)) using (var player = new System.Media.SoundPlayer(audio)) { player.Load(); check(player.IsLoadCompleted, "recorded WAV is accepted by the actual playback backend without emitting test audio"); }
+        check(saved.Exists(item => item.correctText == "打开 Example") && saved.TrueForAll(item => item.state == "collected"), "full bilingual labels persist and never claim training");
+        fails(() => store.Save("Example", "", pcm), "missing label blocked");
+        fails(() => store.Save("Example", "Example", new byte[32000]), "silent clip blocked");
+        fails(() => store.Save("Example", "Example", new byte[3]), "invalid PCM blocked");
+        fails(() => store.AudioPath(new VoiceSample { id = "../escape", wav = "../escape.wav" }), "metadata cannot escape sample folder");
+        check(store.Load("Example").Count == 2, "invalid saves never replace previous samples");
+        using (var dialog = new SampleCaptureDialog(fixture)) {
+            dialog.StartPosition = FormStartPosition.Manual; dialog.Location = new Point(-20000, -20000); dialog.Show(); Application.DoEvents();
+            dialog.pendingAudio = pcm; dialog.spokenText.Text = "我正在用 Example 写代码"; dialog.UpdateSampleControls();
+            check(dialog.sampleSaveButton.Enabled && dialog.samplePlayButton.Enabled, "supplement recording offers save and playback");
+            using (var bitmap = new Bitmap(dialog.Width, dialog.Height)) { dialog.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-supplement.png")); }
+            dialog.spokenText.Clear(); check(!dialog.SaveSample() && dialog.pendingAudio == pcm, "failed save keeps recording available");
+            dialog.spokenText.Text = "我正在用 Example 写代码";
+            check(dialog.SaveSample() && dialog.pendingAudio == null && store.Load("个人补录").Count == 1, "supplement saves without dictionary entry");
+            string errors; long bytes; var records = new HistoryStore(fixture).Load(out errors, out bytes);
+            check(errors.Length == 0 && records.Exists(item => item.Text("word") == "个人补录" && !item.Flag("selectedForTraining")), "supplements reach shared review without automatic selection");
+            check(!dialog.HasNativeFrame && dialog.ClientSize == new Size(620, 330), "supplement keeps borderless style"); dialog.Close();
+        }
+        store.Remove(first); check(store.Load("Example").Count == 1 && File.Exists(store.AudioPath(first)) && File.Exists(Path.Combine(fixture, "user-data", "voice-samples", first.id + ".json.deleted")), "sample deletion retains recoverable original audio and labels");
+        File.WriteAllText(Path.Combine(fixture, "user-data", "voice-samples", "broken.json"), "{}");
+        fails(() => store.Load("Example"), "invalid metadata is reported instead of silently hidden");
+        Console.WriteLine("VOICE-SAMPLE-TEST PASS: multi-clip / bilingual transcripts / per-word isolation / PCM WAV / silent and invalid rejection / failed-save retention / recoverable deletion / unified supplement / no automatic training");
+    }
+
+    internal static void CheckCaptureForTest(string work) {
+        string fixture = Path.Combine(work, "voice-capture-check-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(fixture);
+        File.WriteAllText(Path.Combine(fixture, "dictionary.json"), "{\"hotwords\":[\"Capture test\"],\"rules\":[]}");
+        var counts = new List<int>();
+        using (var dialog = new SampleCaptureDialog(fixture)) {
+            dialog.StartPosition = FormStartPosition.Manual; dialog.Location = new Point(-20000, -20000); dialog.Show(); Application.DoEvents(); dialog.spokenText.Text = "Capture test";
+            int prepared = 0; dialog.PrepareRecording = () => { prepared++; return Task.FromResult(0); };
+            for (int cycle = 0; cycle < 3; cycle++) {
+                dialog.ToggleSampleRecording().GetAwaiter().GetResult();
+                if (!dialog.RecordingBusy || !dialog.spokenText.ReadOnly || dialog.sampleSaveButton.Enabled) throw new Exception("Recording controls did not lock the word and transcript");
+                var clock = Stopwatch.StartNew(); while (clock.ElapsedMilliseconds < 700) { Application.DoEvents(); Thread.Sleep(10); }
+                dialog.StopSampleRecording();
+                if (dialog.RecordingBusy || dialog.sampleTimer.Enabled || dialog.pendingAudio == null || dialog.pendingAudio.Length < 16000 || dialog.spokenText.ReadOnly || !dialog.sampleSaveButton.Enabled) throw new Exception("Sample capture did not drain its tail or release the microphone");
+                counts.Add(dialog.pendingAudio.Length); dialog.pendingAudio = null; dialog.UpdateSampleControls();
+            }
+            if (prepared != 3 || Directory.Exists(Path.Combine(fixture, "user-data"))) throw new Exception("Capture must prepare each start and never save audio without an explicit save");
+            dialog.PrepareRecording = () => { throw new IOException("injected unavailable microphone"); };
+            dialog.ToggleSampleRecording().GetAwaiter().GetResult();
+            if (dialog.RecordingBusy || !dialog.sampleNotice.Text.Contains("injected")) throw new Exception("Start failure must release recording state and show the error");
+            dialog.Close();
+        }
+        File.WriteAllText(Path.Combine(work, "dictionary-capture-test.txt"), "PASS: real default microphone / sample recording controller / three reopen cycles / tail drain / word and label lock / release and retry / injected start failure / no automatic save or training; PCM byte counts=" + string.Join(",", counts));
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e) {
+        StopSampleRecording(); if (!ResolvePendingAudio()) { e.Cancel = true; return; } base.OnFormClosing(e);
+    }
+    protected override void Dispose(bool disposing) {
+        if (disposing) {
+            ++sampleStartRevision; sampleTimer.Stop();
+            if (sampleRecorder != null) { sampleRecorder.Dispose(); sampleRecorder = null; }
+            if (sampleAudio != null) { sampleAudio.Dispose(); sampleAudio = null; }
+            StopSamplePlayback(); samplePlayer.Dispose(); sampleTimer.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+}
+
+sealed class HistoryStatusTag : Control
+{
+    internal static void Colors(string state, out Color ink, out Color fill) {
+        if (state == "待验证" || state == "待复测") { ink = Color.FromArgb(101, 53, 153); fill = Color.FromArgb(243, 233, 255); }
+        else if (state == "已打回") { ink = Color.FromArgb(156, 49, 38); fill = Color.FromArgb(255, 233, 232); }
+        else if (state == "待核对" || state == "待识别") { ink = Color.FromArgb(133, 82, 0); fill = Color.FromArgb(255, 244, 214); }
+        else if (state == "已保存" || state == "已对照" || state == "验证通过" || state == "验收通过" || state == "已启用") { ink = Color.FromArgb(32, 108, 69); fill = Color.FromArgb(227, 245, 234); }
+        else if (state == "已选训练") { ink = Color.FromArgb(39, 83, 160); fill = Color.FromArgb(230, 239, 255); }
+        else { ink = Color.FromArgb(91, 97, 107); fill = Color.FromArgb(235, 236, 239); }
+    }
+    internal static Size Measure(Graphics graphics, string text, Font font) { return new Size((int)Math.Ceiling(graphics.MeasureString(text, font).Width) + 14, 22); }
+    internal static int Draw(Graphics graphics, string text, Font font, Point location) {
+        Color ink, fill; Colors(text, out ink, out fill); var bounds = new Rectangle(location, Measure(graphics, text, font)); graphics.SmoothingMode = SmoothingMode.AntiAlias; graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+        using (var shape = MicrophoneMenuRenderer.Outline(bounds, 4)) using (var brush = new SolidBrush(fill)) graphics.FillPath(brush, shape);
+        using (var brush = new SolidBrush(ink)) using (var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, FormatFlags = StringFormatFlags.NoWrap }) graphics.DrawString(text, font, brush, bounds, format);
+        return bounds.Width;
+    }
+    internal HistoryStatusTag() { Font = new Font(HistoryCard.TextFamily, 9.5f); TabStop = false; AccessibleRole = AccessibleRole.StaticText; DoubleBuffered = true; Size = new Size(88, 22); }
+    protected override void OnTextChanged(EventArgs e) { base.OnTextChanged(e); AccessibleName = Text; Invalidate(); }
+    protected override void OnPaint(PaintEventArgs e) { e.Graphics.Clear(Parent == null ? BackColor : Parent.BackColor); Draw(e.Graphics, Text, Font, Point.Empty); }
+}
+
+sealed class HistoryEntry
+{
+    internal string FileName, Original, Kind, TrainingStatus = "";
+    internal Dictionary<string, object> Data;
+    internal string Text(string key) { object value; return Data.TryGetValue(key, out value) ? Convert.ToString(value) : ""; }
+    internal bool Flag(string key) { object value; return Data.TryGetValue(key, out value) && value is bool && (bool)value; }
+    internal double Seconds { get { return Convert.ToDouble(Data["durationSeconds"]); } }
+    internal string Audio { get { return Path.Combine(Path.GetDirectoryName(FileName), Text("wav")); } }
+    public override string ToString() { return State + "，" + Text("correctText"); }
+    internal string State { get { return Flag("ignored") ? "已忽略" : Flag("selectedForTraining") ? "已选训练" : Flag("reviewed") ? "已保存" : "待核对"; } }
+}
+
+sealed class HistoryStore
+{
+    internal readonly string Root;
+    internal HistoryStore(string root) { Root = Path.Combine(root, "user-data"); }
+    internal string Settings { get { return Path.Combine(Root, "history-settings.json"); } }
+    internal static Dictionary<string, object> Parse(string text) {
+        var data = new JavaScriptSerializer().DeserializeObject(text) as Dictionary<string, object>;
+        if (data == null) throw new IOException("记录必须是 JSON 对象"); return data;
+    }
+    internal static void Atomic(string path, string text) {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)); string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try { File.WriteAllText(temp, text, new UTF8Encoding(false)); if (File.Exists(path)) File.Replace(temp, path, null); else File.Move(temp, path); }
+        finally { if (File.Exists(temp)) File.Delete(temp); }
+    }
+    internal bool Enabled() { if (!File.Exists(Settings)) return false; object value; return Parse(File.ReadAllText(Settings)).TryGetValue("enabled", out value) && value is bool && (bool)value; }
+    internal void SetEnabled(bool value) { Atomic(Settings, new JavaScriptSerializer().Serialize(new { enabled = value })); }
+    internal List<HistoryEntry> Load(out string errors, out long bytes) {
+        var result = new List<HistoryEntry>(); var failures = new List<string>(); bytes = 0;
+        foreach (string kind in new[] { "dictation-history", "voice-samples" }) {
+            string folder = Path.Combine(Root, kind); if (!Directory.Exists(folder)) continue;
+            foreach (string item in Directory.GetFiles(folder)) { try { bytes += new FileInfo(item).Length; } catch (IOException) { } }
+            foreach (string file in Directory.GetFiles(folder, "*.json")) try {
+                if (new FileInfo(file).Length > 131072) throw new IOException("索引过大");
+                string original = File.ReadAllText(file); var entry = new HistoryEntry { FileName = file, Original = original, Kind = kind, Data = Parse(original) };
+                Guid id; DateTime created;
+                if (!Guid.TryParseExact(entry.Text("id"), "N", out id) || Path.GetFileNameWithoutExtension(file) != entry.Text("id") || entry.Text("wav") != entry.Text("id") + ".wav" ||
+                    entry.Text("state") != "collected" || entry.Text("sampleRate") != "16000" || entry.Text("channels") != "1" || entry.Text("bitsPerSample") != "16" ||
+                    !DateTime.TryParse(entry.Text("createdUtc"), out created) || entry.Text("correctText").Length > (kind == "voice-samples" ? 2000 : 10000) ||
+                    double.IsNaN(entry.Seconds) || entry.Seconds <= 0 || entry.Seconds > 180) throw new IOException("索引或音频路径无效");
+                if (!File.Exists(entry.Audio)) throw new IOException("原音缺失");
+                if (entry.Flag("selectedForTraining") && (!entry.Flag("reviewed") || entry.Flag("ignored") || string.IsNullOrWhiteSpace(entry.Text("correctText")))) throw new IOException("训练选择缺少已核对的完整文字");
+                result.Add(entry);
+            } catch (Exception error) { failures.Add(Path.GetFileName(file) + "：" + error.Message); }
+        }
+        result.Sort((a, b) => string.CompareOrdinal(b.Text("createdUtc"), a.Text("createdUtc")));
+        errors = string.Join("\n", failures.ToArray()); return result;
+    }
+    internal void Save(HistoryEntry entry, string correct, bool selected, bool ignored) {
+        if (string.IsNullOrWhiteSpace(correct) || correct.Length > (entry.Kind == "voice-samples" ? 2000 : 10000)) throw new IOException("请填写这段原音实际说出的完整文字；补录最多 2000 字，听写记录最多 10000 字");
+        if (File.ReadAllText(entry.FileName) != entry.Original) throw new IOException("记录已被其他窗口修改，请刷新后重试");
+        var data = Parse(entry.Original); data["correctText"] = correct.Trim(); data["reviewed"] = true;
+        data["selectedForTraining"] = selected && !ignored; data["ignored"] = ignored; data["updatedUtc"] = DateTime.UtcNow.ToString("o");
+        Write(entry, data);
+    }
+    internal void Write(HistoryEntry entry, Dictionary<string, object> data) {
+        if (File.ReadAllText(entry.FileName) != entry.Original) throw new IOException("记录已被其他窗口修改，请刷新后重试");
+        string text = new JavaScriptSerializer().Serialize(data); Atomic(entry.FileName, text); entry.Data = data; entry.Original = text;
+    }
+    internal void ChangeState(HistoryEntry entry, string action) {
+        var data = Parse(entry.Original);
+        if (action == "select" && (!entry.Flag("reviewed") || entry.Flag("ignored") || string.IsNullOrWhiteSpace(entry.Text("correctText"))))
+            throw new IOException("请先试听并保存正确文字，再留作训练");
+        if (action == "pending") { data["reviewed"] = false; data["ignored"] = false; }
+        else if (action == "ignore") data["ignored"] = true;
+        else if (action != "select" && action != "unselect") throw new IOException("未知录音操作");
+        data["selectedForTraining"] = action == "select"; data["updatedUtc"] = DateTime.UtcNow.ToString("o"); Write(entry, data);
+    }
+    internal void Remove(HistoryEntry entry) {
+        if (File.ReadAllText(entry.FileName) != entry.Original) throw new IOException("记录已修改，请刷新后重试");
+        File.Move(entry.FileName, entry.FileName + ".deleted");
+    }
+    internal void ValidatePermanentRemoval(HistoryEntry entry) {
+        string folder = Path.GetFullPath(Path.Combine(Root, entry.Kind)); Guid id;
+        if ((entry.Kind != "voice-samples" && entry.Kind != "dictation-history") || !Guid.TryParseExact(entry.Text("id"), "N", out id) ||
+            !string.Equals(Path.GetDirectoryName(Path.GetFullPath(entry.FileName)), folder, StringComparison.OrdinalIgnoreCase) || Path.GetFileName(entry.FileName) != entry.Text("id") + ".json" || entry.Text("wav") != entry.Text("id") + ".wav") throw new IOException("删除路径不属于此录音，未处理");
+        if (File.ReadAllText(entry.FileName) != entry.Original) throw new IOException("记录已被外部修改，请刷新后再删除");
+    }
+    internal void PermanentlyRemove(HistoryEntry entry) {
+        ValidatePermanentRemoval(entry);
+        File.Delete(entry.Audio);
+        File.Delete(entry.FileName);
+    }
+    internal static string ArchiveState(string folder, out string original) {
+        string path = Path.Combine(folder, "lifecycle.json"); original = File.Exists(path) ? File.ReadAllText(path) : null;
+        if (original == null) return "archived";
+        var data = Parse(original); string state = data.ContainsKey("status") ? Convert.ToString(data["status"]) : "";
+        if (!data.ContainsKey("schemaVersion") || Convert.ToInt32(data["schemaVersion"]) != 1 || (state != "archived" && state != "withdrawn")) throw new IOException("批次状态记录无效，未覆盖");
+        return state;
+    }
+    internal void SetArchiveState(string folder, string expected, bool withdraw) {
+        string resolved = Path.GetFullPath(folder), parent = Path.GetFullPath(Path.Combine(Root, "training-batches"));
+        if (!string.Equals(Path.GetDirectoryName(resolved), parent, StringComparison.OrdinalIgnoreCase) || !File.Exists(Path.Combine(resolved, "manifest.json"))) throw new IOException("批次路径不属于当前归档");
+        string current; string before = ArchiveState(resolved, out current);
+        if (current != expected || before == (withdraw ? "withdrawn" : "archived")) throw new IOException("批次状态已变化，请刷新后重试");
+        var data = current == null ? new Dictionary<string, object>() : Parse(current);
+        var history = data.ContainsKey("history") ? new List<object>((object[])data["history"]) : new List<object>();
+        string after = withdraw ? "withdrawn" : "archived", now = DateTime.UtcNow.ToString("o");
+        history.Add(new { from = before, to = after, createdUtc = now });
+        data["schemaVersion"] = 1; data["status"] = after; data["updatedUtc"] = now; data["history"] = history;
+        Atomic(Path.Combine(resolved, "lifecycle.json"), new JavaScriptSerializer().Serialize(data));
+    }
+    internal static void ValidateAudio(HistoryEntry entry) {
+        using (var reader = new BinaryReader(File.OpenRead(entry.Audio))) {
+            if (reader.BaseStream.Length != 44 + (long)Math.Round(entry.Seconds * 16000) * 2 ||
+                Encoding.ASCII.GetString(reader.ReadBytes(4)) != "RIFF") throw new IOException("录音长度或格式异常");
+            reader.BaseStream.Position = 8;
+            if (Encoding.ASCII.GetString(reader.ReadBytes(8)) != "WAVEfmt " || reader.ReadInt32() != 16 || reader.ReadInt16() != 1 || reader.ReadInt16() != 1 || reader.ReadInt32() != 16000 || reader.ReadInt32() != 32000 || reader.ReadInt16() != 2 || reader.ReadInt16() != 16 || Encoding.ASCII.GetString(reader.ReadBytes(4)) != "data" || reader.ReadInt32() != reader.BaseStream.Length - 44)
+                throw new IOException("需要完整的 16kHz 单声道 PCM16 录音");
+        }
+    }
+    internal string Export(List<HistoryEntry> confirmed = null, string name = null) {
+        name = string.IsNullOrWhiteSpace(name) ? "批次 " + DateTime.Now.ToString("MM-dd HH:mm") : name.Trim();
+        if (name.Length > 80 || Array.Exists(name.ToCharArray(), char.IsControl)) throw new IOException("批次名称限80字，不能含换行或控制字符");
+        string errors; long bytes; var entries = Load(out errors, out bytes);
+        if (errors.Length > 0) throw new IOException("有损坏记录，请先检查，未导出不完整批次：\n" + errors);
+        var chosen = entries.FindAll(item => item.Flag("selectedForTraining") && !item.Flag("ignored") && (confirmed == null || confirmed.Exists(value => value.FileName == item.FileName)));
+        if (confirmed != null && (chosen.Count != confirmed.Count || chosen.Exists(item => confirmed.Find(value => value.FileName == item.FileName).Original != item.Original))) throw new IOException("本批录音或文字已变化，请刷新后重新确认");
+        if (chosen.Count == 0) throw new IOException("请先试听、核对并勾选留作训练");
+        string target = Path.Combine(Root, "training-batches", DateTime.Now.ToString("yyyyMMdd-HHmmss") + "-" + Guid.NewGuid().ToString("N"));
+        string staging = target + ".partial"; Directory.CreateDirectory(Path.Combine(staging, "audio"));
+        var samples = new List<object>(); var lines = new List<string>();
+        foreach (var entry in chosen) {
+            ValidateAudio(entry); string filename = entry.Kind + "-" + entry.Text("wav");
+            string copied = Path.Combine(staging, "audio", filename); File.Copy(entry.Audio, copied);
+            string hash; using (var sha = System.Security.Cryptography.SHA256.Create()) using (var stream = File.OpenRead(copied)) hash = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+            samples.Add(new { sourceKind = entry.Kind, sourceId = entry.Text("id"), audio = "audio/" + filename, sha256 = hash, metadata = Parse(entry.Original) });
+            lines.Add(new JavaScriptSerializer().Serialize(new { sourceKind = entry.Kind, sourceId = entry.Text("id"), audio = "audio/" + filename, sha256 = hash,
+                promptText = entry.Text("promptText"), spokenText = entry.Text("correctText"), recognizedText = entry.Text("text"), rawRecognition = entry.Text("rawText"), firstDraft = entry.Text("firstText"), correctText = entry.Text("correctText"),
+                roundId = entry.Text("roundId"), sourceGroup = entry.Text("roundId").Length > 0 ? entry.Text("roundId") : "manual-date:" + entry.Text("createdUtc").Substring(0, 10),
+                createdUtc = entry.Text("createdUtc"), durationSeconds = entry.Seconds, model = entry.Text("model"), reviewed = true, split = "unassigned" }));
+        }
+        File.WriteAllText(Path.Combine(staging, "manifest.json"), new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Serialize(new {
+            schemaVersion = 2, name = name, status = "prepared_not_trained", createdUtc = DateTime.UtcNow.ToString("o"), split = "unassigned_keep_rounds_together", samples = samples
+        }), new UTF8Encoding(false));
+        File.WriteAllLines(Path.Combine(staging, "samples.jsonl"), lines.ToArray(), new UTF8Encoding(false));
+        File.WriteAllText(Path.Combine(staging, "下一步.txt"), "本批次只准备材料，尚未训练。\r\n先检查 lifecycle.json：status=withdrawn 表示已撤回，暂停使用；archived 或没有此文件表示有效归档。\r\n撤回和恢复只改状态，不改原音或清单快照。\r\n\r\n批次位置：" + target + "\r\n清单：manifest.json；原音：audio/。\r\n\r\n1. 保留本批次不改；后续改字请另建批次。\r\n2. 在隔离训练环境导入 samples[].metadata.correctText 与音频，按原录音轮次分训练/开发/验收，不按切片随机分组。\r\n3. 以当前生产 R5 INT8 为对照，单独训练候选、导出 INT8，比较中文、英文、混说及速度和内存。\r\n4. 另录新会话验收；检查救援和词典替换前的裸识别，避免把替换成功当成模型学会。\r\n5. 用户验证通过后，由agent完成通用回归、正式启用与R5回滚准备；未通过继续用现模型。\r\n\r\n可向 Codex 提出：请读取此批次 manifest.json，先核验音频与完整标签、按轮次去重分组和估算训练空间，给出隔离训练及验收方案。不要覆盖日用模型，不要把本批次直接当最终验收集。需要移动固态空间时先确认。\r\n\r\n应用只负责记录、批次归档和人工验证。训练由agent执行；训练完成后用 app/training_review.py register 登记候选、来源归档和报告，用户在「验证」录新音对照后通过或打回。通过只代表个人复测通过，agent还需完成通用回归、INT8速度/内存、生产启用与回滚校验。启用后用 deployed 命令核对生产哈希并记录。详见 docs/训练交接与验证协议.md。", new UTF8Encoding(false));
+        Directory.Move(staging, target); return target;
+    }
+}
+
+sealed class TrainingReviewPanel : Panel
+{
+    readonly string root, programRoot;
+    readonly ComboBox versions = new ComboBox();
+    readonly HashSet<string> checkedCases = new HashSet<string>();
+    bool multi;
+    Button versionPicker, multiButton, allButton, clearButton, inspectButton;
+    readonly Label selectedCount = new DictionaryLabel();
+    readonly DictionaryListBox cases = new DictionaryListBox();
+    readonly DictionaryTextBox details = new DictionaryTextBox();
+    readonly TextBox note = new TextBox();
+    readonly Label notice;
+    readonly Button captureButton, retryButton, rejectButton, passButton;
+    internal readonly Label Summary = new DictionaryLabel();
+    internal readonly List<Button> Footer = new List<Button>();
+    readonly List<Dictionary<string, object>> runs = new List<Dictionary<string, object>>();
+    readonly DictionaryScrollBar casesScroll;
+    internal bool busy;
+    bool silent;
+    Process child;
+    SampleCaptureDialog capture;
+    internal Func<Task> PrepareRecording;
+    internal Action<List<Dictionary<string, object>>> RunsChanged;
+    internal string SelectedRunId = "";
+    internal bool RecordingBusy { get { return capture != null && !capture.IsDisposed && capture.RecordingBusy; } }
+    static string TextOf(Dictionary<string, object> data, string key) { object value; return data != null && data.TryGetValue(key, out value) ? Convert.ToString(value) : ""; }
+    static object[] ArrayOf(Dictionary<string, object> data, string key) { object value; return data != null && data.TryGetValue(key, out value) && value is object[] ? (object[])value : new object[0]; }
+    Dictionary<string, object> Current { get { return versions.SelectedIndex >= 0 && versions.SelectedIndex < runs.Count ? runs[versions.SelectedIndex] : null; } }
+    internal TrainingReviewPanel(string root, Label notice) {
+        this.root = root; this.notice = notice; DoubleBuffered = true; programRoot = Path.GetDirectoryName(Application.StartupPath); Size = new Size(574, 396); BackColor = Color.FromArgb(251, 250, 248); Font = new Font(HistoryCard.TextFamily, 11f);
+        Summary.Bounds = new Rectangle(314, 48, 554, 26); Summary.Font = new Font(Font.FontFamily, 10f); Summary.ForeColor = Color.FromArgb(96, 100, 107);
+        Controls.Add(Caption("候选版本", 10, 0, 78, 36));
+        versionPicker = new DictionaryButton { Bounds = new Rectangle(96, 0, 468, 36), Font = Font, BackColor = BackColor, TextAlign = ContentAlignment.MiddleLeft, Outlined = true, AccessibleName = "选择候选版本" };
+        versionPicker.Click += (o, e) => { var menu = new HistoryMenu(); for (int i = 0; i < runs.Count; i++) { int index = i; menu.Items.Add(TextOf(runs[i], "name") + " · " + TextOf(runs[i], "displayStatus"), null, (sender, args) => versions.SelectedIndex = index); } if (runs.Count == 0) menu.Items.Add("暂无候选").Enabled = false; menu.Closed += (sender, args) => { if (IsDisposed || !IsHandleCreated) menu.Dispose(); else try { BeginInvoke(new Action(() => menu.Dispose())); } catch (InvalidOperationException) { menu.Dispose(); } }; menu.Show(versionPicker, new Point(0, versionPicker.Height)); }; Controls.Add(versionPicker);
+        versions.Font = Font; versions.DropDownStyle = ComboBoxStyle.DropDownList;
+        multiButton = Toolbar("多选", 10, 88, () => { multi = !multi; checkedCases.Clear(); cases.Invalidate(); UpdateActions(); });
+        allButton = Toolbar("全选", 106, 72, () => { foreach (Dictionary<string, object> item in cases.Items) checkedCases.Add(TextOf(item, "id")); cases.Invalidate(); UpdateActions(); });
+        clearButton = Toolbar("清空", 186, 72, () => { checkedCases.Clear(); cases.Invalidate(); UpdateActions(); });
+        inspectButton = Toolbar("查看对照", 452, 112, ShowDetail);
+        selectedCount.Bounds = new Rectangle(270, 50, 174, 28); selectedCount.Font = Font; selectedCount.ForeColor = Color.FromArgb(96, 100, 107); Controls.Add(selectedCount);
+        versions.SelectedIndexChanged += (o, e) => { if (!silent) { checkedCases.Clear(); multi = false; SelectedRunId = TextOf(Current, "id"); ShowCases(); } };
+        cases.Bounds = new Rectangle(10, 88, 538, 88); cases.DrawMode = DrawMode.OwnerDrawFixed; cases.ItemHeight = 56; cases.CardFeedback = true; cases.IntegralHeight = false; cases.BorderStyle = BorderStyle.None; cases.BackColor = HistoryCard.Canvas; cases.AccessibleName = "独立新录音复测列表"; Controls.Add(cases);
+        cases.DrawItem += (o, e) => { if (e.Index < 0) return; var item = (Dictionary<string, object>)cases.Items[e.Index]; e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+            HistoryCard.Draw(e.Graphics, e.Bounds, e.Index + 1, Font, (e.State & DrawItemState.Selected) != 0, multi && checkedCases.Contains(TextOf(item, "id")), cases.HoverIndex == e.Index, cases.PressedIndex == e.Index, cases.Focused && cases.SelectedIndex == e.Index);
+            int inset = multi ? 42 : 12;
+            if (multi) HistoryCard.Check(e.Graphics, new Rectangle(e.Bounds.X + 12, e.Bounds.Y + 17, 18, 18), checkedCases.Contains(TextOf(item, "id")), cases.HoverIndex == e.Index, cases.PressedIndex == e.Index, cases.Focused && cases.SelectedIndex == e.Index, true);
+            using (var brush = new SolidBrush(Color.FromArgb(20, 25, 31))) using (var format = new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap }) e.Graphics.DrawString(TextOf(item, "correctText"), Font, brush, new Rectangle(e.Bounds.X + inset, e.Bounds.Y + 6, e.Bounds.Width - inset - 12, 24), format);
+            using (var font = new Font(Font.FontFamily, 9.5f)) HistoryStatusTag.Draw(e.Graphics, TextOf(item, "status") == "evaluated" ? "已对照" : "待识别", font, new Point(e.Bounds.X + inset, e.Bounds.Y + 27)); };
+        cases.SelectedIndexChanged += (o, e) => UpdateActions();
+        cases.MouseClick += (o, e) => { int index = cases.IndexFromPoint(e.Location); if (multi && e.Button == MouseButtons.Left && index >= 0 && HistoryCard.Bounds(cases.GetItemRectangle(index)).Contains(e.Location)) ToggleCase(index); };
+        cases.MouseDoubleClick += (o, e) => { if (!multi && e.Button == MouseButtons.Left && cases.IndexFromPoint(e.Location) >= 0 && HistoryCard.Bounds(cases.GetItemRectangle(cases.IndexFromPoint(e.Location))).Contains(e.Location)) ShowDetail(); };
+        cases.KeyDown += (o, e) => { if (multi && e.KeyCode == Keys.Space && cases.SelectedIndex >= 0) { ToggleCase(cases.SelectedIndex); e.Handled = e.SuppressKeyPress = true; } else if (!multi && e.KeyCode == Keys.Enter) { ShowDetail(); e.Handled = e.SuppressKeyPress = true; } };
+        casesScroll = new DictionaryScrollBar(() => cases.Items.Count, () => Math.Max(1, cases.Height / cases.ItemHeight), () => cases.TopIndex, value => { if (cases.Items.Count > 0) cases.TopIndex = value; }); casesScroll.Bounds = new Rectangle(552, 88, 12, 88); casesScroll.BackColor = BackColor; casesScroll.CardTrack = true; casesScroll.TabStop = false; Controls.Add(casesScroll);
+        cases.ViewChanged = () => { casesScroll.TabStop = casesScroll.Overflows; casesScroll.Invalidate(); };
+        Controls.Add(Caption("识别对照（只读）", 10, 184, 554, 26));
+        var field = new DictionaryField { Bounds = new Rectangle(10, 212, 554, 80) }; details.Bounds = new Rectangle(12, 8, 514, 64); details.Multiline = true; details.ReadOnly = true; details.BorderStyle = BorderStyle.None; details.Font = new Font(Font.FontFamily, 11f); details.BackColor = Color.FromArgb(246, 245, 243); details.AccessibleName = "本条新录音的原模型与候选结果及正确文字"; field.Controls.Add(details); Controls.Add(field);
+        var textScroll = new DictionaryScrollBar(() => (int)DictionaryScrollBar.SendMessage(details.Handle, 0x00BA, IntPtr.Zero, IntPtr.Zero), () => Math.Max(1, details.Height / details.Font.Height), () => (int)DictionaryScrollBar.SendMessage(details.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero), value => { int top = (int)DictionaryScrollBar.SendMessage(details.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero); DictionaryScrollBar.SendMessage(details.Handle, 0x00B6, IntPtr.Zero, new IntPtr(value - top)); });
+        textScroll.Bounds = new Rectangle(534, 8, 12, 64); textScroll.BackColor = details.BackColor; textScroll.TabStop = false; field.Controls.Add(textScroll); details.ViewChanged = () => { textScroll.TabStop = textScroll.Overflows; textScroll.Invalidate(); };
+        Controls.Add(Caption("备注（打回时必填）", 10, 300, 554, 26));
+        var noteField = new DictionaryField { Bounds = new Rectangle(10, 328, 554, 36) }; note.Bounds = new Rectangle(12, 6, 530, 24); note.BorderStyle = BorderStyle.None; note.Font = Font; note.BackColor = details.BackColor; note.MaxLength = 2000; note.AccessibleName = "验证备注，打回必须填写原因"; noteField.Controls.Add(note); Controls.Add(noteField);
+        captureButton = ActionButton("录新音", 314, 124, async () => await RecordCase()); retryButton = ActionButton("重试识别", 450, 124, async () => await RetryCases()); rejectButton = ActionButton("打回", 586, 124, async () => await Decide("rejected")); passButton = ActionButton("通过", 746, 124, async () => await Decide("passed")); ((DictionaryButton)passButton).Primary = true;
+        rejectButton.ForeColor = Color.FromArgb(166, 48, 43); ShowCases();
+    }
+    Button Toolbar(string text, int x, int width, Action action) { var button = new DictionaryButton { Text = text, Bounds = new Rectangle(x, 48, width, 32), Font = Font, Outlined = true, BackColor = BackColor }; button.Click += (o, e) => action(); Controls.Add(button); return button; }
+    void ToggleCase(int index) { string id = TextOf((Dictionary<string, object>)cases.Items[index], "id"); if (!checkedCases.Remove(id)) checkedCases.Add(id); cases.Invalidate(cases.GetItemRectangle(index)); UpdateActions(); }
+    async Task RetryCases() { if (Current != null && (TextOf(Current, "status") == "passed" || TextOf(Current, "status") == "rejected")) { await Act("reopen", null); return; } if (multi) { if (checkedCases.Count == 0) return; await Act("evaluate", new Dictionary<string, object> { { "caseIds", new List<string>(checkedCases).ToArray() } }); } else await Act("evaluate", null); }
+    Label Caption(string text, int x, int y, int width, int height) { return new DictionaryLabel { Text = text, Bounds = new Rectangle(x, y, width, height), Font = new Font(Font.FontFamily, 10f), ForeColor = Color.FromArgb(96, 100, 107) }; }
+    Button ActionButton(string text, int x, int width, Action click) { var button = new DictionaryButton { Text = text, Bounds = new Rectangle(x, 506, width, 52), Font = new Font(Font.FontFamily, 12f), BackColor = BackColor, ForeColor = Color.FromArgb(20, 25, 31), AccessibleName = text }; button.Click += (o, e) => click(); Footer.Add(button); return button; }
+    internal void StopCapture() { if (capture != null && !capture.IsDisposed) capture.StopSampleRecording(); }
+    internal bool ResolveCapture() { if (capture != null && !capture.IsDisposed && capture.Visible) { capture.Close(); return !capture.Visible; } return true; }
+    async Task<Dictionary<string, object>> Execute(Dictionary<string, object> request) {
+        request["root"] = root;
+        var info = new ProcessStartInfo(Path.Combine(programRoot, ".venv", "Scripts", "python.exe"), "\"" + Path.Combine(programRoot, "app", "training_review.py") + "\" --request") { WorkingDirectory = programRoot, UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8 };
+        using (var process = new Process { StartInfo = info }) {
+            child = process; process.Start(); var output = process.StandardOutput.ReadToEndAsync(); var errors = process.StandardError.ReadToEndAsync();
+            using (var input = new StreamWriter(process.StandardInput.BaseStream, new UTF8Encoding(false))) await input.WriteAsync(new JavaScriptSerializer().Serialize(request));
+            var reading = Task.WhenAll(output, errors); if (await Task.WhenAny(reading, Task.Delay(180000)) != reading) { if (!process.HasExited) process.Kill(); throw new IOException("复测超过等待时间，原音已保留，可重试识别"); }
+            await reading; var response = HistoryStore.Parse(await output); object ok; if (!response.TryGetValue("ok", out ok) || !(ok is bool) || !(bool)ok) throw new IOException(TextOf(response, "error"));
+            child = null; return response;
+        }
+    }
+    void Apply(Dictionary<string, object> response) {
+        if (IsDisposed) return; string selected = SelectedRunId; runs.Clear(); foreach (object item in ArrayOf(response, "runs")) runs.Add((Dictionary<string, object>)item);
+        silent = true; versions.Items.Clear(); foreach (var run in runs) versions.Items.Add(TextOf(run, "name") + " · " + TextOf(run, "displayStatus"));
+        versions.SelectedIndex = Math.Max(-1, runs.FindIndex(item => TextOf(item, "id") == selected)); if (versions.SelectedIndex < 0 && runs.Count > 0) versions.SelectedIndex = 0; silent = false; SelectedRunId = TextOf(Current, "id"); ShowCases();
+        if (ArrayOf(response, "errors").Length > 0) notice.Text = "部分验证记录读取失败：" + string.Join("；", Array.ConvertAll(ArrayOf(response, "errors"), Convert.ToString));
+        if (RunsChanged != null) RunsChanged(runs);
+    }
+    internal async Task Reload() { if (busy || IsDisposed) return; busy = true; UpdateActions(); try { Apply(await Execute(new Dictionary<string, object> { { "action", "list" } })); } catch (Exception error) { if (!IsDisposed) notice.Text = "验证记录未读取：" + error.Message; } finally { busy = false; child = null; if (!IsDisposed) UpdateActions(); } }
+    async Task Act(string action, Dictionary<string, object> extra) {
+        if (busy || Current == null) return; var request = extra ?? new Dictionary<string, object>(); request["action"] = action; request["id"] = TextOf(Current, "id"); busy = true; UpdateActions(); notice.Text = action == "capture" || action == "evaluate" ? "正在对新录音运行原模型和候选对照，原音已保存…" : "正在记录验证结论…";
+        string failure = null, draftNote = note.Text;
+        try { Apply(await Execute(request)); if (!IsDisposed) notice.Text = action == "reopen" ? "已撤回结论，返回待复测；原音、对照与历次结论保留。" : action == "decide" ? "验证结论已保存。通过后交给agent校验、启用并准备回滚。" : "识别对照已完成，请核对新录音和正确全文。"; }
+        catch (Exception error) { failure = error.Message; }
+        if (failure != null && !IsDisposed) { try { Apply(await Execute(new Dictionary<string, object> { { "action", "list" } })); } catch { } if (!IsDisposed) { note.Text = draftNote; notice.Text = "操作未完成，原音保留：" + failure; } }
+        busy = false; child = null; if (!IsDisposed) UpdateActions();
+    }
+
+    async Task RecordCase() {
+        if (busy || Current == null) return;
+        using (var dialog = new SampleCaptureDialog(Path.Combine(root, "user-data", "training-review", "captures", Guid.NewGuid().ToString("N")))) {
+            capture = dialog; dialog.PrepareRecording = PrepareRecording;
+            try { dialog.ShowDialog(FindForm()); if (dialog.SavedSample != null) await Act("capture", new Dictionary<string, object> { { "audio", dialog.SavedAudioPath }, { "correctText", dialog.SavedSample.correctText } }); }
+            finally { capture = null; }
+        }
+    }
+    async Task Decide(string decision) {
+        if (decision == "rejected" && string.IsNullOrWhiteSpace(note.Text)) { notice.Text = "请填写打回原因，方便agent重新训练。"; note.Focus(); return; }
+        if (MessageBox.Show(FindForm(), decision == "passed" ? "确认已逐条核对本版本的新录音复测？\n这里只记录个人验证通过，正式启用仍由agent完成通用回归和回滚准备。" : "将此版本打回，保留原音和失败原因，由agent重新训练新版本。", "验证结论", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+        await Act("decide", new Dictionary<string, object> { { "decision", decision }, { "note", note.Text } });
+    }
+    void ShowCases() {
+        cases.Items.Clear(); var run = Current; foreach (object item in ArrayOf(run, "cases")) cases.Items.Add((Dictionary<string, object>)item); if (cases.Items.Count > 0) cases.SelectedIndex = cases.Items.Count - 1;
+        versionPicker.Text = run == null ? "暂无候选" : TextOf(run, "name") + " · " + TextOf(run, "displayStatus"); versionPicker.AccessibleName = "候选版本：" + versionPicker.Text;
+        checkedCases.RemoveWhere(id => !Array.Exists(ArrayOf(run, "cases"), value => TextOf((Dictionary<string, object>)value, "id") == id));
+        Summary.Text = run == null ? "等待agent登记训练后的候选版本" : TextOf(run, "displayStatus") + " · " + cases.Items.Count + " 条独立新录音";
+        var decision = run != null && run.ContainsKey("decision") ? run["decision"] as Dictionary<string, object> : null; note.Text = TextOf(decision, "note"); note.ReadOnly = run == null || TextOf(run, "status") != "awaiting_retest"; ShowDetail(); UpdateActions();
+    }
+    void ShowDetail() {
+        var item = cases.SelectedItem as Dictionary<string, object>;
+        details.Text = item == null ? (Current == null ? "训练由agent完成后登记候选、来源批次和训练报告。\r\n登记后在这里录新音，对照结果，再通过或打回。" : "请录制登记训练完成之后的新句子；训练原音不能用作复测。") : "原模型：" + TextOf(item, "baselineText") + "\r\n候选：" + TextOf(item, "candidateText") + "\r\n正确全文：" + TextOf(item, "correctText");
+    }
+    void UpdateActions() {
+        bool held = Current != null && Current.ContainsKey("sourceWithdrawn") && Current["sourceWithdrawn"] is bool && (bool)Current["sourceWithdrawn"];
+        bool pending = !busy && !held && Current != null && TextOf(Current, "status") == "awaiting_retest";
+        versions.Enabled = !busy; versionPicker.Enabled = !busy && runs.Count > 0; multiButton.Enabled = !busy && cases.Items.Count > 0; multiButton.Text = multi ? "完成" : "多选"; allButton.Visible = clearButton.Visible = multi; allButton.Enabled = clearButton.Enabled = !busy && cases.Items.Count > 0; inspectButton.Visible = !multi; inspectButton.Enabled = !busy && cases.SelectedIndex >= 0; selectedCount.Text = multi ? "已选 " + checkedCases.Count + " 条" : ""; captureButton.Enabled = !busy && !held && !multi && Current != null && (pending || TextOf(Current, "status") == "passed"); rejectButton.Enabled = pending && !multi;
+        bool evaluated = cases.Items.Count > 0; bool unevaluated = false; foreach (Dictionary<string, object> item in cases.Items) { evaluated &= TextOf(item, "status") == "evaluated"; unevaluated |= TextOf(item, "status") != "evaluated"; }
+        bool selectedPending = false; foreach (Dictionary<string, object> item in cases.Items) if (checkedCases.Contains(TextOf(item, "id")) && TextOf(item, "status") != "evaluated") selectedPending = true;
+        bool canReopen = !busy && !multi && Current != null && (TextOf(Current, "status") == "passed" || TextOf(Current, "status") == "rejected");
+        passButton.Enabled = pending && evaluated && !multi; retryButton.Text = canReopen ? "撤回结论" : multi ? "重试所选" : "重试识别"; retryButton.Enabled = canReopen || (pending && (multi ? selectedPending : unevaluated));
+    }
+    internal void CheckForTest(string work, string source, string archive) {
+        Action<bool, string> check = (ok, message) => { if (!ok) throw new Exception("REVIEW-TEST: " + message); };
+        check(Top + 328 + 36 <= notice.Top, "verification note stays above feedback area");
+        check(versions.Items.Count == 0 && !captureButton.Enabled && !passButton.Enabled, "no candidate means no false verification actions");
+        string id = Guid.NewGuid().ToString("N");
+        var response = HistoryStore.Parse(new JavaScriptSerializer().Serialize(new { runs = new[] { new { id = id, name = "个人微调 · 测试版本", status = "awaiting_retest", displayStatus = "待复测", archives = new[] { new { path = archive, sources = new[] { source } } }, cases = new[] { new { id = "test-case", correctText = "今天不用 Codex，先跑测试。", baselineText = "今天不用扣desks，先跑测试。", candidateText = "今天不用 Codex，先跑测试。", status = "evaluated", durationSeconds = 1.0 } } } }, errors = new string[0] }));
+        Apply(response); check(passButton.Enabled && captureButton.Enabled && details.Text.Contains("原模型") && details.Text.Contains("正确全文"), "fresh comparison and explicit pass affordance");
+        note.Clear(); rejectButton.PerformClick(); check(notice.Text.Contains("填写打回原因"), "reject requires an actionable reason");
+        var form = FindForm(); using (var bitmap = new Bitmap(form.Width, form.Height)) { form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-verification.png")); }
+        var item = (Dictionary<string, object>)cases.Items[0]; item["status"] = "pending"; UpdateActions(); check(!passButton.Enabled && retryButton.Enabled, "pending recognition blocks approval and exposes retry");
+        var second = new Dictionary<string, object>(item); second["id"] = "test-case-2"; second["correctText"] = "另一个新句子"; second["status"] = "evaluated"; cases.Items.Add(second);
+        string previousDetail = details.Text; cases.SelectedIndex = 1; check(details.Text == previousDetail, "single selection does not change opened comparison"); inspectButton.PerformClick(); check(details.Text.Contains("另一个新句子"), "explicit inspection opens selected comparison");
+        multiButton.PerformClick(); allButton.PerformClick(); check(checkedCases.Count == 2 && !passButton.Enabled && !rejectButton.Enabled && retryButton.Enabled, "verification multi-select retries pending cases without bulk approval");
+        clearButton.PerformClick(); check(checkedCases.Count == 0 && !retryButton.Enabled, "empty verification selection disables retry"); ToggleCase(0); check(retryButton.Enabled && checkedCases.SetEquals(new[] { "test-case" }), "whole-card selection determines retry scope");
+        using (var bitmap = new Bitmap(form.Width, form.Height)) { form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-verification-batch.png")); }
+        multiButton.PerformClick();
+        foreach (object value in ArrayOf(Current, "cases")) ((Dictionary<string, object>)value)["status"] = "evaluated";
+        Current["status"] = "passed"; Current["displayStatus"] = "验证通过"; Current["decision"] = new Dictionary<string, object> { { "note", "原验证结论保留" } }; ShowCases();
+        check(retryButton.Enabled && retryButton.Text == "撤回结论" && note.ReadOnly && note.Text.Contains("原验证结论"), "passed conclusion has a reversible action and retains its note");
+        using (var bitmap = new Bitmap(form.Width, form.Height)) { form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-verification-reopen.png")); }
+        Current["status"] = "rejected"; ShowCases(); check(retryButton.Enabled && retryButton.Text == "撤回结论", "rejected conclusion can also return to pending");
+        Current["status"] = "awaiting_retest"; Current["sourceWithdrawn"] = true; ShowCases(); check(!passButton.Enabled && !captureButton.Enabled && !retryButton.Enabled, "withdrawn source prevents verification advancement");
+        Apply(HistoryStore.Parse("{\"runs\":[],\"errors\":[]}"));
+        Console.WriteLine("REVIEW-TEST PASS: reversible conclusions and withdrawn-source guard / scoped multi-select retry / explicit inspection / candidate gating / fresh before-after display / explicit approval / rejection reason / failed recognition retry / offscreen layout");
+    }
+    protected override void Dispose(bool disposing) { if (disposing) { versions.Dispose(); if (capture != null && !capture.IsDisposed) capture.Dispose(); if (child != null) try { if (!child.HasExited) child.Kill(); } catch (InvalidOperationException) { } } base.Dispose(disposing); }
+}
+
+sealed class HistoryPanel : Panel
+{
+    static readonly Color Face = Color.FromArgb(251, 250, 248), Field = Color.FromArgb(246, 245, 243), Ink = Color.FromArgb(20, 25, 31), Dim = Color.FromArgb(96, 100, 107);
+    readonly HistoryStore store;
+    readonly CheckBox enabled = new DictionaryCheckBox(), selected = new DictionaryCheckBox();
+    readonly DictionaryListBox rows = new DictionaryListBox();
+    readonly TextBox search = new TextBox();
+    readonly DictionaryTextBox original = new DictionaryTextBox(), correct = new DictionaryTextBox();
+    readonly ComboBox filter = new ComboBox(), stage = new ComboBox();
+    readonly Label summary = new DictionaryLabel(), notice = new DictionaryLabel(), empty = new DictionaryLabel();
+    readonly System.Media.SoundPlayer player = new System.Media.SoundPlayer();
+    readonly System.Windows.Forms.Timer playback = new System.Windows.Forms.Timer { Interval = 100 };
+    readonly Stopwatch clock = new Stopwatch();
+    readonly List<HistoryEntry> entries = new List<HistoryEntry>();
+    readonly Button play, save, export;
+    Button undoButton, batchToggle, filterButton, clearSearch;
+    readonly Panel batchBar = new Panel();
+    readonly Label markedLabel = new DictionaryLabel();
+    readonly HashSet<string> marked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    sealed class Change { internal string File, Before, After; }
+    readonly List<List<Change>> undo = new List<List<Change>>();
+    bool batchMode;
+    string latestBatch = "";
+    readonly Panel libraryPage = new Panel(), editorPage = new Panel(), materialsPage = new Panel();
+    readonly DictionaryListBox materialRows = new DictionaryListBox();
+    readonly Label materialSummary = new DictionaryLabel(), editorSummary = new DictionaryLabel();
+    readonly HistoryStatusTag editorTag = new HistoryStatusTag();
+    Button libraryNav, materialsNav, reviewNav, supplement, openRecording;
+    readonly TrainingReviewPanel reviewPage;
+    readonly ComboBox batchChoice = new ComboBox();
+    readonly TextBox batchName = new TextBox();
+    readonly DictionaryField batchNameField = new DictionaryField();
+    readonly Label batchNameLabel = new DictionaryLabel();
+    Button pendingBatch, archivedBatch, batchPicker, materialAll, materialClear;
+    bool browsingArchives;
+    bool ArchiveTab { get { return browsingArchives || ArchivedView; } }
+    sealed class BatchView { internal string Path, Name, Status, Lifecycle; internal bool Withdrawn; internal List<HistoryEntry> Entries; public override string ToString() { return (Withdrawn ? "[已撤回] " : "") + Name + " · " + Entries.Count + " 条 · " + Status; } }
+    readonly List<BatchView> batches = new List<BatchView>();
+    readonly HashSet<string> archiveSelected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> archiveSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, string> trainingMarks = new Dictionary<string, string>();
+    readonly Dictionary<string, string> batchMarks = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    bool batchLoading;
+    bool ArchivedView { get { return batchChoice.SelectedIndex > 0 && batchChoice.SelectedIndex <= batches.Count; } }
+    Label pageTitle;
+    readonly DictionaryHelpIcon trainingInfo = new DictionaryHelpIcon();
+    readonly ToolTip trainingHelp = new ToolTip();
+    const string TrainingExplanation = "新建批次：点击卡片勾选这次交给agent的录音，再归档。\n已有批次：快照保留，可撤回或恢复归档。\n空格勾选；Enter回到原录音纠错。";
+    readonly List<Button> materialsFooter = new List<Button>();
+    CheckBox compare;
+    int page;
+    sealed class Visit { internal int Page, Filter, Top, MaterialTop, Stage; internal string File, Query, TopFile, MaterialTopFile, ReviewRun, BatchPath; internal bool Compare, Archives; }
+    readonly List<Visit> visits = new List<Visit>();
+    int visitIndex = -1;
+    internal Action NavigationChanged;
+    static string TopFileOf(ListBox list) { return list.Items.Count == 0 ? "" : ((HistoryEntry)list.Items[list.TopIndex]).FileName; }
+    static void RestoreTop(ListBox list, string file, int fallback) {
+        if (list.Items.Count == 0) return;
+        for (int i = 0; i < list.Items.Count; i++) if (((HistoryEntry)list.Items[i]).FileName == file) { list.TopIndex = i; return; }
+        list.TopIndex = Math.Min(fallback, list.Items.Count - 1);
+    }
+    Visit CaptureVisit() { return new Visit { Page = page, Archives = ArchiveTab, BatchPath = ArchivedView ? batches[batchChoice.SelectedIndex - 1].Path : "", ReviewRun = reviewPage == null ? "" : reviewPage.SelectedRunId, Filter = filter.SelectedIndex, Query = search.Text, Top = rows.Items.Count == 0 ? 0 : rows.TopIndex, MaterialTop = materialRows.Items.Count == 0 ? 0 : materialRows.TopIndex, TopFile = TopFileOf(rows), MaterialTopFile = TopFileOf(materialRows), File = current == null ? "" : current.FileName, Compare = compare.Checked, Stage = stage.SelectedIndex }; }
+    void UpdateVisit() { if (visitIndex >= 0) visits[visitIndex] = CaptureVisit(); }
+    void RecordVisit() {
+        var next = CaptureVisit();
+        if (visitIndex >= 0 && visits[visitIndex].Page == next.Page && visits[visitIndex].File == next.File) { visits[visitIndex] = next; }
+        else { if (visitIndex + 1 < visits.Count) visits.RemoveRange(visitIndex + 1, visits.Count - visitIndex - 1); visits.Add(next); if (visits.Count > 64) visits.RemoveAt(0); visitIndex = visits.Count - 1; }
+        if (NavigationChanged != null) NavigationChanged();
+    }
+    int VisitTarget(int direction) { for (int i = visitIndex + direction; i >= 0 && i < visits.Count; i += direction) if (visits[i].Page != 1 || entries.Exists(item => item.FileName == visits[i].File)) return i; return -1; }
+    internal bool CanGoBack { get { return VisitTarget(-1) >= 0; } }
+    internal bool CanGoForward { get { return VisitTarget(1) >= 0; } }
+    internal void GoVisit(int direction) {
+        int target = VisitTarget(direction); if (loading || target < 0 || !Resolve()) return; UpdateVisit(); Stop(); var visit = visits[target];
+        batchMode = false; marked.Clear(); UpdateMarked(); silent = true; filter.SelectedIndex = lastFilter = visit.Filter; search.Text = lastSearch = visit.Query; silent = false; Filter();
+        var entry = entries.Find(item => item.FileName == visit.File);
+        if (visit.Page == 1 && entry != null && !rows.Items.Contains(entry)) { silent = true; filter.SelectedIndex = lastFilter = 0; search.Text = lastSearch = ""; silent = false; Filter(); }
+        if (entry != null && rows.Items.Contains(entry)) { silent = true; rows.SelectedItem = entry; silent = false; ShowEntry(entry); }
+        stage.SelectedIndex = visit.Stage; compare.Checked = visit.Compare; ShowOriginal(visit.Compare);
+        RestoreTop(rows, visit.TopFile, visit.Top);
+        reviewPage.SelectedRunId = visit.ReviewRun; SetPage(visit.Page); int restoredBatch = batches.FindIndex(item => item.Path == visit.BatchPath); batchChoice.SelectedIndex = restoredBatch < 0 ? 0 : restoredBatch + 1; browsingArchives = visit.Archives; ShowBatch(); RestoreTop(materialRows, visit.MaterialTopFile, visit.MaterialTop); visitIndex = target; notice.Text = ""; if (NavigationChanged != null) NavigationChanged();
+    }
+    readonly HistoryMenu moreMenu = new HistoryMenu();
+    readonly HistoryMenu bulkMenu = new HistoryMenu();
+    readonly ToolStripMenuItem deleteMenu = new ToolStripMenuItem("删除这条");
+    Label originalLabel, correctLabel;
+    DictionaryField searchField;
+    DictionaryScrollBar rowsScroll, materialScroll;
+    HistoryEntry current;
+    bool silent, dirty, loading;
+    long usageBytes;
+    int lastFilter;
+    string lastSearch = "";
+    double playingUntil;
+    internal string RuntimeNotice = "";
+    internal Func<Task> PrepareRecording;
+    SampleCaptureDialog capture;
+    internal bool RecordingBusy { get { return (capture != null && !capture.IsDisposed && capture.RecordingBusy) || (reviewPage != null && reviewPage.RecordingBusy); } }
+    internal void StopCapture() { if (capture != null && !capture.IsDisposed) capture.StopSampleRecording(); if (reviewPage != null) reviewPage.StopCapture(); }
+    async void Supplement() {
+        if (!Resolve()) return; Stop();
+        try { using (var dialog = new SampleCaptureDialog(Path.GetDirectoryName(store.Root))) {
+            capture = dialog; dialog.PrepareRecording = PrepareRecording; dialog.ShowDialog(FindForm());
+        } } finally { capture = null; }
+        await Reload();
+    }
+    internal HistoryPanel(string root) {
+        store = new HistoryStore(root); DoubleBuffered = true; BackColor = Face; Font = new Font(HistoryCard.TextFamily, 11f); Size = new Size(878, 560);
+        reviewPage = new TrainingReviewPanel(root, notice); reviewPage.PrepareRecording = async () => { if (PrepareRecording != null) await PrepareRecording(); }; reviewPage.RunsChanged = UpdateTrainingMarks;
+        libraryNav = Button("录音", 10, 4, 248, 42, () => Navigate(0)); Controls.Add(libraryNav);
+        materialsNav = Button("训练", 10, 58, 248, 42, () => Navigate(2)); Controls.Add(materialsNav);
+        reviewNav = Button("验证", 10, 112, 248, 42, () => Navigate(3)); Controls.Add(reviewNav);
+        foreach (var nav in new[] { libraryNav, materialsNav, reviewNav }) { nav.TextAlign = ContentAlignment.MiddleLeft; nav.Font = new Font(Font.FontFamily, 15f); ((DictionaryButton)nav).Outlined = false; }
+        pageTitle = Label("录音", 314, 4, 554, 38, 20f); pageTitle.Font = new Font(Font.FontFamily, 20f, FontStyle.Bold); pageTitle.ForeColor = Ink; Controls.Add(pageTitle);
+        trainingInfo.Size = new Size(24, 24); trainingInfo.BackColor = Color.Transparent; trainingInfo.ForeColor = Dim; trainingInfo.AccessibleName = "训练说明"; trainingInfo.AccessibleDescription = TrainingExplanation;
+        using (var bitmap = new Bitmap(1, 1)) using (var graphics = Graphics.FromImage(bitmap)) { graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit; trainingInfo.Location = new Point(pageTitle.Left + (int)Math.Ceiling(graphics.MeasureString("训练", pageTitle.Font).Width) + 10, pageTitle.Top + 9); }
+        Controls.Add(trainingInfo); trainingHelp.InitialDelay = 350; trainingHelp.AutoPopDelay = 15000; trainingHelp.SetToolTip(trainingInfo, TrainingExplanation);
+        Action showTrainingHelp = () => { if (FindForm() != null && FindForm().Bounds.IntersectsWith(Screen.FromControl(this).WorkingArea)) trainingHelp.Show(TrainingExplanation, trainingInfo, 0, trainingInfo.Height + 6, 15000); };
+        trainingInfo.Enter += (o, e) => showTrainingHelp(); trainingInfo.Click += (o, e) => showTrainingHelp(); trainingInfo.Leave += (o, e) => trainingHelp.Hide(trainingInfo);
+        trainingInfo.KeyDown += (o, e) => { if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space) { showTrainingHelp(); e.Handled = e.SuppressKeyPress = true; } };
+
+        summary.Bounds = new Rectangle(314, 48, 554, 26); summary.Font = new Font(Font.FontFamily, 10f); summary.ForeColor = Dim; Controls.Add(summary);
+        undoButton = Button("撤销上次", 10, 506, 156, 52, Undo); undoButton.Enabled = false; undoButton.BackColor = Face; ((DictionaryButton)undoButton).Outlined = false; Controls.Add(undoButton);
+        foreach (var panel in new Panel[] { libraryPage, editorPage, materialsPage, reviewPage }) { panel.Bounds = new Rectangle(304, 88, 574, 396); panel.BackColor = Face; Controls.Add(panel); }
+        enabled.Bounds = new Rectangle(10, 416, 248, 36); enabled.Text = "保存听写录音"; enabled.AccessibleName = "保存录音，从下一轮听写生效"; Controls.Add(enabled);
+        enabled.CheckedChanged += (o, e) => { if (silent) return; try { store.SetEnabled(enabled.Checked); notice.Text = enabled.Checked ? "已开启，下轮听写开始保存录音。" : "已关闭，已有录音仍保留。"; }
+            catch (Exception error) { silent = true; enabled.Checked = !enabled.Checked; silent = false; notice.Text = "设置未保存：" + error.Message; } };
+        supplement = Button("补录一句", 314, 506, 156, 52, Supplement); supplement.BackColor = Face; supplement.Font = new Font(Font.FontFamily, 15f); ((DictionaryButton)supplement).Outlined = false; ((DictionaryButton)supplement).Glyph = "plus"; Controls.Add(supplement);
+        openRecording = Button("打开录音", 746, 506, 124, 52, () => Navigate(1)); ((DictionaryButton)openRecording).Primary = true; Controls.Add(openRecording);
+
+        filter.DropDownStyle = ComboBoxStyle.DropDownList; filter.Items.AddRange(new object[] { "全部录音", "待核对", "已保存", "已忽略" }); filter.SelectedIndex = 0;
+        filter.Bounds = new Rectangle(10, 0, 180, 32); filter.Font = new Font(Font.FontFamily, 11f); filter.AccessibleName = "录音列表筛选"; libraryPage.Controls.Add(filter); filter.Visible = false;
+        filter.SelectedIndexChanged += (o, e) => { if (silent) return; if (Resolve()) { lastFilter = filter.SelectedIndex; Filter(); } else { silent = true; filter.SelectedIndex = lastFilter; silent = false; } };
+        searchField = new DictionaryField { Bounds = new Rectangle(10, 0, 334, 42), Glyph = "search" };
+        search.Bounds = new Rectangle(40, 10, 278, 24); search.Font = Font; search.BackColor = Field; search.BorderStyle = BorderStyle.None; search.AccessibleName = "搜索录音文字或日期";
+        search.TextChanged += (o, e) => { if (silent) return; if (Resolve()) { lastSearch = search.Text; Filter(); } else { silent = true; search.Text = lastSearch; silent = false; } }; searchField.Controls.Add(search); libraryPage.Controls.Add(searchField);
+        clearSearch = Button("", 296, 5, 32, 32, () => { search.Clear(); search.Focus(); }); clearSearch.AccessibleName = "清空录音搜索"; clearSearch.BackColor = Field;
+        ((DictionaryButton)clearSearch).Glyph = "close"; ((DictionaryButton)clearSearch).Outlined = false; clearSearch.Visible = false; searchField.Controls.Add(clearSearch);
+        search.TextChanged += (o, e) => { bool hasQuery = search.TextLength > 0; clearSearch.Visible = hasQuery; search.Width = hasQuery ? 248 : 278; };
+        batchToggle = Button("多选", 460, 0, 104, 42, () => SetBatchMode(!batchMode)); libraryPage.Controls.Add(batchToggle);
+        filterButton = Button("筛选", 352, 0, 100, 42, () => { }); libraryPage.Controls.Add(filterButton);
+        var filterMenu = new HistoryMenu(); filterMenu.Renderer = new MicrophoneMenuRenderer(); filterMenu.ShowImageMargin = false; filterMenu.Font = Font;
+        for (int i = 0; i < filter.Items.Count; i++) { int index = i; filterMenu.Items.Add(Convert.ToString(filter.Items[i]), null, (o, e) => { filter.SelectedIndex = index; filterButton.Text = filter.SelectedIndex == 0 ? "筛选" : filter.Text; }); }
+        filterMenu.Items.Add(new ToolStripSeparator()); filterMenu.Items.Add("查看统计", null, (o, e) => MessageBox.Show(FindForm(), entries.Count + " 条录音；已核对 " + entries.FindAll(item => item.Flag("reviewed")).Count + " 条；已选材料 " + entries.FindAll(item => item.Flag("selectedForTraining")).Count + " 条。\n原始材料约 " + (usageBytes / 1048576.0).ToString("0.0") + " MiB。\n日常听写档案上限 1 GiB；补录和批次另占空间。", "录音统计")); filterMenu.Items.Add("刷新录音", null, async (o, e) => { if (Resolve()) await Reload(); }); filterMenu.Items.Add("使用说明", null, (o, e) => OpenGuide());
+        filterButton.Click += (o, e) => filterMenu.Show(filterButton, new Point(0, filterButton.Height)); filterButton.Disposed += (o, e) => filterMenu.Dispose();
+        rows.Bounds = new Rectangle(10, 56, 538, 280); rows.DrawMode = DrawMode.OwnerDrawFixed; rows.ItemHeight = 76; rows.IntegralHeight = false; rows.BorderStyle = BorderStyle.None; rows.BackColor = HistoryCard.Canvas; rows.CardFeedback = true;
+        rows.AccessibleName = "录音列表，单击选中，双击或Enter打开，多选时点击整卡勾选"; libraryPage.Controls.Add(rows); rows.DrawItem += DrawRow;
+        rows.SelectedIndexChanged += (o, e) => { if (silent) return; var next = rows.SelectedItem as HistoryEntry; if (next == current) return; if (!Resolve()) { silent = true; rows.SelectedItem = current; silent = false; return; } ShowEntry(next); };
+        rows.MouseClick += (o, e) => { if (e.Button != MouseButtons.Left) return; int index = rows.IndexFromPoint(e.Location); if (index < 0 || !HistoryCard.Bounds(rows.GetItemRectangle(index)).Contains(e.Location)) return; if (batchMode) { ToggleMarked((HistoryEntry)rows.Items[index]); } };
+        rows.MouseDoubleClick += (o, e) => { if (!batchMode && e.Button == MouseButtons.Left && rows.IndexFromPoint(e.Location) >= 0 && HistoryCard.Bounds(rows.GetItemRectangle(rows.IndexFromPoint(e.Location))).Contains(e.Location)) Navigate(1); };
+        rows.KeyDown += (o, e) => { if (batchMode && e.KeyCode == Keys.Space && current != null) { ToggleMarked(current); e.Handled = e.SuppressKeyPress = true; } else if (!batchMode && e.KeyCode == Keys.Enter) { Navigate(1); e.Handled = e.SuppressKeyPress = true; } };
+        rowsScroll = new DictionaryScrollBar(() => rows.Items.Count, () => Math.Max(1, rows.Height / rows.ItemHeight), () => rows.TopIndex, value => { if (rows.Items.Count > 0) rows.TopIndex = value; });
+        rowsScroll.Bounds = new Rectangle(552, 56, 12, 280); rowsScroll.BackColor = Face; rowsScroll.CardTrack = true; rows.ViewChanged = () => { rowsScroll.TabStop = rowsScroll.Overflows; rowsScroll.Invalidate(); }; libraryPage.Controls.Add(rowsScroll);
+        empty.Bounds = new Rectangle(22, 90, 518, 130); empty.ForeColor = Dim; libraryPage.Controls.Add(empty);
+        markedLabel.Bounds = new Rectangle(10, 344, 554, 24); markedLabel.ForeColor = Dim; libraryPage.Controls.Add(markedLabel);
+        batchBar.Bounds = new Rectangle(314, 506, 554, 52); batchBar.BackColor = Face; Controls.Add(batchBar);
+        AddBatchButton("全选", 0, 100, () => { foreach (HistoryEntry item in rows.Items) marked.Add(item.FileName); UpdateMarked(); });
+        AddBatchButton("清空", 108, 100, () => { marked.Clear(); UpdateMarked(); });
+        var bulk = Button("批量操作", 430, 0, 124, 52, () => { }); ((DictionaryButton)bulk).Primary = true; batchBar.Controls.Add(bulk);
+        bulkMenu.Renderer = new MicrophoneMenuRenderer(); bulkMenu.ShowImageMargin = false; bulkMenu.Font = Font;
+        foreach (string action in new[] { "select", "unselect", "pending", "ignore" }) { string value = action; bulkMenu.Items.Add(action == "select" ? "留作训练" : action == "unselect" ? "取消训练" : action == "pending" ? "重新核对" : "忽略", null, (o, e) => ChangeEntries(value, true)); }
+        bulkMenu.Items.Add(new ToolStripSeparator()); var removeItem = bulkMenu.Items.Add("删除录音", null, async (o, e) => await DeleteMarked()); removeItem.Tag = Color.FromArgb(166, 48, 43);
+        bulk.Click += (o, e) => bulkMenu.Show(bulk, new Point(0, bulk.Height)); bulk.Disposed += (o, e) => bulkMenu.Dispose();
+        editorTag.Location = new Point(314, 48); editorTag.Visible = false; Controls.Add(editorTag);
+        editorSummary.Bounds = new Rectangle(314, 48, 554, 26); editorSummary.Font = new Font(Font.FontFamily, 10f); editorSummary.ForeColor = Dim; Controls.Add(editorSummary);
+        play = Button("播放录音", 10, 0, 132, 42, Play); ((DictionaryButton)play).Glyph = "play"; editorPage.Controls.Add(play);
+        correctLabel = Label("修改后的文字（可编辑）", 10, 56, 554, 26, 11f); editorPage.Controls.Add(correctLabel);
+        compare = new DictionaryCheckBox { Text = "对照原文", Bounds = new Rectangle(414, 54, 150, 32), BackColor = Face };
+        compare.CheckedChanged += (o, e) => ShowOriginal(compare.Checked); editorPage.Controls.Add(compare); compare.Visible = false;
+        originalLabel = Label("原识别文字（只读）", 10, 58, 280, 26, 11f); originalLabel.Visible = false; editorPage.Controls.Add(originalLabel);
+        stage.Bounds = new Rectangle(314, 54, 250, 30); stage.Font = Font; stage.DropDownStyle = ComboBoxStyle.DropDownList; stage.FlatStyle = FlatStyle.Flat; stage.AccessibleName = "原识别阶段";
+        stage.Items.AddRange(new object[] { "原来的结果", "最早的草稿", "救援前的文字" }); stage.SelectedIndex = 0; stage.SelectedIndexChanged += (o, e) => OriginalText(); stage.Visible = false; editorPage.Controls.Add(stage);
+        AddText(original, new Rectangle(10, 88, 554, 72), true, "原始识别，只读"); editorPage.Controls.Add(original.Parent); original.Parent.Visible = false;
+        AddText(correct, new Rectangle(10, 88, 554, 228), false, "修改后的文字，可编辑，按录音修正完整内容"); editorPage.Controls.Add(correct.Parent);
+        selected.Bounds = new Rectangle(10, 332, 554, 36); selected.Text = "留作训练"; selected.AccessibleName = "留作训练，明确选择并保存后生效"; selected.Font = new Font(Font.FontFamily, 12f); editorPage.Controls.Add(selected);
+        correct.TextChanged += (o, e) => { if (!silent && current != null) { dirty = true; } };
+        selected.CheckedChanged += (o, e) => { if (!silent && current != null) { dirty = true; } };
+        save = Button("保存", 746, 506, 124, 52, SaveAndNext); ((DictionaryButton)save).Primary = true; save.Font = new Font(Font.FontFamily, 15f); Controls.Add(save);
+        var more = Button("选项", 440, 0, 124, 42, () => { }); more.Click += (o, e) => moreMenu.Show(more, new Point(0, more.Height)); editorPage.Controls.Add(more);
+        pendingBatch = Button("待归档", 10, 0, 104, 36, () => { browsingArchives = false; batchChoice.SelectedIndex = 0; ShowBatch(); });
+        archivedBatch = Button("已归档", 122, 0, 104, 36, () => { browsingArchives = true; if (batches.Count > 0 && !ArchivedView) batchChoice.SelectedIndex = 1; ShowBatch(); });
+        materialAll = Button("全选", 350, 0, 100, 36, () => { foreach (HistoryEntry item in materialRows.Items) archiveSelected.Add(item.FileName); materialRows.Invalidate(); BatchSummary(); });
+        materialClear = Button("清空", 458, 0, 106, 36, () => { archiveSelected.Clear(); materialRows.Invalidate(); BatchSummary(); });
+        materialsPage.Controls.AddRange(new Control[] { pendingBatch, archivedBatch, materialAll, materialClear });
+        batchNameLabel.Text = "批次名"; batchNameLabel.Font = Font; batchNameLabel.ForeColor = Dim; batchNameLabel.Bounds = new Rectangle(10, 52, 68, 30); materialsPage.Controls.Add(batchNameLabel);
+        batchNameField.Bounds = new Rectangle(82, 48, 482, 42); batchName.Bounds = new Rectangle(12, 10, 454, 24); batchName.Font = Font; batchName.BackColor = Field; batchName.BorderStyle = BorderStyle.None; batchName.MaxLength = 80; batchName.Text = "训练 " + DateTime.Now.ToString("MM-dd HH:mm"); batchName.AccessibleName = "新批次名称"; batchNameField.Controls.Add(batchName); materialsPage.Controls.Add(batchNameField);
+        batchPicker = Button("选择批次", 10, 48, 554, 42, () => {
+            var menu = new HistoryMenu(); foreach (var batch in batches) { var chosen = batch; menu.Items.Add((batch.Withdrawn ? "[已撤回] " : "") + batch.Name, null, (o, e) => { browsingArchives = true; batchChoice.SelectedIndex = batches.IndexOf(chosen) + 1; }); }
+            if (batches.Count == 0) menu.Items.Add("暂无归档").Enabled = false; menu.Closed += (o, e) => { if (IsDisposed || !IsHandleCreated) menu.Dispose(); else try { BeginInvoke(new Action(() => menu.Dispose())); } catch (InvalidOperationException) { menu.Dispose(); } }; menu.Show(batchPicker, new Point(0, batchPicker.Height));
+        }); batchPicker.TextAlign = ContentAlignment.MiddleLeft; materialsPage.Controls.Add(batchPicker);
+        batchChoice.Font = Font; batchChoice.Visible = batchChoice.TabStop = false; batchChoice.DropDownStyle = ComboBoxStyle.DropDownList;
+        batchChoice.SelectedIndexChanged += (o, e) => { if (!batchLoading) { browsingArchives = batchChoice.SelectedIndex > 0; ShowBatch(); } };
+        materialSummary.Bounds = new Rectangle(314, 48, 554, 26); materialSummary.Font = new Font(Font.FontFamily, 10f); materialSummary.ForeColor = Dim; Controls.Add(materialSummary);
+        materialRows.Bounds = new Rectangle(10, 104, 538, 256); materialRows.DrawMode = DrawMode.OwnerDrawFixed; materialRows.ItemHeight = 76; materialRows.IntegralHeight = false; materialRows.BorderStyle = BorderStyle.None; materialRows.BackColor = HistoryCard.Canvas; materialRows.CardFeedback = true; materialRows.AccessibleName = "新批次二次确认，归档批次为只读快照"; materialRows.DrawItem += DrawRow; materialsPage.Controls.Add(materialRows);
+        materialRows.MouseClick += (o, e) => { if (e.Button != MouseButtons.Left) return; int index = materialRows.IndexFromPoint(e.Location); if (index < 0 || !HistoryCard.Bounds(materialRows.GetItemRectangle(index)).Contains(e.Location)) return; if (!ArchiveTab) { var item = (HistoryEntry)materialRows.Items[index]; if (!archiveSelected.Remove(item.FileName)) archiveSelected.Add(item.FileName); materialRows.Invalidate(materialRows.GetItemRectangle(index)); BatchSummary(); } };
+        materialRows.KeyDown += (o, e) => { if (e.KeyCode == Keys.Space && !ArchiveTab && materialRows.SelectedItem != null) { var item = (HistoryEntry)materialRows.SelectedItem; if (!archiveSelected.Remove(item.FileName)) archiveSelected.Add(item.FileName); materialRows.Invalidate(materialRows.GetItemRectangle(materialRows.SelectedIndex)); BatchSummary(); e.Handled = e.SuppressKeyPress = true; } else if (e.KeyCode == Keys.Enter && !ArchiveTab) { OpenMaterial(); e.Handled = e.SuppressKeyPress = true; } };
+        materialScroll = new DictionaryScrollBar(() => materialRows.Items.Count, () => Math.Max(1, materialRows.Height / materialRows.ItemHeight), () => materialRows.TopIndex,
+            value => { if (materialRows.Items.Count > 0) materialRows.TopIndex = value; }); materialScroll.Bounds = new Rectangle(552, 104, 12, 256); materialScroll.BackColor = Face; materialScroll.CardTrack = true; materialScroll.TabStop = false; materialsPage.Controls.Add(materialScroll);
+        materialRows.ViewChanged = () => { materialScroll.TabStop = materialScroll.Overflows; materialScroll.Invalidate(); };
+        var openBatch = Button("打开批次", 314, 506, 124, 52, OpenBatches); materialsFooter.Add(openBatch); Controls.Add(openBatch);
+        var guide = Button("交接说明", 450, 506, 124, 52, OpenGuide); materialsFooter.Add(guide); Controls.Add(guide);
+        export = Button("归档批次", 746, 506, 124, 52, async () => { if (ArchivedView) await ToggleArchive(); else await Export(); }); ((DictionaryButton)export).Primary = true; export.Font = new Font(Font.FontFamily, 15f); Controls.Add(export);
+        Controls.Add(reviewPage.Summary); foreach (var button in reviewPage.Footer) Controls.Add(button);
+        notice.Bounds = new Rectangle(314, 462, 554, 22); notice.Font = new Font(Font.FontFamily, 10f); notice.ForeColor = Dim; notice.AutoEllipsis = true; Controls.Add(notice);
+        BuildMoreMenu(); playback.Tick += (o, e) => { if (clock.Elapsed.TotalSeconds >= playingUntil) Stop(); }; ShowEntry(null); SetPage(0); RecordVisit();
+    }
+    void Navigate(int target) {
+        if (target == 1 && current == null) return; if (!Resolve()) return; UpdateVisit(); Stop(); ShowEntry(current); if (target != page) notice.Text = "";
+        if (batchMode) { batchMode = false; marked.Clear(); UpdateMarked(); }
+        SetPage(target); RecordVisit(); if (target == 1) { correct.Focus(); correct.SelectionStart = correct.TextLength; } else if (target == 0) rows.Focus();
+    }
+    void SetPage(int target) {
+        trainingInfo.Visible = target == 2; trainingInfo.TabStop = target == 2;
+        openRecording.Visible = target == 0 && !batchMode; openRecording.Enabled = rows.Items.Count > 0;
+        page = target; summary.Visible = target == 0; libraryPage.Visible = target == 0; editorPage.Visible = target == 1; materialsPage.Visible = target == 2; reviewPage.Visible = target == 3; reviewPage.Summary.Visible = target == 3; foreach (var button in reviewPage.Footer) button.Visible = target == 3;
+        libraryNav.Visible = materialsNav.Visible = true;
+        libraryNav.BackColor = target == 0 || target == 1 ? Color.FromArgb(233, 232, 230) : Face; materialsNav.BackColor = target == 2 ? Color.FromArgb(233, 232, 230) : Face; reviewNav.BackColor = target == 3 ? Color.FromArgb(233, 232, 230) : Face; ((DictionaryButton)reviewNav).Selected = target == 3; ((DictionaryButton)libraryNav).Selected = target == 0 || target == 1; ((DictionaryButton)materialsNav).Selected = target == 2;
+        libraryNav.AccessibleDescription = target == 0 || target == 1 ? "已选中" : "未选中"; reviewNav.AccessibleDescription = target == 3 ? "已选中" : "未选中"; reviewNav.Invalidate(); materialsNav.AccessibleDescription = target == 2 ? "已选中" : "未选中"; libraryNav.Invalidate(); materialsNav.Invalidate();
+        pageTitle.Text = target == 0 ? "录音" : target == 1 ? "听音改字" : target == 2 ? "训练" : "验证";
+        editorSummary.Visible = target == 1; editorTag.Visible = target == 1 && current != null; materialSummary.Visible = target == 2; save.Visible = target == 1; export.Visible = target == 2; supplement.Visible = target == 0 && !batchMode;
+        foreach (var button in materialsFooter) { button.Visible = target == 2; button.BackColor = Face; ((DictionaryButton)button).Outlined = false; }
+        undoButton.Visible = undo.Count > 0 && target != 3;
+        if (target == 3) { var loadingReview = reviewPage.Reload(); }
+        batchBar.Visible = target == 0 && batchMode; markedLabel.Visible = target == 0 && batchMode; rows.Height = rowsScroll.Height = batchMode ? 280 : 318; batchToggle.Text = batchMode ? "完成" : "多选";
+        UpdateMaterials();
+    }
+    void OpenMaterial() {
+        var entry = materialRows.SelectedItem as HistoryEntry; if (entry == null || !Resolve()) return; UpdateVisit();
+        silent = true; filter.SelectedIndex = lastFilter = 0; search.Text = lastSearch = ""; silent = false; Filter(); rows.SelectedItem = entry; ShowEntry(entry); SetPage(1); RecordVisit(); correct.Focus();
+    }
+    void UpdateTrainingMarks(List<Dictionary<string, object>> runs) {
+        trainingMarks.Clear(); batchMarks.Clear();
+        foreach (var run in runs) {
+            string state = Convert.ToString(run["displayStatus"]); if (state == "待复测") state = "待验证"; if (state == "验收通过") state = "验证通过";
+            foreach (object archiveValue in (object[])run["archives"]) { var archive = (Dictionary<string, object>)archiveValue; string path = Convert.ToString(archive["path"]); if (!batchMarks.ContainsKey(path)) batchMarks[path] = state;
+                foreach (object source in (object[])archive["sources"]) if (!trainingMarks.ContainsKey(Convert.ToString(source))) trainingMarks[Convert.ToString(source)] = state;
+            }
+        }
+        foreach (var item in entries) { string state; item.TrainingStatus = trainingMarks.TryGetValue(item.Kind + ":" + item.Text("id"), out state) ? state : ""; }
+        rows.Invalidate(); UpdateMaterials();
+    }
+    void UpdateMaterials() {
+        if (materialSummary == null) return;
+        string selectedPath = ArchivedView ? batches[batchChoice.SelectedIndex - 1].Path : ""; batches.Clear(); string folder = Path.Combine(store.Root, "training-batches");
+        if (Directory.Exists(folder)) foreach (string path in Directory.GetDirectories(folder)) {
+            if (path.EndsWith(".partial", StringComparison.OrdinalIgnoreCase) || !File.Exists(Path.Combine(path, "manifest.json"))) continue;
+            try { var data = HistoryStore.Parse(File.ReadAllText(Path.Combine(path, "manifest.json"))); var batch = new BatchView { Path = path, Name = data.ContainsKey("name") ? Convert.ToString(data["name"]) : "批次 " + Path.GetFileName(path), Entries = new List<HistoryEntry>() }; string state; batch.Withdrawn = HistoryStore.ArchiveState(path, out batch.Lifecycle) == "withdrawn"; batch.Status = batch.Withdrawn ? "已撤回" : batchMarks.TryGetValue(Path.GetFullPath(path), out state) ? state : "待交给agent";
+                foreach (object value in (object[])data["samples"]) { var sample = (Dictionary<string, object>)value; var meta = (Dictionary<string, object>)sample["metadata"]; batch.Entries.Add(new HistoryEntry { Kind = Convert.ToString(sample["sourceKind"]), FileName = Path.Combine(store.Root, Convert.ToString(sample["sourceKind"]), Convert.ToString(sample["sourceId"]) + ".json"), Data = meta, Original = new JavaScriptSerializer().Serialize(meta) }); }
+                batches.Add(batch);
+            } catch (Exception error) { notice.Text = "部分批次读取失败，原文件保留：" + error.Message; }
+        }
+        batches.Sort((a, b) => string.CompareOrdinal(b.Path, a.Path));
+        batchLoading = true; batchChoice.Items.Clear(); batchChoice.Items.Add("新建批次 · 二次确认"); foreach (var batch in batches) batchChoice.Items.Add(batch); int chosen = batches.FindIndex(item => item.Path == selectedPath); batchChoice.SelectedIndex = chosen < 0 ? 0 : chosen + 1; batchLoading = false;
+        ShowBatch();
+    }
+    void ShowBatch() {
+        materialRows.BeginUpdate(); materialRows.Items.Clear();
+        archiveSelected.RemoveWhere(file => !entries.Exists(item => item.FileName == file && item.Flag("selectedForTraining") && !item.Flag("ignored")));
+        if (ArchivedView) foreach (var item in batches[batchChoice.SelectedIndex - 1].Entries) materialRows.Items.Add(item);
+        else if (!ArchiveTab) foreach (var item in entries) if (item.Flag("selectedForTraining") && !item.Flag("ignored")) { materialRows.Items.Add(item); bool archived = batches.Exists(batch => !batch.Withdrawn && batch.Entries.Exists(old => old.Kind == item.Kind && old.Text("id") == item.Text("id"))); if (archiveSeen.Add(item.FileName) && !archived) archiveSelected.Add(item.FileName); }
+        materialRows.EndUpdate();
+        pendingBatch.BackColor = !ArchiveTab ? HistoryCard.SelectedPaper : Face; archivedBatch.BackColor = ArchiveTab ? HistoryCard.SelectedPaper : Face;
+        pendingBatch.ForeColor = !ArchiveTab ? HistoryCard.MarkInk : Dim; archivedBatch.ForeColor = ArchiveTab ? HistoryCard.MarkInk : Dim;
+        batchNameField.Visible = batchNameLabel.Visible = !ArchiveTab; batchPicker.Visible = ArchiveTab;
+        batchPicker.Text = ArchivedView ? (batches[batchChoice.SelectedIndex - 1].Withdrawn ? "[已撤回] " : "") + batches[batchChoice.SelectedIndex - 1].Name : "暂无归档"; batchPicker.AccessibleName = batchPicker.Text; trainingHelp.SetToolTip(batchPicker, batchPicker.Text); batchPicker.Enabled = batches.Count > 0;
+        materialAll.Enabled = materialClear.Enabled = !ArchiveTab && materialRows.Items.Count > 0;
+        BatchSummary();
+    }
+    void BatchSummary() {
+        double seconds = 0; int count = 0; foreach (HistoryEntry item in materialRows.Items) if (ArchivedView || archiveSelected.Contains(item.FileName)) { count++; seconds += item.Seconds; }
+        materialSummary.Text = ArchivedView ? batches[batchChoice.SelectedIndex - 1].Status + " · " + count + " 条 · " + seconds.ToString("0.0") + " 秒 · 快照保留" : "本批已确认 " + count + " / " + materialRows.Items.Count + " 条 · " + seconds.ToString("0.0") + " 秒";
+        if (ArchiveTab && !ArchivedView) materialSummary.Text = "还没有归档批次";
+        export.Text = ArchivedView ? (batches[batchChoice.SelectedIndex - 1].Withdrawn ? "恢复归档" : "撤回归档") : "归档批次";
+        ((DictionaryButton)export).Primary = !ArchivedView || batches[batchChoice.SelectedIndex - 1].Withdrawn; ((DictionaryButton)export).Outlined = ArchivedView;
+        export.Enabled = ArchivedView || (!ArchiveTab && count > 0);
+    }
+    void BuildMoreMenu() {
+        moreMenu.Renderer = new MicrophoneMenuRenderer(); moreMenu.ShowImageMargin = false; moreMenu.Font = Font;
+        var originalItem = new ToolStripMenuItem("对照原文") { CheckOnClick = true }; originalItem.CheckedChanged += (o, e) => compare.Checked = originalItem.Checked; moreMenu.Items.Add(originalItem);
+        var materialItem = new ToolStripMenuItem("留作训练") { CheckOnClick = true }; materialItem.CheckedChanged += (o, e) => selected.Checked = materialItem.Checked; moreMenu.Items.Add(materialItem);
+        moreMenu.Opening += (o, e) => { materialItem.Checked = selected.Checked; originalItem.Checked = compare.Checked; };
+        moreMenu.Items.Add("还原本次编辑", null, (o, e) => { ShowEntry(current); notice.Text = "已恢复上次保存内容。"; });
+        moreMenu.Items.Add("跳过这条", null, (o, e) => SkipRecord());
+        var state = new ToolStripMenuItem("管理这条录音"); state.DropDownItems.Add("重新核对 / 恢复", null, (o, e) => ChangeEntries("pending", false)); state.DropDownItems.Add("忽略", null, (o, e) => ChangeEntries("ignore", false));
+        deleteMenu.Click += (o, e) => Remove(); state.DropDownItems.Add(deleteMenu); moreMenu.Items.Add(state);
+        moreMenu.Items.Add("使用说明", null, (o, e) => OpenGuide());
+    }
+    void SkipRecord() { if (Resolve()) { UpdateVisit(); bool moved = NextRecord(); RecordVisit(); notice.Text = moved ? "已跳过，录音仍保留。" : "已经是最后一条。"; } }
+    void OpenGuide() {
+        try { Process.Start(new ProcessStartInfo(Path.Combine(Path.GetDirectoryName(store.Root), "docs", "录音纠错使用说明书.html")) { UseShellExecute = true }); }
+        catch (Exception error) { notice.Text = "说明书未打开：" + error.Message; }
+    }
+    void OpenBatches() {
+        try { string folder = ArchivedView ? batches[batchChoice.SelectedIndex - 1].Path : latestBatch.Length > 0 ? latestBatch : Path.Combine(store.Root, "training-batches"); Directory.CreateDirectory(folder); Process.Start(new ProcessStartInfo("explorer.exe", "\"" + folder + "\"") { UseShellExecute = true }); }
+        catch (Exception error) { notice.Text = "文件夹未打开：" + error.Message; }
+    }
+    void AddBatchButton(string text, int x, int width, Action click) { var button = Button(text, x, 0, width, 52, click); batchBar.Controls.Add(button); }
+    void SetBatchMode(bool value) { if (!Resolve()) return; batchMode = value; marked.Clear(); SetPage(0); UpdateMarked(); }
+    void ToggleMarked(HistoryEntry entry) { if (!marked.Remove(entry.FileName)) marked.Add(entry.FileName); UpdateMarked(rows.Items.IndexOf(entry)); }
+    void UpdateMarked(int changedIndex = -1) { markedLabel.Text = batchMode ? "已勾选 " + marked.Count + " 条" : ""; foreach (Control button in batchBar.Controls) if (button.Left >= 264) button.Enabled = marked.Count > 0; if (changedIndex >= 0) rows.Invalidate(rows.GetItemRectangle(changedIndex)); else rows.Invalidate(); }
+    void Remember(List<Change> changes) { if (changes.Count == 0) return; undo.Add(changes); if (undo.Count > 20) undo.RemoveAt(0); undoButton.Enabled = undoButton.Visible = true; }
+    void ChangeEntries(string action, bool many) {
+        if (!Resolve()) return;
+        var targets = many ? entries.FindAll(item => marked.Contains(item.FileName)) : current == null ? new List<HistoryEntry>() : new List<HistoryEntry> { current };
+        if (targets.Count == 0) { notice.Text = "请先勾选要处理的录音。"; return; }
+        var changes = new List<Change>();
+        try {
+            foreach (var item in targets) {
+                if (File.ReadAllText(item.FileName) != item.Original) throw new IOException("记录已被外部修改，请刷新后重试");
+                if (action == "select" && (!item.Flag("reviewed") || item.Flag("ignored") || string.IsNullOrWhiteSpace(item.Text("correctText")))) throw new IOException("包含未核对或已忽略的录音，请先试听并保存；本次未处理");
+            }
+            foreach (var item in targets) { string before = item.Original; store.ChangeState(item, action); changes.Add(new Change { File = item.FileName, Before = before, After = item.Original }); }
+            notice.Text = "已处理 " + changes.Count + " 条，可点「撤销上次」恢复。";
+        } catch (Exception error) { notice.Text = "已处理 " + changes.Count + " 条，其余未改：" + error.Message + (changes.Count > 0 ? "；已处理部分可撤销。" : ""); }
+        finally { Remember(changes); marked.Clear(); UpdateMarked(); UpdateSummary(); Filter(); }
+    }
+    void Undo() {
+        if (!Resolve() || undo.Count == 0) return; var changes = undo[undo.Count - 1];
+        try {
+            foreach (var change in changes) if (!File.Exists(change.File) || File.ReadAllText(change.File) != change.After) throw new IOException("记录已被外部修改或删除，未覆盖；请刷新检查");
+            for (int i = changes.Count - 1; i >= 0; i--) {
+                var change = changes[i]; HistoryStore.Atomic(change.File, change.Before);
+                var item = entries.Find(entry => entry.FileName == change.File); if (item != null) { item.Original = change.Before; item.Data = HistoryStore.Parse(change.Before); } changes.RemoveAt(i);
+            }
+            undo.RemoveAt(undo.Count - 1); notice.Text = "已撤销上次保存或状态操作；原音和已准备的批次保持原样。";
+        } catch (Exception error) { notice.Text = "撤销未完成：" + error.Message; }
+        finally { undoButton.Enabled = undoButton.Visible = undo.Count > 0; UpdateSummary(); Filter(); }
+    }
+    void ShowOriginal(bool visible) {
+        originalLabel.Visible = stage.Visible = original.Parent.Visible = visible; correctLabel.Top = visible ? 184 : 56;
+        var field = correct.Parent; field.Bounds = visible ? new Rectangle(10, 216, 554, 100) : new Rectangle(10, 88, 554, 228);
+        correct.Bounds = new Rectangle(12, 10, field.Width - 40, field.Height - 20);
+        foreach (Control control in field.Controls) if (control is DictionaryScrollBar) control.Height = field.Height - 20;
+    }
+    bool NextRecord() {
+        Stop(); if (rows.SelectedIndex + 1 < rows.Items.Count) { rows.SelectedIndex++; return true; }
+        ShowEntry(current); return false;
+    }
+    void SaveAndNext() {
+        if (current == null) return; bool chosen = selected.Checked; if (!Save()) return; UpdateVisit();
+        bool moved = NextRecord(); Filter(); if (!moved) SetPage(0); RecordVisit(); notice.Text = chosen ? "已保存，并留作训练。" : "已保存。";
+    }
+    internal Label Notice { get { return notice; } }
+    internal bool Loading { get { return loading; } }
+    Label Label(string text, int x, int y, int width, int height, float size) { return new DictionaryLabel { Text = text, Bounds = new Rectangle(x, y, width, height), Font = new Font(Font.FontFamily, size), ForeColor = Dim }; }
+    Button Button(string text, int x, int y, int width, int height, Action click) { var button = new DictionaryButton { Text = text, Bounds = new Rectangle(x, y, width, height), Font = new Font(Font.FontFamily, 11f), BackColor = Color.White, ForeColor = Ink, Outlined = true }; button.Click += (o, e) => click(); return button; }
+    void AddText(TextBox box, Rectangle bounds, bool readOnly, string name) {
+        var field = new DictionaryField { Bounds = bounds }; box.Bounds = new Rectangle(12, 10, bounds.Width - 40, bounds.Height - 20);
+        box.Multiline = true; box.ReadOnly = readOnly; box.MaxLength = 10000; box.BorderStyle = BorderStyle.None; box.Font = new Font(Font.FontFamily, 15f); box.BackColor = Field; box.ForeColor = Ink; box.AccessibleName = name;
+        box.ScrollBars = ScrollBars.None; field.Controls.Add(box);
+        var scroll = new DictionaryScrollBar(() => (int)DictionaryScrollBar.SendMessage(box.Handle, 0x00BA, IntPtr.Zero, IntPtr.Zero),
+            () => Math.Max(1, box.Height / box.Font.Height), () => (int)DictionaryScrollBar.SendMessage(box.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero),
+            value => { int line = (int)DictionaryScrollBar.SendMessage(box.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero); DictionaryScrollBar.SendMessage(box.Handle, 0x00B6, IntPtr.Zero, new IntPtr(value - line)); });
+        scroll.Bounds = new Rectangle(bounds.Width - 20, 10, 12, bounds.Height - 20); scroll.BackColor = Field;
+        ((DictionaryTextBox)box).ViewChanged = () => { scroll.TabStop = scroll.Overflows; scroll.Invalidate(); }; field.Controls.Add(scroll); Controls.Add(field);
+    }
+    internal async Task Reload() {
+        if (loading || IsDisposed) return; loading = true; Enabled = false; if (NavigationChanged != null) NavigationChanged();
+        try {
+            string errors = ""; long bytes = 0; var loaded = await Task.Run(() => store.Load(out errors, out bytes)); if (IsDisposed) return;
+            entries.Clear(); entries.AddRange(loaded); silent = true;
+            try { enabled.Checked = store.Enabled(); } finally { silent = false; }
+            usageBytes = bytes; UpdateSummary();
+            notice.Text = errors.Length > 0 ? "部分记录读取失败（原文件保留）：" + errors : RuntimeNotice.Length > 0 ? RuntimeNotice : "";
+            string statusFile = Path.Combine(store.Root, "history-status.json");
+            if (errors.Length == 0 && File.Exists(statusFile)) { var status = HistoryStore.Parse(File.ReadAllText(statusFile)); object value; if (status.TryGetValue("notice", out value)) notice.Text = "上次留档提示：" + Convert.ToString(value); }
+            notice.AccessibleDescription = notice.Text; Filter(); await reviewPage.Reload();
+        } catch (Exception error) { notice.Text = "读取失败：" + error.Message; }
+        finally { loading = false; if (!IsDisposed) { Enabled = true; if (visits.Count == 0) RecordVisit(); else if (NavigationChanged != null) NavigationChanged(); } }
+    }
+    void UpdateSummary() {
+        int chosen = entries.FindAll(item => item.Flag("selectedForTraining")).Count;
+        summary.Text = entries.Count + " 条录音";
+        export.Enabled = chosen > 0; UpdateMaterials();
+    }
+    void Filter() {
+        if (filterButton != null) filterButton.Text = filter.SelectedIndex == 0 ? "筛选" : filter.Text;
+        var visible = entries.FindAll(item => {
+            bool included = filter.SelectedIndex == 1 ? !item.Flag("reviewed") && !item.Flag("ignored") : filter.SelectedIndex == 2 ? item.Flag("reviewed") && !item.Flag("ignored") : filter.SelectedIndex == 3 ? item.Flag("ignored") : true;
+            return included && (item.Text("correctText") + " " + item.Text("text") + " " + item.Text("rawText") + " " + item.Text("word") + " " + item.Text("createdUtc")).IndexOf(search.Text.Trim(), StringComparison.OrdinalIgnoreCase) >= 0;
+        });
+        marked.Clear(); UpdateMarked(); string id = current == null ? "" : current.Text("id"); silent = true; rows.BeginUpdate(); rows.Items.Clear();
+        foreach (var item in visible) rows.Items.Add(item); int index = visible.FindIndex(item => item.Text("id") == id);
+        rows.SelectedIndex = index >= 0 ? index : rows.Items.Count > 0 ? 0 : -1; rows.EndUpdate(); silent = false;
+        empty.Visible = rows.Items.Count == 0; empty.Text = entries.Count == 0 ? "还没有录音。\n开启左侧开关后用 Win+H 听写，或点「补录一句」。" : "这里没有录音。\n可在上方切换「全部录音」或其他筛选。"; ShowEntry(rows.SelectedItem as HistoryEntry); if (openRecording != null) openRecording.Enabled = rows.Items.Count > 0; if (current == null && page == 1) SetPage(0);
+    }
+    void DrawRow(object sender, DrawItemEventArgs e) {
+        if (e.Index < 0) return; var list = (DictionaryListBox)sender; var item = (HistoryEntry)list.Items[e.Index]; e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+        bool confirm = list == materialRows && !ArchiveTab, selection = (batchMode && list == rows) || confirm;
+        bool markedRow = selection && (confirm ? archiveSelected.Contains(item.FileName) : marked.Contains(item.FileName));
+        HistoryCard.Draw(e.Graphics, e.Bounds, e.Index + 1, Font, (e.State & DrawItemState.Selected) != 0, markedRow, list.HoverIndex == e.Index, list.PressedIndex == e.Index, list.Focused && list.SelectedIndex == e.Index);
+        DateTime time; string stamp = DateTime.TryParse(item.Text("createdUtc"), out time) ? time.ToLocalTime().ToString("MM-dd HH:mm") : "";
+        int inset = selection ? 42 : 12;
+        if (selection) HistoryCard.Check(e.Graphics, new Rectangle(e.Bounds.X + 12, e.Bounds.Y + 29, 18, 18), markedRow, list.HoverIndex == e.Index, list.PressedIndex == e.Index, list.Focused && list.SelectedIndex == e.Index, true);
+        using (var format = new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap }) {
+            using (var brush = new SolidBrush(Dim)) using (var font = new Font(Font.FontFamily, 9.5f)) e.Graphics.DrawString(stamp + " · " + item.Seconds.ToString("0.0") + " 秒", font, brush, new Rectangle(e.Bounds.X + inset, e.Bounds.Y + 5, e.Bounds.Width - inset - 12, 22), format);
+            using (var brush = new SolidBrush(Ink)) e.Graphics.DrawString(item.Text("correctText").Replace("\r", " ").Replace("\n", " "), Font, brush, new Rectangle(e.Bounds.X + inset, e.Bounds.Y + 26, e.Bounds.Width - inset - 12, 24), format);
+            using (var font = new Font(Font.FontFamily, 9.5f)) {
+                int tagWidth = HistoryStatusTag.Draw(e.Graphics, item.State, font, new Point(e.Bounds.X + inset, e.Bounds.Y + 48)); if (item.TrainingStatus.Length > 0) tagWidth += 8 + HistoryStatusTag.Draw(e.Graphics, item.TrainingStatus, font, new Point(e.Bounds.X + inset + tagWidth + 8, e.Bounds.Y + 48));
+                using (var brush = new SolidBrush(Dim)) e.Graphics.DrawString(item.Kind == "voice-samples" ? "个人补录" : "日常听写", font, brush, new Rectangle(e.Bounds.X + inset + tagWidth + 10, e.Bounds.Y + 48, e.Bounds.Width - inset - tagWidth - 22, 22), format);
+            }
+        }
+    }
+    void ShowEntry(HistoryEntry entry) {
+        Stop(); current = entry; silent = true;
+        correct.MaxLength = entry != null && entry.Kind == "voice-samples" ? 2000 : 10000;
+        correct.Text = entry == null ? "" : entry.Text("correctText"); selected.Checked = entry != null && entry.Flag("selectedForTraining"); silent = false; dirty = false;
+        correct.Enabled = selected.Enabled = play.Enabled = save.Enabled = deleteMenu.Enabled = entry != null;
+        editorTag.Text = entry == null ? "" : entry.State; editorTag.Visible = page == 1 && entry != null;
+        editorSummary.SetBounds(editorTag.Right + 12, 48, 868 - editorTag.Right - 12, 26); editorSummary.Text = entry == null ? "" : entry.Seconds.ToString("0.0") + " 秒";
+        OriginalText();
+    }
+    void OriginalText() {
+        if (current == null) { original.Clear(); return; }
+        string key = stage.SelectedIndex == 1 ? "firstText" : stage.SelectedIndex == 2 ? "rawText" : "text";
+        original.Text = current.Text(key); if (original.Text.Length == 0) original.Text = current.Kind == "voice-samples" ? "主动补录没有原始识别结果。" : "本片段没有该阶段的记录。";
+    }
+    internal bool Save() {
+        if (current == null) return true;
+        try { string before = current.Original; store.Save(current, correct.Text, selected.Checked, false); Remember(new List<Change> { new Change { File = current.FileName, Before = before, After = current.Original } }); dirty = false; UpdateSummary(); notice.Text = (selected.Checked ? "已保存，已留作训练，尚未训练。" : "已保存，未选入训练。") + "在录音列表的「已保存」中可查看。"; rows.Invalidate(); return true; }
+        catch (Exception error) { notice.Text = "保存失败：" + error.Message; return false; }
+    }
+    internal bool Resolve() {
+        if (capture != null && !capture.IsDisposed && capture.Visible) { capture.Close(); if (capture.Visible) return false; }
+        if (reviewPage != null && !reviewPage.ResolveCapture()) return false;
+        if (!dirty) return true;
+        var answer = MessageBox.Show(FindForm(), "这条记录的文字或训练选择尚未保存，保存吗？", "听写记录", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+        if (answer == DialogResult.Cancel) return false; if (answer == DialogResult.Yes) return Save(); dirty = false; return true;
+    }
+    void Play() {
+        if (playingUntil > 0) { Stop(); return; } if (current == null) return;
+        try { HistoryStore.ValidateAudio(current); Stop(); player.Stream = new MemoryStream(File.ReadAllBytes(current.Audio)); player.Load(); player.Play(); clock.Restart(); playingUntil = current.Seconds; playback.Start(); ((DictionaryButton)play).Glyph = "stop"; play.Text = "停止"; }
+        catch (Exception error) { Stop(); notice.Text = "试听失败：" + error.Message; }
+    }
+    internal void Stop() { playback.Stop(); player.Stop(); if (player.Stream != null) { player.Stream.Dispose(); player.Stream = null; } playingUntil = 0; if (play != null) { ((DictionaryButton)play).Glyph = "play"; play.Text = "播放"; play.Invalidate(); } }
+    async Task DeleteMarked(bool confirmedForTest = false) {
+        if (!batchMode || !Resolve()) return;
+        var targets = new List<HistoryEntry>(); foreach (HistoryEntry item in rows.Items) if (marked.Contains(item.FileName)) targets.Add(item);
+        if (targets.Count == 0) { notice.Text = "请先勾选要删除的录音。"; return; }
+        try { foreach (var item in targets) store.ValidatePermanentRemoval(item); }
+        catch (Exception error) { notice.Text = "未删除：" + error.Message; return; }
+        if (!confirmedForTest) using (var confirmation = new DictionaryDeleteDialog("", true, targets.Count)) if (confirmation.ShowDialog(FindForm()) != DialogResult.OK) return;
+        Stop(); int removed = 0; string failure = "";
+        try { foreach (var item in targets) { store.PermanentlyRemove(item); removed++; } }
+        catch (Exception error) { failure = error.Message; }
+        marked.Clear(); undo.RemoveAll(group => group.Exists(change => targets.Exists(item => item.FileName == change.File))); UpdateMarked(); await Reload(); if (IsDisposed) return;
+        notice.Text = failure.Length == 0 ? "已永久删除 " + removed + " 条原音和标注；归档批次、验证副本保留。" : "完整删除 " + removed + " 条；下一条可能部分清理失败，其余未处理：" + failure;
+        notice.AccessibleDescription = notice.Text;
+    }
+    async void Remove() {
+        if (current == null || !Resolve()) return; using (var confirmation = new DictionaryDeleteDialog("", true)) if (confirmation.ShowDialog(FindForm()) != DialogResult.OK) return;
+        try { Stop(); store.Remove(current); await Reload(); notice.Text = "已移出列表 · 原音及 .json.deleted 索引保留，可恢复；仍占用磁盘"; } catch (Exception error) { notice.Text = "删除失败：" + error.Message; }
+    }
+    async Task ToggleArchive() {
+        if (!Resolve() || !ArchivedView) return;
+        var batch = batches[batchChoice.SelectedIndex - 1]; bool withdraw = !batch.Withdrawn;
+        try {
+            store.SetArchiveState(batch.Path, batch.Lifecycle, withdraw); if (withdraw) batchName.Text = batch.Name; UpdateMaterials();
+            foreach (var entry in entries) if (batch.Entries.Exists(old => old.Kind == entry.Kind && old.Text("id") == entry.Text("id"))) {
+                if (withdraw && entry.Flag("selectedForTraining") && !entry.Flag("ignored") && !batches.Exists(other => !other.Withdrawn && other.Entries.Exists(old => old.Kind == entry.Kind && old.Text("id") == entry.Text("id")))) archiveSelected.Add(entry.FileName);
+                else if (!withdraw) archiveSelected.Remove(entry.FileName);
+            }
+            await reviewPage.Reload(); if (IsDisposed) return;
+            notice.Text = withdraw ? "已撤回归档；快照保留，现存录音可回待归档重新挑选。" : "已恢复归档；原音和文字快照未改变。";
+        } catch (Exception error) { if (!IsDisposed) notice.Text = "状态未更新：" + error.Message; }
+    }
+    async Task Export() {
+        if (!Resolve() || ArchiveTab) return;
+        var chosen = entries.FindAll(item => item.Flag("selectedForTraining") && !item.Flag("ignored") && archiveSelected.Contains(item.FileName)); double seconds = 0; foreach (var item in chosen) seconds += item.Seconds;
+        if (chosen.Count == 0) { notice.Text = "请先核对并选择本批次的录音。"; return; }
+        if (MessageBox.Show(FindForm(), "批次：" + batchName.Text + "\n将复制 " + chosen.Count + " 条录音，约 " + (seconds / 60).ToString("0.0") + " 分钟，及当前正确文字。\n\n这一步只准备独立批次，不会训练或启用模型。后续见「交接说明」。", "归档批次", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
+        string name = batchName.Text; export.Enabled = false;
+        try { var confirmed = chosen.ConvertAll(item => new HistoryEntry { FileName = item.FileName, Original = item.Original }); latestBatch = await Task.Run(() => store.Export(confirmed, name)); if (IsDisposed) return; foreach (var item in chosen) archiveSelected.Remove(item.FileName); UpdateMaterials(); int index = batches.FindIndex(item => item.Path == latestBatch); if (index >= 0) batchChoice.SelectedIndex = index + 1; batchName.Text = "训练 " + DateTime.Now.ToString("MM-dd HH:mm"); if (IsDisposed) return; notice.Text = "批次已归档，交给agent训练；训练完成后到「验证」录新音复测。"; notice.AccessibleDescription = notice.Text; }
+        catch (Exception error) { if (!IsDisposed) notice.Text = "批次未完成：" + error.Message; }
+        finally { if (!IsDisposed) BatchSummary(); }
+    }
+    internal static void CheckForTest(string work) {
+        Action<bool, string> check = (ok, message) => { if (!ok) throw new Exception("HISTORY-TEST: " + message); };
+        string root = Path.Combine(work, "history-check-" + Guid.NewGuid().ToString("N"));
+        var store = new HistoryStore(root); check(!store.Enabled(), "recording defaults off");
+        store.SetEnabled(true); check(store.Enabled(), "explicit recording opt in roundtrips"); store.SetEnabled(false);
+        byte[] pcm = new byte[32000]; for (int i = 0; i < pcm.Length; i += 2) { short value = (short)(Math.Sin(i * .1) * 1500); pcm[i] = (byte)value; pcm[i + 1] = (byte)(value >> 8); }
+        var manual = new VoiceSampleStore(root).Save("Codex", "今天不用 Codex，先跑测试。", pcm);
+        string folder = Path.Combine(store.Root, "dictation-history"); Directory.CreateDirectory(folder);
+        string id = Guid.NewGuid().ToString("N"); File.WriteAllBytes(Path.Combine(folder, id + ".wav"), VoiceSampleStore.Wave(pcm));
+        var data = new Dictionary<string, object> { { "id", id }, { "wav", id + ".wav" }, { "createdUtc", DateTime.UtcNow.ToString("o") }, { "state", "collected" }, { "durationSeconds", 1.0 }, { "sampleRate", 16000 }, { "channels", 1 }, { "bitsPerSample", 16 }, { "firstText", "今天不用扣desks" }, { "rawText", "今天不用扣desks，先跑测试。" }, { "text", "今天不用扣desks，先跑测试。" }, { "correctText", "今天不用扣desks，先跑测试。" }, { "roundId", "fixture-round" } };
+        string file = Path.Combine(folder, id + ".json"); File.WriteAllText(file, new JavaScriptSerializer().Serialize(data));
+        string errors; long bytes; var entries = store.Load(out errors, out bytes); check(errors == "" && entries.Count == 2, "manual and daily recordings share review list");
+        var daily = entries.Find(item => item.Kind == "dictation-history"); HistoryStore.ValidateAudio(daily);
+        bool incompatible = false; try { store.Save(entries.Find(item => item.Kind == "voice-samples"), new string('x', 2001), true, false); } catch (IOException) { incompatible = true; }
+        check(incompatible && new VoiceSampleStore(root).Load("Codex").Count == 1, "history editing preserves manual sample label contract");
+        store.Save(daily, "今天不用 Codex，先跑测试。", false, false);
+        check(!daily.Flag("selectedForTraining") && daily.Flag("reviewed") && daily.Text("rawText").Contains("扣desks"), "editing never auto-selects or overwrites original");
+        bool failed = false; try { store.Export(); } catch (IOException) { failed = true; } check(failed, "empty selection is not exported");
+        var stale = store.Load(out errors, out bytes).Find(item => item.Kind == "dictation-history");
+        store.Save(daily, daily.Text("correctText"), true, false);
+        failed = false; try { store.Save(stale, "must not overwrite", false, false); } catch (IOException) { failed = true; } check(failed, "concurrent edits cannot overwrite");
+        string batch = store.Export(name: "个人训练测试"); string manifest = File.ReadAllText(Path.Combine(batch, "manifest.json"));
+        var samples = (object[])HistoryStore.Parse(manifest)["samples"];
+        check(Convert.ToString(HistoryStore.Parse(manifest)["name"]) == "个人训练测试", "custom batch name persists in immutable manifest");
+        bool invalidName = false; try { store.Export(name: "bad\nname"); } catch (IOException) { invalidName = true; } check(invalidName, "invalid names are rejected before export");
+        check(samples.Length == 1 && manifest.Contains("prepared_not_trained") && manifest.Contains("fixture-round") && !manifest.Contains(manual.id) && File.ReadAllText(Path.Combine(batch, "下一步.txt")).Contains("尚未训练"), "batch exports only explicit selections with source groups");
+        var flat = HistoryStore.Parse(File.ReadAllLines(Path.Combine(batch, "samples.jsonl"))[0]);
+        check(Convert.ToString(flat["correctText"]) == daily.Text("correctText") && Convert.ToString(flat["recognizedText"]).Contains("扣desks") && Convert.ToString(flat["rawRecognition"]).Contains("扣desks") && Convert.ToString(flat["sourceGroup"]) == "fixture-round", "agent JSONL keeps original recognition correct text and source grouping distinct");
+        bool staleArchive = false; try { store.Export(new List<HistoryEntry> { new HistoryEntry { FileName = daily.FileName, Original = "stale" } }); } catch (IOException) { staleArchive = true; } check(staleArchive, "archive cannot snapshot text changed after second confirmation");
+
+        store.Save(daily, "后续修订不改变原批次。", false, false); check(File.ReadAllText(Path.Combine(batch, "manifest.json")) == manifest, "batch label snapshot is immutable");
+        store.Save(daily, "今天不用 Codex，先跑测试。", true, false);
+        using (var dialog = new DictionaryDialog(root)) {
+            dialog.StartPosition = FormStartPosition.Manual; dialog.Location = new Point(-20000, -20000); dialog.Show(); Application.DoEvents();
+            var backArrow = (DictionaryButton)typeof(DictionaryDialog).GetField("navBack", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(dialog);
+            var forwardArrow = (DictionaryButton)typeof(DictionaryDialog).GetField("navForward", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(dialog);
+            check(!backArrow.Visible && !forwardArrow.Visible, "word workspace hides history-only arrows");
+            var history = dialog.HistoryForTest; dialog.SelectHistoryForTest(); var wait = Stopwatch.StartNew();
+            while (history.Loading && wait.ElapsedMilliseconds < 10000) { Application.DoEvents(); Thread.Sleep(5); }
+            check(!history.Loading && history.rows.Items.Count == 2 && history.materialRows.Items.Count == 1, "history loads, counts and selection");
+            check(history.libraryPage.Visible && !history.editorPage.Visible && !history.materialsPage.Visible && history.searchField.Visible && history.filter.Items.Count == 4 && !history.filter.Visible && !history.markedLabel.Visible && !history.save.Visible && !history.export.Visible, "library is a separate default page with no editor or training controls");
+            check(history.save.Text == "保存" && !history.selected.Visible && history.moreMenu.Items.Count > 0, "simple save with optional material selection in context menu");
+            check(!history.CanGoBack && !history.CanGoForward && backArrow.Visible && forwardArrow.Visible && !backArrow.Enabled && !forwardArrow.Enabled, "history workspace shows disabled arrows at initial boundary");
+            string firstVisitFile = history.current.FileName;
+            history.Navigate(1); history.Navigate(2); history.GoVisit(-1);
+            check(history.page == 1 && history.current.FileName == firstVisitFile && history.CanGoForward, "back restores the exact recording");
+            history.GoVisit(-1); check(history.page == 0 && !history.CanGoBack, "back returns to initial list and stops at boundary: page=" + history.page + " index=" + history.visitIndex + " count=" + history.visits.Count);
+            history.GoVisit(1); check(history.page == 1, "forward returns to editor");
+            history.Navigate(0); check(!history.CanGoForward, "new visit after back clears forward branch");
+            history.search.Text = "Codex"; history.filter.SelectedIndex = 2; history.Navigate(1); history.compare.Checked = true; history.stage.SelectedIndex = 1; history.Navigate(2); history.GoVisit(-1);
+            check(history.page == 1 && history.compare.Checked && history.stage.SelectedIndex == 1 && history.filter.SelectedIndex == 2 && history.search.Text == "Codex", "navigation restores query scope and original comparison");
+            history.GoVisit(-1); check(history.page == 0 && history.filterButton.Text == "已保存" && history.clearSearch.Visible && history.search.Width == 248, "restored scope and search clear remain correct after hidden-page updates");
+            using (var bitmap = new Bitmap(dialog.Width, dialog.Height)) { dialog.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-history-search.png")); }
+            history.search.Clear(); history.filter.SelectedIndex = 0; history.compare.Checked = false; history.stage.SelectedIndex = 0;
+            int navigationFixtureCount = history.entries.Count; for (int i = 0; i < 12; i++) history.entries.Add(new HistoryEntry { FileName = "scroll-baseline-" + i, Kind = history.entries[0].Kind, Data = HistoryStore.Parse(history.entries[0].Original), Original = history.entries[0].Original }); history.Filter(); history.rows.TopIndex = 8;
+            history.Navigate(1); history.Navigate(2); history.GoVisit(-1); history.GoVisit(-1);
+            check(history.page == 0 && history.rows.TopIndex == 8, "back restores the actual scrolled list position");
+            history.entries.RemoveRange(navigationFixtureCount, 12); history.Filter();
+            navigationFixtureCount = history.entries.Count;
+            for (int i = 0; i < 12; i++) history.entries.Add(new HistoryEntry { FileName = "scroll-fixture-" + i, Kind = history.entries[0].Kind, Data = HistoryStore.Parse(history.entries[0].Original), Original = history.entries[0].Original });
+            history.Filter(); history.rows.TopIndex = 8; string anchorFile = TopFileOf(history.rows); history.Navigate(1); history.Navigate(2);
+            history.entries.Insert(0, new HistoryEntry { FileName = "new-scroll-fixture", Kind = history.entries[0].Kind, Data = HistoryStore.Parse(history.entries[0].Original), Original = history.entries[0].Original }); history.Filter(); history.GoVisit(-1); history.GoVisit(-1);
+            check(TopFileOf(history.rows) == anchorFile && history.rows.TopIndex == 9, "back anchors to the same recording after insertion");
+            history.Navigate(1); history.Navigate(2); history.entries.RemoveAt(0); history.Filter(); history.GoVisit(-1); history.GoVisit(-1);
+            check(TopFileOf(history.rows) == anchorFile && history.rows.TopIndex == 8, "back anchors to the same recording after removal");
+            history.entries.RemoveRange(navigationFixtureCount, 12); history.Filter();
+
+
+
+            history.search.Text = "no-match"; check(history.rows.Items.Count == 0 && history.searchField.Visible, "direct search works");
+            history.clearSearch.PerformClick(); check(history.search.TextLength == 0 && !history.clearSearch.Visible && history.rows.Items.Count == 2 && history.rows.Top == 56, "clear button restores all recordings and hides itself");
+            typeof(Control).GetMethod("OnMouseClick", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(history.rows, new object[] { new MouseEventArgs(MouseButtons.Right, 1, 50, 10, 0) });
+            check(history.page == 0, "right click on recording must not enter editor");
+            typeof(Control).GetMethod("OnMouseClick", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(history.rows, new object[] { new MouseEventArgs(MouseButtons.Left, 1, 50, 74, 0) });
+            check(history.page == 0, "empty card gap does not activate a recording");
+            typeof(Control).GetMethod("OnMouseClick", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(history.rows, new object[] { new MouseEventArgs(MouseButtons.Left, 1, 250, 30, 0) });
+            check(history.page == 0 && history.openRecording.Visible, "single click only selects and exposes explicit open action");
+            typeof(Control).GetMethod("OnMouseDoubleClick", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(history.rows, new object[] { new MouseEventArgs(MouseButtons.Left, 2, 250, 30, 0) });
+            check(history.page == 1, "double click explicitly opens recording");
+            history.Navigate(1); check(history.editorPage.Visible && !history.libraryPage.Visible && !history.materialsPage.Visible && history.save.Visible && !history.export.Visible, "editor page isolates playback correction and save");
+            int visibleButtons = 0; foreach (Control control in history.editorPage.Controls) if (control is Button && control.Visible) visibleButtons++;
+            check(visibleButtons == 2 && history.selected.Visible && !history.compare.Visible, "editor exposes direct training selection and footer save");
+            var materialAction = (ToolStripMenuItem)history.moreMenu.Items[1]; materialAction.Checked = history.selected.Checked;
+            bool wasSelected = history.selected.Checked; materialAction.PerformClick(); check(history.selected.Checked != wasSelected && history.dirty, "context material choice remains explicit and awaits save"); materialAction.PerformClick();
+            history.correct.Text = "今天不用 Codex，先跑测试。"; history.selected.Checked = false; check(history.Save() && !history.current.Flag("selectedForTraining"), "UI saves explicit deselection");
+            history.filter.SelectedIndex = 2; check(history.rows.Items.Count == 1 && history.current.State == "已保存", "saved recordings remain visible without training selection; rows=" + history.rows.Items.Count + "; state=" + (history.current == null ? "null" : history.current.State) + "; filter=" + history.filter.SelectedIndex);
+            history.filter.SelectedIndex = 0;
+            history.selected.Checked = true; check(history.Save(), "UI selects without modifying original");
+            history.stage.SelectedIndex = 1; check(history.original.Text == "今天不用扣desks", "first draft preserved"); history.stage.SelectedIndex = 0;
+            history.filter.SelectedIndex = 2; check(history.rows.Items.Count == 1 && history.current.Flag("reviewed"), "saved filter uses real metadata");
+            history.filter.SelectedIndex = 2; check(history.rows.Items.Count == 1 && history.current.Flag("reviewed") && history.entries.FindAll(item => item.Flag("reviewed") && !item.Flag("ignored")).Count == 1, "visible saved filter finds corrected recordings after reload");
+            history.filter.SelectedIndex = 0; check(history.rows.Items.Count == 2, "all recordings remain accessible");
+            history.ShowOriginal(true); check(history.original.Parent.Visible && history.correct.Text.Contains("Codex"), "optional original comparison preserves correction");
+            check(history.correctLabel.Visible && history.correctLabel.Text.Contains("可编辑") && history.correctLabel.Bottom <= history.correct.Parent.Top && history.originalLabel.Text.Contains("只读"), "comparison gives both text fields explicit visible labels");
+            using (var bitmap = new Bitmap(dialog.Width, dialog.Height)) { dialog.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-history-comparison.png")); }
+            history.ShowOriginal(false); check(history.correctLabel.Visible && history.correctLabel.Bottom <= history.correct.Parent.Top, "editable label also remains visible without comparison");
+            history.filter.SelectedIndex = 0; history.rows.SelectedIndex = 0;
+            string beforeCorrection = history.current.Original; history.correct.Clear(); history.SaveAndNext();
+            check(history.rows.SelectedIndex == 0 && history.current.Original == beforeCorrection && history.correct.Text == "", "failed save does not advance or lose the edit");
+            history.correct.Text = "今天不用 Codex，先跑测试。"; history.selected.Checked = false; history.SaveAndNext();
+            check(history.rows.SelectedIndex == 1 && history.notice.Text.StartsWith("已保存") && !history.selected.Checked && !store.Load(out errors, out bytes).Find(item => item.Kind == "dictation-history").Flag("selectedForTraining"), "save and next persists explicit choice without selecting the next clip");
+            history.rows.SelectedIndex = 0; string beforeSkip = history.current.Original; history.SkipRecord();
+            check(history.rows.SelectedIndex == 1 && store.Load(out errors, out bytes).Find(item => item.Kind == "dictation-history").Original == beforeSkip, "skip advances without changing recording, label or training choice");
+            check(!history.NextRecord() && history.rows.SelectedIndex == 1, "last recording does not wrap or silently change selection");
+            history.SaveAndNext(); check(history.page == 0 && history.libraryPage.Visible, "saving final recording returns directly to list"); history.Undo(); history.Navigate(1);
+            history.rows.SelectedIndex = 0; history.selected.Checked = true; check(history.Save(), "selection remains explicit after guided review");
+            history.Undo(); check(!history.current.Flag("selectedForTraining"), "undo restores previous training choice after save and next");
+            history.ChangeEntries("pending", false); check(!history.current.Flag("reviewed") && !history.current.Flag("selectedForTraining") && history.current.Text("correctText").Contains("Codex"), "reopen keeps corrected label and original audio");
+            history.Undo(); check(history.current.Flag("reviewed"), "undo reopens saved state");
+            history.SetBatchMode(true); foreach (HistoryEntry item in history.rows.Items) history.marked.Add(item.FileName); history.UpdateMarked();
+            history.ChangeEntries("select", true); check(history.entries.FindAll(item => item.Flag("selectedForTraining")).Count == 0 && history.notice.Text.Contains("未核对"), "bulk selection rejects unreviewed records without partial changes");
+            foreach (HistoryEntry item in history.rows.Items) history.marked.Add(item.FileName);
+            history.ChangeEntries("ignore", true); check(history.entries.TrueForAll(item => item.Flag("ignored")), "bulk ignore preserves all recordings");
+            history.Undo(); check(history.entries.TrueForAll(item => !item.Flag("ignored")), "one undo restores entire batch");
+            foreach (HistoryEntry item in history.rows.Items) history.marked.Add(item.FileName);
+            history.ChangeEntries("pending", true); check(history.entries.TrueForAll(item => !item.Flag("reviewed") && !item.Flag("selectedForTraining")), "bulk reopen clears training choices"); history.Undo();
+            history.rows.SelectedIndex = 1; history.correct.Text = "今天不用 Codex，先跑测试。"; check(history.Save(), "second recording explicitly reviewed");
+            foreach (HistoryEntry item in history.rows.Items) history.marked.Add(item.FileName);
+            history.ChangeEntries("select", true); check(history.entries.TrueForAll(item => item.Flag("selectedForTraining")), "bulk select reviewed records");
+            foreach (HistoryEntry item in history.rows.Items) history.marked.Add(item.FileName);
+            history.ChangeEntries("unselect", true); check(history.entries.TrueForAll(item => !item.Flag("selectedForTraining") && item.Flag("reviewed")), "bulk deselect retains reviewed text"); history.Undo();
+            history.SetBatchMode(false);
+            using (var bitmap = new Bitmap(dialog.Width, dialog.Height)) { dialog.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-history.png")); }
+            history.Navigate(1);
+            using (var bitmap = new Bitmap(dialog.Width, dialog.Height)) { dialog.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-history-editor.png")); }
+            history.Navigate(2); check(history.materialsPage.Visible && !history.editorPage.Visible && !history.libraryPage.Visible && history.materialRows.Items.Count == 2 && history.export.Visible && !history.save.Visible, "materials page previews candidates with isolated batch preparation");
+            check(history.trainingInfo.Visible && history.trainingHelp.GetToolTip(history.trainingInfo) == TrainingExplanation && history.materialRows.Height == 256 && history.materialsPage.Top + history.materialRows.Bottom <= history.notice.Top, "training help is beside title and freed space belongs to list");
+            history.archivedBatch.PerformClick(); check(history.ArchiveTab && history.batchPicker.Visible && !history.batchNameField.Visible, "archived tab separates read-only batch browsing");
+            string archivePath = history.batches[history.batchChoice.SelectedIndex - 1].Path, manifestBefore = File.ReadAllText(Path.Combine(archivePath, "manifest.json"));
+            string lifecycleBefore = history.batches[history.batchChoice.SelectedIndex - 1].Lifecycle;
+            Action<Task> finishArchive = task => { var timer = Stopwatch.StartNew(); while (!task.IsCompleted && timer.ElapsedMilliseconds < 10000) { Application.DoEvents(); Thread.Sleep(5); } check(task.IsCompleted && !task.IsFaulted, "archive status task completes"); };
+            finishArchive(history.ToggleArchive()); check(history.batches[history.batchChoice.SelectedIndex - 1].Withdrawn && history.export.Text == "恢复归档", "archived batch can be withdrawn and exposes restore");
+            check(history.archiveSelected.Count > 0 && File.ReadAllText(Path.Combine(archivePath, "manifest.json")) == manifestBefore, "withdrawal returns existing selected recordings without rewriting snapshot");
+            bool lifecycleConflict = false; try { store.SetArchiveState(archivePath, lifecycleBefore, false); } catch (IOException) { lifecycleConflict = true; } check(lifecycleConflict, "stale archive status cannot overwrite a newer transition");
+            using (var bitmap = new Bitmap(dialog.Width, dialog.Height)) { dialog.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-archive-withdrawn.png")); }
+            finishArchive(history.ToggleArchive()); check(!history.batches[history.batchChoice.SelectedIndex - 1].Withdrawn && history.export.Text == "撤回归档" && File.ReadAllText(Path.Combine(archivePath, "manifest.json")) == manifestBefore, "restore reuses exactly the original archive snapshot");
+            var lifecycle = HistoryStore.Parse(File.ReadAllText(Path.Combine(archivePath, "lifecycle.json"))); check(((object[])lifecycle["history"]).Length == 2, "archive roundtrip preserves transition history");
+            using (var bitmap = new Bitmap(dialog.Width, dialog.Height)) { dialog.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-history-archives.png")); }
+            history.pendingBatch.PerformClick(); history.batchName.Text = "个人微调 第一次"; history.UpdateMaterials(); check(!history.ArchiveTab && history.batchNameField.Visible && history.batchName.Text == "个人微调 第一次", "new batch has an editable name retained across refresh");
+            history.materialAll.PerformClick(); check(history.archiveSelected.Count == history.materialRows.Items.Count, "training has select-all"); history.materialClear.PerformClick(); check(history.archiveSelected.Count == 0, "training has clear-selection");
+            history.batchChoice.SelectedIndex = 0; history.archiveSelected.Clear(); history.UpdateMaterials(); check(history.archiveSelected.Count == 0 && !history.export.Enabled, "second confirmation is not silently reset by refresh");
+            history.archiveSelected.Add(((HistoryEntry)history.materialRows.Items[0]).FileName); history.BatchSummary(); check(history.export.Enabled, "new archive only enables for explicitly confirmed recordings");
+            check(history.batches.Count > 0, "existing batches are visible in selector"); history.batchChoice.SelectedIndex = 1; check(history.export.Enabled && history.export.Text == "撤回归档" && history.ArchivedView && history.materialSummary.Text.Contains("快照保留"), "immutable snapshot has a reversible archive status"); history.batchChoice.SelectedIndex = 0;
+
+            using (var bitmap = new Bitmap(dialog.Width, dialog.Height)) { dialog.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-history-materials.png")); }
+            history.materialRows.SelectedIndex = 0;
+            typeof(Control).GetMethod("OnMouseClick", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(history.materialRows, new object[] { new MouseEventArgs(MouseButtons.Right, 1, 50, 10, 0) });
+            check(history.page == 2, "right click on training material does not navigate");
+            for (int i = 0; i < 10; i++) history.materialRows.Items.Add(history.entries[0]);
+            check(history.materialScroll.Overflows, "long training material list exposes a real scrollbar"); history.materialScroll.CheckForTest();
+            int bufferedBefore = history.materialRows.BufferedPaints; int paintNotices = 0; Action originalView = history.materialRows.ViewChanged; history.materialRows.ViewChanged += () => paintNotices++;
+            for (int i = 0; i < 10; i++) { history.materialRows.Refresh(); Application.DoEvents(); }
+            history.materialRows.ViewChanged = originalView; check(history.materialRows.BufferedItems > 0, "direct native owner-draw also renders a complete row offscreen"); check(history.materialRows.BufferedPaints >= bufferedBefore + 10, "each actual card paint is composed offscreen before presentation"); check(paintNotices <= 1, "stationary repaint does not repeatedly invalidate the scrollbar");
+            using (var bitmap = new Bitmap(dialog.Width, dialog.Height)) { dialog.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-history-scroll.png")); }
+            history.UpdateMaterials(); history.materialRows.SelectedIndex = 0;
+            typeof(Control).GetMethod("OnMouseClick", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(history.materialRows, new object[] { new MouseEventArgs(MouseButtons.Left, 1, 50, 10, 0) });
+            check(history.page == 2, "click anywhere on a new-batch card toggles confirmation without opening editor");
+            typeof(Control).GetMethod("OnKeyDown", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(history.materialRows, new object[] { new KeyEventArgs(Keys.Enter) });
+            check(history.page == 1 && history.current != null, "Enter material returns to correction");
+            history.Navigate(0); check(history.page == 0 && history.libraryPage.Visible && !history.editorPage.Visible && !history.materialsPage.Visible && !history.filter.Visible, "return restores simple library and hides other page controls");
+            history.SetBatchMode(true); history.marked.Clear();
+            typeof(Control).GetMethod("OnMouseClick", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(history.rows, new object[] { new MouseEventArgs(MouseButtons.Left, 1, 250, 30, 0) });
+            check(history.marked.Count == 1 && history.page == 0, "batch mode card body toggles selection");
+            typeof(Control).GetMethod("OnMouseClick", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(history.rows, new object[] { new MouseEventArgs(MouseButtons.Left, 1, 250, 30, 0) });
+            check(history.marked.Count == 0, "second card-body click unchecks");
+            foreach (HistoryEntry item in history.rows.Items) history.marked.Add(item.FileName); history.UpdateMarked();
+            using (var bitmap = new Bitmap(dialog.Width, dialog.Height)) { dialog.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-history-batch.png")); }
+            history.bulkMenu.Fit(); history.bulkMenu.PerformLayout(); foreach (ToolStripItem item in history.bulkMenu.Items) if (!(item is ToolStripSeparator)) check(item.Width >= TextRenderer.MeasureText(item.Text, history.bulkMenu.Font).Width + 38, "action text fits renderer inset without truncation");
+            using (var bitmap = new Bitmap(history.bulkMenu.Width, history.bulkMenu.Height)) { history.bulkMenu.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-history-actions.png")); }
+            history.SetBatchMode(false);
+            history.Navigate(2); history.batchChoice.SelectedIndex = 1; string rememberedBatch = history.batches[0].Path;
+            history.Navigate(3); var reviewWait = Stopwatch.StartNew();
+            while (history.reviewPage.busy && reviewWait.ElapsedMilliseconds < 10000) { Application.DoEvents(); Thread.Sleep(5); }
+            history.reviewPage.CheckForTest(work, history.current.Kind + ":" + history.current.Text("id"), history.batches[0].Path); history.GoVisit(-1); check(history.page == 2 && history.ArchivedView && history.batches[history.batchChoice.SelectedIndex - 1].Path == rememberedBatch, "back navigation remembers the concrete archived batch"); history.Navigate(0);
+            string expected = history.current.Original; File.AppendAllText(history.current.FileName, " ");
+            history.Undo(); check(history.notice.Text.Contains("外部修改") && File.ReadAllText(history.current.FileName) == expected + " ", "undo never overwrites external edits");
+            File.WriteAllText(history.current.FileName, expected); history.Undo(); check(history.entries.TrueForAll(item => !item.Flag("selectedForTraining")), "undo can retry after conflict resolved");
+            history.Navigate(1); history.search.Text = "no-match"; check(history.rows.Items.Count == 0 && history.empty.Visible && history.page == 0 && !history.save.Visible, "empty editor returns to list instead of exposing ineffective actions"); history.search.Clear();
+            foreach (Control control in history.Controls) check(history.ClientRectangle.Contains(control.Bounds), "history controls stay inside client area: " + control.Text);
+            foreach (var panel in new Panel[] { history.libraryPage, history.editorPage, history.materialsPage, history.reviewPage }) foreach (Control control in panel.Controls) check(panel.ClientRectangle.Contains(control.Bounds), "page controls stay inside their page: " + control.Text);
+            check(history.libraryPage.Bounds == history.editorPage.Bounds && history.libraryPage.Bounds == history.materialsPage.Bounds && history.libraryPage.Left == 304, "all pages share the dictionary content grid");
+            check(history.save.Bounds == history.export.Bounds && history.save.Top == 506 && history.save.Height == 52 && history.save.Width == 124, "primary actions match dictionary footer geometry");
+            check(!history.markedLabel.Visible || history.rows.Bottom <= history.markedLabel.Top, "batch count never intercepts clicks in recording rows");
+            check(history.correct.Parent.Width == 554 && history.original.Parent.Width == 554 && history.materialRows.Width + 16 == 554, "editor and materials share the same content width");
+            check(history.editorPage.Top + history.correct.Parent.Bottom <= history.Notice.Top, "editor never overlaps the status region");
+            Func<Color, double> luminance = color => { Func<byte, double> channel = v => v / 255.0 <= .04045 ? v / 255.0 / 12.92 : Math.Pow((v / 255.0 + .055) / 1.055, 2.4); return .2126 * channel(color.R) + .7152 * channel(color.G) + .0722 * channel(color.B); };
+            Func<Color, Color, double> contrast = (a, b) => (Math.Max(luminance(a), luminance(b)) + .05) / (Math.Min(luminance(a), luminance(b)) + .05);
+            check(contrast(Ink, Field) >= 4.5 && contrast(Dim, Field) >= 4.5 && contrast(Dim, Face) >= 4.5 && contrast(Dim, Color.FromArgb(232, 231, 228)) >= 4.5, "body and secondary text meet 4.5 contrast benchmark");
+            check(contrast(DictionaryField.BorderInk, Field) >= 3 && contrast(DictionaryButton.OutlineInk, Color.White) >= 3 && contrast(DictionaryScrollBar.IdleInk, Field) >= 3, "interactive boundaries and idle scrollbar meet 3 contrast benchmark");
+            check(contrast(Dim, HistoryCard.NumberInk) >= 4.5 && contrast(Dim, HistoryCard.SelectedNumberInk) >= 4.5 && contrast(Ink, HistoryCard.SelectedPaper) >= 4.5, "text remains legible over the index and checked card background");
+            check(contrast(Color.White, HistoryCard.MarkInk) >= 4.5, "custom checkmark has clear selected contrast");
+            check(history.Font.Name == HistoryCard.TextFamily && history.reviewPage.Font.Name == HistoryCard.TextFamily && history.editorTag.Font.Name == HistoryCard.TextFamily && history.batchChoice.Font.Name == HistoryCard.TextFamily && history.stage.Font.Name == HistoryCard.TextFamily, "history body, verification and status labels use the same explicit Chinese UI font");
+            check(history.rows.CardFeedback && history.materialRows.CardFeedback && history.rowsScroll.CardTrack && history.materialScroll.CardTrack, "list hover and visible scroll tracks are scoped to history cards");
+            double tagMinimum = double.MaxValue;
+            using (var palette = new Bitmap(520, 72)) using (var graphics = Graphics.FromImage(palette)) using (var font = new Font("Segoe UI Variable Text", 9.5f)) {
+                graphics.Clear(Face); int x = 18;
+                foreach (string state in new[] { "待核对", "已保存", "已选训练", "已忽略" }) {
+                    Color ink, fill; HistoryStatusTag.Colors(state, out ink, out fill); tagMinimum = Math.Min(tagMinimum, contrast(ink, fill));
+                    check(contrast(ink, fill) >= 4.5, "colored status tag remains readable: " + state);
+                    x += HistoryStatusTag.Draw(graphics, state, font, new Point(x, 24)) + 12;
+                }
+                check(x < palette.Width, "all four status tags fit without clipping"); palette.Save(Path.Combine(work, "dictionary-status-tags.png"));
+            }
+            check(history.editorTag.Width < 150 && !history.editorTag.TabStop, "status label does not create an extra action or keyboard stop");
+            File.WriteAllText(Path.Combine(work, "dictionary-ui-audit.txt"), "UI-AUDIT PASS\r\nText over watermark minimum: " + Math.Min(contrast(Dim, HistoryCard.NumberInk), contrast(Dim, HistoryCard.SelectedNumberInk)).ToString("0.00") + "\r\nChecked card/text: " + contrast(Ink, HistoryCard.SelectedPaper).ToString("0.00") + "\r\nWhite checkmark/blue: " + contrast(Color.White, HistoryCard.MarkInk).ToString("0.00") + "\r\nBody/field: " + contrast(Ink, Field).ToString("0.00") + "\r\nSecondary/field: " + contrast(Dim, Field).ToString("0.00") + "\r\nSecondary/page: " + contrast(Dim, Face).ToString("0.00") + "\r\nSecondary/selected: " + contrast(Dim, Color.FromArgb(232, 231, 228)).ToString("0.00") + "\r\nField edge/field: " + contrast(DictionaryField.BorderInk, Field).ToString("0.00") + "\r\nButton edge/white: " + contrast(DictionaryButton.OutlineInk, Color.White).ToString("0.00") + "\r\nScrollbar/field: " + contrast(DictionaryScrollBar.IdleInk, Field).ToString("0.00") + "\r\nColored tag minimum: " + tagMinimum.ToString("0.00") + "\r\nRight/left click, material scrollbar drag/Home/End/wheel, empty editor, save/undo and grouped actions: PASS\r\n");
+            foreach (var item in history.entries) store.ChangeState(item, "pending");
+            history.visits.Clear(); history.visitIndex = -1; history.Navigate(0); history.filter.SelectedIndex = 1; history.Filter(); history.RecordVisit();
+            history.rows.SelectedIndex = 0; history.Navigate(1); history.SaveAndNext(); history.GoVisit(-1); history.GoVisit(-1);
+            check(history.page == 0 && history.rows.Items.Contains(history.current) && history.rows.SelectedItem == history.current, "back after saving a filtered recording keeps current equal to visible selection");
+            check(backArrow.ForeColor != backArrow.DisabledInk && forwardArrow.ForeColor != forwardArrow.DisabledInk, "navigation arrows have distinct active and inactive colors");
+            foreach (Control control in dialog.Controls) if (control is Button && control.Text == "词语") ((Button)control).PerformClick();
+            check(!backArrow.Visible && !forwardArrow.Visible, "returning to word workspace hides arrows again");
+            dialog.Close();
+        }
+        string damaged = Path.Combine(folder, Guid.NewGuid().ToString("N") + ".json"); File.WriteAllText(damaged, "{broken");
+        store.Load(out errors, out bytes); check(errors.Length > 0, "corrupt records are reported");
+        failed = false; try { store.Export(); } catch (IOException) { failed = true; } check(failed, "corrupt records block incomplete batches"); File.Move(damaged, damaged + ".bad");
+        daily = store.Load(out errors, out bytes).Find(item => item.Kind == "dictation-history"); store.Remove(daily);
+        check(File.Exists(daily.Audio) && File.Exists(daily.FileName + ".deleted") && store.Load(out errors, out bytes).Count == 1, "delete retains recoverable original audio and labels");
+        string deleteRoot = Path.Combine(root, "delete-fixture"); var deleteSamples = new VoiceSampleStore(deleteRoot);
+        for (int i = 0; i < 3; i++) deleteSamples.Save("删除测试", "完整句子" + i, pcm);
+        var deleteStore = new HistoryStore(deleteRoot); var deleteEntries = deleteStore.Load(out errors, out bytes);
+        deleteStore.Save(deleteEntries[0], deleteEntries[0].Text("correctText"), true, false); deleteStore.Save(deleteEntries[1], deleteEntries[1].Text("correctText"), true, false);
+        string protectedBatch = deleteStore.Export();
+        using (var owner = new Form { StartPosition = FormStartPosition.Manual, Location = new Point(-20000, -20000), Size = new Size(878, 560), ShowInTaskbar = false }) using (var panel = new HistoryPanel(deleteRoot)) {
+            owner.Controls.Add(panel); owner.Show(); Action<Task> finish = task => { var timer = Stopwatch.StartNew(); while (!task.IsCompleted && timer.ElapsedMilliseconds < 10000) { Application.DoEvents(); Thread.Sleep(5); } check(task.IsCompleted && !task.IsFaulted, "delete task completes"); };
+            finish(panel.Reload()); panel.SetBatchMode(true); panel.filter.SelectedIndex = 2;
+            check(panel.rows.Items.Count == 2 && panel.bulkMenu.Items[panel.bulkMenu.Items.Count - 1].Text.Contains("删除录音"), "batch menu exposes deletion");
+            foreach (var item in panel.entries) panel.marked.Add(item.FileName);
+            var first = (HistoryEntry)panel.rows.Items[0]; var second = (HistoryEntry)panel.rows.Items[1];
+            bool outsideBlocked = false; try { deleteStore.ValidatePermanentRemoval(new HistoryEntry { Kind = first.Kind, FileName = Path.Combine(deleteRoot, "outside", Path.GetFileName(first.FileName)), Data = first.Data, Original = first.Original }); } catch (IOException) { outsideBlocked = true; } check(outsideBlocked && File.Exists(first.Audio), "permanent deletion refuses a path outside source folder");
+            File.AppendAllText(second.FileName, " "); finish(panel.DeleteMarked(true)); check(File.Exists(first.Audio) && File.Exists(first.FileName) && panel.notice.Text.StartsWith("未删除"), "whole-group conflict preflight prevents any deletion"); File.WriteAllText(second.FileName, second.Original);
+            using (var locked = new FileStream(second.Audio, FileMode.Open, FileAccess.Read, FileShare.None)) finish(panel.DeleteMarked(true));
+            check(!File.Exists(first.FileName) && !File.Exists(first.Audio) && File.Exists(second.FileName) && panel.notice.Text.StartsWith("完整删除 1 条"), "partial failure reports real complete count and stops");
+            foreach (HistoryEntry item in panel.rows.Items) panel.marked.Add(item.FileName); finish(panel.DeleteMarked(true));
+            check(deleteStore.Load(out errors, out bytes).Count == 1 && !File.Exists(second.FileName) && !File.Exists(second.Audio), "bulk delete removes source audio and metadata, excluding hidden unchecked scope");
+            check(File.Exists(Path.Combine(protectedBatch, "manifest.json")) && Directory.GetFiles(Path.Combine(protectedBatch, "audio")).Length == 2, "permanent source deletion preserves immutable archive copies");
+            using (var confirmation = new DictionaryDeleteDialog("", true, 2)) { check(confirmation.Text == "永久删除录音" && confirmation.AcceptButton == confirmation.CancelButton, "permanent confirmation defaults to cancellation"); confirmation.StartPosition = FormStartPosition.Manual; confirmation.Location = new Point(-20000, -20000); confirmation.Show(owner); using (var bitmap = new Bitmap(confirmation.Width, confirmation.Height)) { confirmation.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-history-delete-confirm.png")); } confirmation.Close(); }
+            owner.Close();
+        }
+        Console.WriteLine("HISTORY-TEST PASS: archive withdrawal and restoration with immutable snapshots / custom named batch tabs / full-width search / explicit open / untruncated action menus / buffered native paint and direct draw / training title help and larger list / coalesced paint notifications / whole-card multi-select / permanent bulk deletion with conflict and partial-failure guards / opt-in / daily and manual review / original texts / explicit selection / deselection / conflict / immutable selected batch / source groups / corrupt records / safe delete / simple editor with one save action / optional controls in context / completion returns to list / record training verification modules / archive second confirmation and agent JSONL / separate library editor and materials pages / direct navigation and return / mouse button guards / material scrollbar drag and keyboard / empty editor guard / text and component contrast / filtered back selection consistency / stable scroll identity / search clear buttons / scoped navigation visibility / back and forward visit memory / forward branch reset / four semantic color tags with text / shared dictionary grid and footer / aligned content widths / no status overlap / contextual buttons with borders / four filters / bulk select and deselect / bulk ignore and reopen / grouped undo / review gate / visible saved list / saved counts and row states / simple default / optional comparison / save and next / failed-save retention / skip unchanged / offscreen layout");
+    }
+    protected override void OnPaint(PaintEventArgs e) {
+        base.OnPaint(e); using (var pen = new Pen(Color.FromArgb(220, 218, 214))) { e.Graphics.DrawLine(pen, 280, 4, 280, 490); e.Graphics.DrawLine(pen, 4, 490, 872, 490); }
+    }
+    protected override void Dispose(bool disposing) { if (disposing) { if (capture != null && !capture.IsDisposed) capture.Dispose(); Stop(); batchChoice.Dispose(); trainingHelp.Dispose(); moreMenu.Dispose(); filter.Dispose(); playback.Dispose(); player.Dispose(); } base.Dispose(disposing); }
 }
 
 sealed class DictionaryHelpIcon : Control
@@ -911,15 +2369,15 @@ class DictionaryWindow : Form
 sealed class DictionaryDeleteDialog : DictionaryWindow
 {
     readonly Button confirm, cancel;
-    public DictionaryDeleteDialog(string word, bool sample = false) {
-        Text = "确认删除词语"; AccessibleName = Text;
+    public DictionaryDeleteDialog(string word, bool sample = false, int recordCount = 0) {
+        Text = recordCount > 0 ? "永久删除录音" : "确认删除词语"; AccessibleName = Text;
         FormBorderStyle = FormBorderStyle.None; ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent; AutoScaleMode = AutoScaleMode.None;
         ClientSize = new Size(480, 244); BackColor = Color.FromArgb(251, 250, 248); DoubleBuffered = true;
-        var title = DictionaryDialog.Caption(sample ? "删除这段录音？" : "删除这个词语？", 28, 24, Color.FromArgb(20, 25, 31));
+        var title = DictionaryDialog.Caption(recordCount > 0 ? "永久删除 " + recordCount + " 条录音？" : sample ? "删除这段录音？" : "删除这个词语？", 28, 24, Color.FromArgb(20, 25, 31));
         title.Font = new Font("Microsoft YaHei UI", 18f, FontStyle.Bold); Controls.Add(title);
-        var detail = DictionaryDialog.Caption(sample ? "将从样本列表移除这段录音。\n原始文件保留在本机，不会删除词条。" : "将移除「" + word + "」及其纠错写法。\n删除后 10 秒内可撤回，保存后生效。", 28, 78, Color.FromArgb(102, 106, 113));
-        detail.AutoSize = false; detail.Size = new Size(424, 78); detail.Font = new Font("Segoe UI Variable Text", 12f);
+        var detail = DictionaryDialog.Caption(recordCount > 0 ? "删除所选原音与对应标注，无法撤销。\n已归档批次和验证记录中的副本仍保留。" : sample ? "将从样本列表移除这段录音。\n原始文件保留在本机，不会删除词条。" : "将移除「" + word + "」及其纠错写法。\n删除后 10 秒内可撤回，保存后生效。", 28, 78, Color.FromArgb(102, 106, 113));
+        detail.AutoSize = false; detail.Size = new Size(424, 78); detail.Font = new Font(recordCount > 0 ? HistoryCard.TextFamily : "Segoe UI Variable Text", 12f);
         Controls.Add(detail);
         cancel = DictionaryDialog.MakeButton("取消", new Rectangle(228, 178, 100, 42), () => { DialogResult = DialogResult.Cancel; Close(); });
         confirm = DictionaryDialog.MakeButton("删除", new Rectangle(344, 178, 108, 42), () => { DialogResult = DialogResult.OK; Close(); });
@@ -1015,45 +2473,32 @@ sealed class DictionaryDialog : DictionaryWindow
     readonly TextBox previewOutput = new TextBox();
     readonly Label previewHits = new DictionaryLabel();
     readonly ToolTip help = new ToolTip();
-    readonly Panel textPage = new Panel(), voicePage = new Panel();
-    readonly TextBox spokenText = new TextBox();
-    readonly DictionaryListBox samplesList = new DictionaryListBox();
-    readonly Label sampleNotice = new DictionaryLabel();
-    readonly Label captureTime = new DictionaryLabel();
-    readonly Panel meter = new Panel();
-    readonly VoiceSampleStore sampleStore;
-    readonly System.Windows.Forms.Timer sampleTimer = new System.Windows.Forms.Timer { Interval = 80 };
-    readonly Stopwatch sampleClock = new Stopwatch();
-    readonly List<float> sampleLevels = new List<float>();
-    readonly System.Media.SoundPlayer samplePlayer = new System.Media.SoundPlayer();
-    Button textTab, voiceTab, recordButton, sampleSaveButton, samplePlayButton, sampleDeleteButton;
-    Recorder sampleRecorder;
-    MemoryStream sampleAudio;
-    byte[] pendingAudio;
-    string recordingWord;
-    bool sampleStarting;
-    int sampleStartRevision;
-    double playbackUntil;
-    internal Func<Task> PrepareRecording;
-    internal bool RecordingBusy { get { return sampleStarting || sampleRecorder != null; } }
+    readonly Panel textPage = new Panel();
+    internal Func<Task> PrepareRecording { get { return historyPage.PrepareRecording; } set { historyPage.PrepareRecording = value; } }
+    internal bool RecordingBusy { get { return historyPage.RecordingBusy; } }
+    internal void StopSampleRecording() { historyPage.StopCapture(); }
     sealed class DeletedWord { internal WordGroup Group; internal int Index; internal long Deadline; }
     readonly List<DeletedWord> deleted = new List<DeletedWord>();
     readonly Stopwatch undoClock = Stopwatch.StartNew();
     readonly System.Windows.Forms.Timer undoTimer = new System.Windows.Forms.Timer { Interval = 100 };
     readonly DictionaryUndoBar undoBar;
     Func<string, bool> confirmDeletion;
-    Button saveButton, addButton, deleteButton, previewButton;
+    Button saveButton, addButton, deleteButton, previewButton, clearWordSearch;
     Process previewWorker;
     int previewRevision;
     string loadedText;
     bool loadFailed;
     int current = -1;
     bool silent, dirty;
+    readonly HistoryPanel historyPage;
+    readonly Button wordsWorkspace, historyWorkspace, navBack, navForward;
+    readonly List<Control> hiddenWordControls = new List<Control>();
     Point dragFrom;
 
     public DictionaryDialog(string root, string previewRoot = null) {
         this.root = previewRoot ?? root;
-        path = Path.Combine(root, "dictionary.json"); sampleStore = new VoiceSampleStore(root);
+        historyPage = new HistoryPanel(root) { Location = new Point(24, 100), Visible = false };
+        path = Path.Combine(root, "dictionary.json");
         Text = "个人词典"; FormBorderStyle = FormBorderStyle.None; ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterScreen; TopMost = true; AutoScaleMode = AutoScaleMode.None;
         ClientSize = new Size(926, 680); BackColor = Face; ForeColor = Ink;
@@ -1063,13 +2508,13 @@ sealed class DictionaryDialog : DictionaryWindow
         title.Font = new Font("Microsoft YaHei UI", 24f, FontStyle.Bold); Controls.Add(title);
         var info = new DictionaryHelpIcon { Bounds = new Rectangle(title.Right + 12, 35, 22, 22), BackColor = Color.Transparent,
             ForeColor = Dim, AccessibleName = "词典与录音说明", TabStop = true };
-        const string explanation = "填写错法可直接纠正文字；新规则在中文、纯英文和混说中生效，旧规则保留原设置。\n按列表顺序前 64 词参与近音救援，超出部分的错法纠正仍有效；纯中文暂无同等救援。\n每个词可保存多段录音，每段填写对应的完整文字，支持单词或句子。\n录音仅保存在本机，用于后续批量训练；保存样本不等于模型已学会。\n删除词语不会删除已有录音。文字预览不测试声音。";
+        const string explanation = "填写错法可直接纠正文字；新规则在中文、纯英文和混说中生效，旧规则保留原设置。\n按列表顺序前 64 词参与近音救援，超出部分的错法纠正仍有效；纯中文暂无同等救援。\n听写记录集中试听、修正完整文字；需要主动补录时，在听写记录点补录。\n录音仅保存在本机，明确勾选才会进入训练材料；保存样本不等于模型已学会。\n删除词语不会删除已有录音。文字预览不测试声音。";
         info.AccessibleDescription = explanation;
         help.InitialDelay = 350; help.ReshowDelay = 100; help.AutoPopDelay = 15000; help.SetToolTip(info, explanation);
         info.Enter += (o, e) => { if (Bounds.IntersectsWith(Screen.FromControl(this).WorkingArea)) help.Show(explanation, info, 0, info.Height + 6, 15000); };
         info.Leave += (o, e) => help.Hide(info); info.MouseLeave += (o, e) => help.Hide(info); Controls.Add(info);
-        counts.Bounds = new Rectangle(338, 34, 500, 48); counts.ForeColor = Dim;
-        counts.Font = new Font(Font.FontFamily, 10.5f); Controls.Add(counts);
+        counts.Bounds = new Rectangle(338, 72, 556, 32); counts.ForeColor = Dim;
+        counts.Font = new Font(Font.FontFamily, 9f); Controls.Add(counts);
         var close = IconButton("close", "关闭词典", new Rectangle(854, 24, 40, 40), Close); Controls.Add(close);
 
         var searchField = new DictionaryField { Bounds = new Rectangle(34, 104, 248, 42), Glyph = "search" };
@@ -1078,6 +2523,8 @@ sealed class DictionaryDialog : DictionaryWindow
         search.AccessibleName = "搜索词语或错法";
         search.TextChanged += (o, e) => { if (!silent) { Commit(); FilterList(); } };
         searchField.Controls.Add(search); Controls.Add(searchField);
+        clearWordSearch = IconButton("close", "清空词语搜索", new Rectangle(210, 5, 32, 32), () => { search.Clear(); search.Focus(); }); clearWordSearch.BackColor = Field; clearWordSearch.Visible = false; searchField.Controls.Add(clearWordSearch);
+        search.TextChanged += (o, e) => { bool hasQuery = search.TextLength > 0; clearWordSearch.Visible = hasQuery; search.Width = hasQuery ? 162 : 194; };
         var listClip = new Panel { Bounds = new Rectangle(34, 162, 248, 410), BackColor = Face };
         list.Bounds = new Rectangle(0, 0, 248, 410); list.DrawMode = DrawMode.OwnerDrawFixed;
         list.ItemHeight = 41; list.BorderStyle = BorderStyle.None; list.BackColor = Face; list.ForeColor = Ink;
@@ -1091,19 +2538,14 @@ sealed class DictionaryDialog : DictionaryWindow
         wordTitle.Bounds = new Rectangle(334, 102, 504, 46); wordTitle.Font = new Font(Font.FontFamily, 22f, FontStyle.Bold); Controls.Add(wordTitle);
         deleteButton = IconButton("trash", "删除词语", new Rectangle(854, 104, 40, 40), Remove); Controls.Add(deleteButton);
         scope.Bounds = new Rectangle(338, 151, 556, 24); scope.ForeColor = Dim; scope.Font = new Font(Font.FontFamily, 10f); Controls.Add(scope);
-        textTab = MakeButton("文字纠正", new Rectangle(338, 186, 272, 40), () => SelectPage(false));
-        voiceTab = MakeButton("录音纠音", new Rectangle(622, 186, 272, 40), () => SelectPage(true));
-        ((DictionaryButton)textTab).Glyph = "edit"; ((DictionaryButton)voiceTab).Glyph = "mic";
-        textTab.Font = voiceTab.Font = new Font(Font.FontFamily, 12f);
-        Controls.Add(textTab); Controls.Add(voiceTab);
-        textPage.Bounds = voicePage.Bounds = new Rectangle(338, 242, 556, 332);
-        textPage.BackColor = voicePage.BackColor = Face; Controls.Add(textPage); Controls.Add(voicePage);
+        textPage.Bounds = new Rectangle(338, 196, 556, 378);
+        textPage.BackColor = Face; Controls.Add(textPage);
 
         var variantLabel = Caption("容易识别成", 0, 0, Dim); variantLabel.Font = new Font(Font.FontFamily, 12f); textPage.Controls.Add(variantLabel);
         var variantHint = Caption("每行一项 · 粘贴自动整理", 340, 3, Dim); variantHint.Font = new Font(Font.FontFamily, 10f); textPage.Controls.Add(variantHint);
-        var field = new DictionaryField { Bounds = new Rectangle(0, 32, 556, 140) };
-        var textClip = new Panel { Bounds = new Rectangle(16, 12, 512, 114), BackColor = Field };
-        variants.Bounds = new Rectangle(0, 0, 512, 114); variants.Font = new Font(Font.FontFamily, 15f);
+        var field = new DictionaryField { Bounds = new Rectangle(0, 32, 556, 186) };
+        var textClip = new Panel { Bounds = new Rectangle(16, 12, 512, 160), BackColor = Field };
+        variants.Bounds = new Rectangle(0, 0, 512, 160); variants.Font = new Font(Font.FontFamily, 15f);
         variants.Multiline = true; variants.ScrollBars = ScrollBars.None; variants.BorderStyle = BorderStyle.None;
         variants.BackColor = Field; variants.ForeColor = Ink; variants.AcceptsReturn = true; variants.AccessibleName = "容易识别成，每行一种写法";
         variants.TextChanged += (o, e) => { if (!silent) { Commit(); MarkDirty(); } };
@@ -1114,11 +2556,11 @@ sealed class DictionaryDialog : DictionaryWindow
             () => Math.Max(1, variants.ClientSize.Height / variants.Font.Height),
             () => (int)DictionaryScrollBar.SendMessage(variants.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero),
             value => { int line = (int)DictionaryScrollBar.SendMessage(variants.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero); DictionaryScrollBar.SendMessage(variants.Handle, 0x00B6, IntPtr.Zero, new IntPtr(value - line)); });
-        textScroll.Bounds = new Rectangle(538, 12, 12, 114); textScroll.BackColor = Field;
+        textScroll.Bounds = new Rectangle(538, 12, 12, 160); textScroll.BackColor = Field;
         variants.ViewChanged = () => { textScroll.TabStop = textScroll.Overflows; textScroll.Invalidate(); };
         field.Controls.Add(textScroll); textPage.Controls.Add(field);
-        var previewLabel = Caption("文字预览", 0, 190, Dim); previewLabel.Font = new Font(Font.FontFamily, 12f); textPage.Controls.Add(previewLabel);
-        var previewField = new DictionaryField { Bounds = new Rectangle(0, 222, 556, 42) };
+        var previewLabel = Caption("文字预览", 0, 236, Dim); previewLabel.Font = new Font(Font.FontFamily, 12f); textPage.Controls.Add(previewLabel);
+        var previewField = new DictionaryField { Bounds = new Rectangle(0, 268, 556, 42) };
         previewInput.Bounds = new Rectangle(14, 11, 490, 24); previewInput.Font = new Font(Font.FontFamily, 12f);
         previewInput.BorderStyle = BorderStyle.None; previewInput.BackColor = Field; previewInput.ForeColor = Ink;
         previewInput.MaxLength = 10000; previewInput.AccessibleName = "输入一句文字试试替换";
@@ -1126,13 +2568,12 @@ sealed class DictionaryDialog : DictionaryWindow
         previewButton = IconButton("arrow", "运行文字预览", new Rectangle(514, 2, 40, 38), async () => await PreviewAsync()); previewButton.BackColor = Field; previewField.Controls.Add(previewButton);
         previewInput.KeyDown += async (o, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; if (previewButton.Enabled) await PreviewAsync(); } };
         textPage.Controls.Add(previewField);
-        previewOutput.Bounds = new Rectangle(4, 274, 548, 28); previewOutput.ReadOnly = true; previewOutput.BorderStyle = BorderStyle.None;
+        previewOutput.Bounds = new Rectangle(4, 320, 548, 28); previewOutput.ReadOnly = true; previewOutput.BorderStyle = BorderStyle.None;
         previewOutput.BackColor = Face; previewOutput.Font = new Font(Font.FontFamily, 12f); previewOutput.ForeColor = Ink;
-        previewOutput.AccessibleName = "纠正后的文字"; textPage.Controls.Add(previewOutput);
-        previewHits.Bounds = new Rectangle(0, 306, 556, 26); previewHits.ForeColor = Dim;
+        previewOutput.AccessibleName = "纠正后的文字"; previewOutput.TabStop = false; previewOutput.TextChanged += (o, e) => previewOutput.TabStop = previewOutput.TextLength > 0; textPage.Controls.Add(previewOutput);
+        previewHits.Bounds = new Rectangle(0, 352, 556, 26); previewHits.ForeColor = Dim;
         previewHits.Font = new Font(Font.FontFamily, 10f); previewHits.AutoEllipsis = true; textPage.Controls.Add(previewHits);
 
-        BuildVoicePage();
         entry.Bounds = new Rectangle(34, 616, 194, 30); entry.Visible = false; entry.Font = new Font(Font.FontFamily, 12f);
         entry.BorderStyle = BorderStyle.FixedSingle; entry.BackColor = Field; entry.ForeColor = Ink; entry.AccessibleName = "新词";
         entry.KeyDown += (o, e) => { if (e.KeyCode == Keys.Enter) { Add(); e.SuppressKeyPress = true; } }; Controls.Add(entry);
@@ -1153,176 +2594,48 @@ sealed class DictionaryDialog : DictionaryWindow
             Reload(); Native.Cue(search.Handle, 0x1501, new IntPtr(1), "搜索词语或错法");
             Native.Cue(previewInput.Handle, 0x1501, new IntPtr(1), "输入文字，按 Enter 预览"); ActiveControl = list;
         };
-        KeyPreview = true; KeyDown += (o, e) => { if (e.KeyCode == Keys.Escape) {
+        KeyPreview = true; KeyDown += (o, e) => { if (e.Alt && historyPage.Visible && (e.KeyCode == Keys.Left || e.KeyCode == Keys.Right)) { historyPage.GoVisit(e.KeyCode == Keys.Left ? -1 : 1); e.SuppressKeyPress = true; return; } if (e.KeyCode == Keys.Escape) {
             if (RecordingBusy) StopSampleRecording(); else if (entry.Visible) EndAdd(); else Close(); e.SuppressKeyPress = true;
         } };
-        SelectPage(false); ActiveControl = list;
+        wordsWorkspace = MakeButton("词语", new Rectangle(338, 26, 150, 40), () => SelectWorkspace(false));
+        historyWorkspace = MakeButton("听写记录", new Rectangle(500, 26, 178, 40), () => SelectWorkspace(true));
+        ((DictionaryButton)wordsWorkspace).Glyph = "edit"; ((DictionaryButton)historyWorkspace).Glyph = "mic";
+        wordsWorkspace.Font = historyWorkspace.Font = new Font(Font.FontFamily, 12f);
+        Controls.Add(wordsWorkspace); Controls.Add(historyWorkspace); Controls.Add(historyPage);
+        navBack = IconButton("back", "后退到上次查看的位置，Alt+左箭头", new Rectangle(234, 26, 40, 40), () => historyPage.GoVisit(-1));
+        navForward = IconButton("forward", "前进到下次查看的位置，Alt+右箭头", new Rectangle(278, 26, 40, 40), () => historyPage.GoVisit(1));
+        foreach (var arrow in new[] { navBack, navForward }) { arrow.ForeColor = Ink; ((DictionaryButton)arrow).DisabledInk = Color.FromArgb(184, 184, 181); }
+        Controls.Add(navBack); Controls.Add(navForward); historyPage.NavigationChanged = UpdateNavigation;
+        SelectWorkspace(false); ActiveControl = list;
     }
 
-    void BuildVoicePage() {
-        var label = Caption("朗读内容", 0, 0, Dim); label.Font = new Font(Font.FontFamily, 12f); voicePage.Controls.Add(label);
-        var note = Caption("单词或整句 · 与录音内容一致", 294, 3, Dim); note.Font = new Font(Font.FontFamily, 10f); voicePage.Controls.Add(note);
-        var field = new DictionaryField { Bounds = new Rectangle(0, 32, 556, 64) };
-        spokenText.Bounds = new Rectangle(14, 10, 526, 44); spokenText.Multiline = true; spokenText.MaxLength = 2000;
-        spokenText.Font = new Font(Font.FontFamily, 12f); spokenText.BorderStyle = BorderStyle.None; spokenText.BackColor = Field; spokenText.ForeColor = Ink;
-        spokenText.AccessibleName = "这段录音对应的完整文字"; field.Controls.Add(spokenText); voicePage.Controls.Add(field);
-        recordButton = MakeButton("录音", new Rectangle(0, 110, 124, 44), async () => await ToggleSampleRecording());
-        ((DictionaryButton)recordButton).Glyph = "mic"; ((DictionaryButton)recordButton).Primary = true; voicePage.Controls.Add(recordButton);
-        meter.Bounds = new Rectangle(140, 118, 150, 28); meter.BackColor = Face; meter.AccessibleName = "麦克风声音强度";
-        meter.Paint += (o, e) => {
-            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var pen = new Pen(sampleRecorder != null ? Color.FromArgb(179, 66, 55) : Dim, 2.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
-                for (int i = 0; i < 25; i++) { float value = i < sampleLevels.Count ? sampleLevels[i] : 0; float half = 1 + Math.Min(11, value * 11); e.Graphics.DrawLine(pen, i * 6 + 2, 14 - half, i * 6 + 2, 14 + half); }
-        }; voicePage.Controls.Add(meter);
-        captureTime.Bounds = new Rectangle(304, 119, 90, 28); captureTime.Font = new Font(Font.FontFamily, 11f); captureTime.ForeColor = Dim; captureTime.Text = "0:00"; voicePage.Controls.Add(captureTime);
-        sampleSaveButton = MakeButton("保存样本", new Rectangle(410, 110, 146, 44), () => SaveSample());
-        ((DictionaryButton)sampleSaveButton).Glyph = "check"; voicePage.Controls.Add(sampleSaveButton);
-        sampleNotice.Bounds = new Rectangle(0, 170, 454, 28); sampleNotice.Font = new Font(Font.FontFamily, 10.5f); sampleNotice.ForeColor = Dim;
-        sampleNotice.AutoEllipsis = true; sampleNotice.AccessibleName = "录音样本状态"; voicePage.Controls.Add(sampleNotice);
-        samplePlayButton = IconButton("play", "试听录音", new Rectangle(466, 164, 40, 36), PlaySample);
-        sampleDeleteButton = IconButton("trash", "删除录音", new Rectangle(516, 164, 40, 36), RemoveSample);
-        voicePage.Controls.Add(samplePlayButton); voicePage.Controls.Add(sampleDeleteButton);
-        var clip = new DictionaryField { Bounds = new Rectangle(0, 208, 556, 124) };
-        samplesList.Bounds = new Rectangle(10, 8, 520, 108); samplesList.DrawMode = DrawMode.OwnerDrawFixed; samplesList.ItemHeight = 36;
-        samplesList.BorderStyle = BorderStyle.None; samplesList.IntegralHeight = false; samplesList.Font = new Font(Font.FontFamily, 11f);
-        samplesList.BackColor = Field; samplesList.ForeColor = Ink; samplesList.AccessibleName = "当前词语的多段录音样本";
-        samplesList.DrawItem += (o, e) => {
-            if (e.Index < 0) return;
-            using (var brush = new SolidBrush((e.State & DrawItemState.Selected) != 0 ? Color.FromArgb(232, 231, 228) : Field)) e.Graphics.FillRectangle(brush, e.Bounds);
-            using (var brush = new SolidBrush(Ink)) using (var format = new StringFormat { LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
-                e.Graphics.DrawString((e.Index + 1).ToString("00") + "   " + samplesList.Items[e.Index], samplesList.Font, brush, e.Bounds, format);
-        };
-        samplesList.SelectedIndexChanged += (o, e) => { if (pendingAudio == null && sampleRecorder == null) {
-            StopSamplePlayback(); var sample = samplesList.SelectedItem as VoiceSample;
-            if (sample != null) spokenText.Text = sample.correctText; UpdateSampleControls();
-        } };
-        samplesList.DoubleClick += (o, e) => { if (samplePlayButton.Enabled) PlaySample(); };
-        clip.Controls.Add(samplesList);
-        var scroll = new DictionaryScrollBar(() => samplesList.Items.Count, () => Math.Max(1, samplesList.ClientSize.Height / samplesList.ItemHeight),
-            () => samplesList.TopIndex, value => { if (samplesList.Items.Count > 0) samplesList.TopIndex = value; });
-        scroll.Bounds = new Rectangle(536, 8, 12, 108); scroll.BackColor = Field;
-        samplesList.ViewChanged = () => { scroll.TabStop = scroll.Overflows; scroll.Invalidate(); }; clip.Controls.Add(scroll); voicePage.Controls.Add(clip);
-        sampleTimer.Tick += (o, e) => {
-            if (sampleRecorder != null) {
-                try { AppendSampleAudio(sampleRecorder.Read(true)); if (sampleClock.ElapsedMilliseconds >= 60000) { StopSampleRecording(); sampleNotice.Text = "已到 60 秒，请试听后保存"; } }
-                catch (Exception error) { StopSampleRecording(); sampleNotice.Text = "录音中断：" + error.Message; }
-            } else if (playbackUntil > 0 && sampleClock.Elapsed.TotalSeconds >= playbackUntil) StopSamplePlayback();
-        };
+    async void SelectWorkspace(bool history) {
+        if (RecordingBusy || !historyPage.Resolve()) return;
+        historyPage.Stop();
+        if (history && !historyPage.Visible) {
+            hiddenWordControls.Clear();
+            foreach (Control control in Controls) if (control != historyPage && control.Top >= 100 && control.Visible) { hiddenWordControls.Add(control); control.Visible = false; }
+        } else if (!history) { foreach (Control control in hiddenWordControls) control.Visible = true; hiddenWordControls.Clear(); }
+        historyPage.Visible = history; counts.Visible = !history;
+        ((DictionaryButton)wordsWorkspace).Primary = !history; ((DictionaryButton)historyWorkspace).Primary = history;
+        wordsWorkspace.AccessibleDescription = history ? "未选中" : "已选中"; historyWorkspace.AccessibleDescription = history ? "已选中" : "未选中";
+        wordsWorkspace.Invalidate(); historyWorkspace.Invalidate(); UpdateNavigation();
+        if (history) { historyPage.BringToFront(); await historyPage.Reload(); }
     }
+    void UpdateNavigation() {
+        if (IsDisposed || Disposing) return;
+        if (!IsHandleCreated) { navBack.Visible = navForward.Visible = false; return; }
+        if (InvokeRequired) { try { BeginInvoke(new Action(UpdateNavigation)); } catch (InvalidOperationException) { } return; }
+        if (navBack.IsDisposed || navForward.IsDisposed) return;
+        navBack.Visible = navForward.Visible = historyPage.Visible; navBack.Enabled = historyPage.Visible && !historyPage.Loading && historyPage.CanGoBack; navForward.Enabled = historyPage.Visible && !historyPage.Loading && historyPage.CanGoForward; }
+    internal void SetHistoryNotice(string value) { historyPage.RuntimeNotice = value; if (historyPage.Visible && value.Length > 0) historyPage.Notice.Text = value; }
+    internal HistoryPanel HistoryForTest { get { return historyPage; } }
+    internal void SelectHistoryForTest() { SelectWorkspace(true); }
 
     Button IconButton(string glyph, string name, Rectangle bounds, Action click) {
         var button = (DictionaryButton)MakeButton("", bounds, click); button.Glyph = glyph;
         button.AccessibleName = name; button.AccessibleDescription = name; return button;
     }
-    void SelectPage(bool voice) {
-        if (RecordingBusy) return;
-        StopSamplePlayback(); textPage.Visible = !voice; voicePage.Visible = voice;
-        textTab.BackColor = voice ? Face : Color.FromArgb(232, 231, 228); voiceTab.BackColor = voice ? Color.FromArgb(232, 231, 228) : Face;
-        textTab.AccessibleDescription = voice ? "未选中" : "已选中"; voiceTab.AccessibleDescription = voice ? "已选中" : "未选中";
-        if (saveButton != null) saveButton.Text = voice ? "保存词典" : "保存";
-        textTab.Invalidate(); voiceTab.Invalidate();
-    }
-    void LoadSamples() {
-        StopSamplePlayback(); samplesList.Items.Clear();
-        try {
-            if (current >= 0) foreach (var sample in sampleStore.Load(groups[current].Word)) samplesList.Items.Add(sample);
-            sampleNotice.Text = samplesList.Items.Count == 0 ? "暂无录音 · 保存样本后可用于训练" : samplesList.Items.Count + " 段样本 · 待训练";
-        } catch (Exception error) { sampleNotice.Text = "读取失败：" + error.Message; sampleNotice.AccessibleDescription = sampleNotice.Text; }
-        samplesList.Invalidate();
-    }
-    void UpdateSampleControls() {
-        bool busy = RecordingBusy, selected = current >= 0 && current < groups.Count;
-        recordButton.Enabled = selected; recordButton.Text = busy ? "停止" : "录音"; ((DictionaryButton)recordButton).Glyph = busy ? "stop" : "mic";
-        recordButton.AccessibleName = busy ? "停止录音" : "开始录音";
-        recordButton.ForeColor = busy ? Color.FromArgb(179, 66, 55) : Dim;
-        ((DictionaryButton)recordButton).Primary = !busy;
-        list.Enabled = search.Enabled = addButton.Enabled = entry.Enabled = !busy;
-        deleteButton.Enabled = selected && !busy; textTab.Enabled = voiceTab.Enabled = !busy;
-        spokenText.Enabled = selected; spokenText.ReadOnly = busy;
-        samplesList.Enabled = !busy && pendingAudio == null;
-        sampleSaveButton.Enabled = !busy && pendingAudio != null;
-        samplePlayButton.Enabled = !busy && (pendingAudio != null || samplesList.SelectedItem is VoiceSample);
-        sampleDeleteButton.Enabled = !busy && (pendingAudio != null || samplesList.SelectedItem is VoiceSample);
-        recordButton.Invalidate();
-    }
-    async Task ToggleSampleRecording() {
-        if (RecordingBusy) { StopSampleRecording(); return; }
-        if (current < 0 || !ResolvePendingAudio()) return;
-        if (string.IsNullOrWhiteSpace(spokenText.Text)) { sampleNotice.Text = "先填写这段录音的完整文字"; spokenText.Focus(); return; }
-        StopSamplePlayback(); int revision = ++sampleStartRevision; sampleStarting = true; UpdateSampleControls();
-        try {
-            if (PrepareRecording != null) await PrepareRecording();
-            if (IsDisposed || Disposing || revision != sampleStartRevision) return;
-            recordingWord = groups[current].Word; sampleAudio = new MemoryStream(); sampleLevels.Clear();
-            sampleRecorder = new Recorder(); sampleClock.Restart(); captureTime.Text = "0:00"; sampleTimer.Start(); sampleNotice.Text = "录音中 · 按上方文字自然朗读";
-        } catch (Exception error) {
-            if (sampleRecorder != null) { sampleRecorder.Dispose(); sampleRecorder = null; }
-            if (sampleAudio != null) { sampleAudio.Dispose(); sampleAudio = null; }
-            sampleNotice.Text = error.Message;
-        } finally { if (revision == sampleStartRevision) sampleStarting = false; if (!IsDisposed && !Disposing) UpdateSampleControls(); }
-    }
-    void AppendSampleAudio(byte[] bytes) {
-        int length = Math.Min(bytes.Length, 60 * 32000 - (int)sampleAudio.Length);
-        if (length > 0) sampleAudio.Write(bytes, 0, length);
-        double squares = 0; for (int i = 0; i + 1 < length; i += 2) { double value = BitConverter.ToInt16(bytes, i) / 32768.0; squares += value * value; }
-        float level = length == 0 ? 0 : (float)Math.Min(1, Math.Sqrt(squares / (length / 2)) * 15);
-        sampleLevels.Add(level); while (sampleLevels.Count > 25) sampleLevels.RemoveAt(0);
-        TimeSpan elapsed = TimeSpan.FromSeconds(sampleAudio.Length / 32000.0); captureTime.Text = elapsed.Minutes + ":" + elapsed.Seconds.ToString("00"); meter.Invalidate();
-    }
-    internal void StopSampleRecording() {
-        ++sampleStartRevision; sampleStarting = false; sampleTimer.Stop();
-        if (sampleRecorder != null) {
-            string error = null;
-            try { AppendSampleAudio(sampleRecorder.Stop()); } catch (Exception failure) { error = failure.Message; }
-            finally { sampleRecorder.Dispose(); sampleRecorder = null; }
-            pendingAudio = sampleAudio.ToArray(); sampleAudio.Dispose(); sampleAudio = null;
-            sampleNotice.Text = error == null ? "待保存 · 可试听并核对完整文字" : "录音中断，请试听或重录：" + error;
-        }
-        if (!IsDisposed && !Disposing) { UpdateSampleControls(); meter.Invalidate(); }
-    }
-    void StopSamplePlayback() {
-        samplePlayer.Stop(); if (samplePlayer.Stream != null) { samplePlayer.Stream.Dispose(); samplePlayer.Stream = null; }
-        playbackUntil = 0; if (sampleRecorder == null) sampleTimer.Stop();
-        if (samplePlayButton != null) { ((DictionaryButton)samplePlayButton).Glyph = "play"; samplePlayButton.AccessibleName = "试听录音"; samplePlayButton.Invalidate(); }
-    }
-    void PlaySample() {
-        if (playbackUntil > 0) { StopSamplePlayback(); return; }
-        try {
-            byte[] audio = pendingAudio != null ? VoiceSampleStore.Wave(pendingAudio) : File.ReadAllBytes(sampleStore.AudioPath(samplesList.SelectedItem as VoiceSample));
-            StopSamplePlayback(); samplePlayer.Stream = new MemoryStream(audio); samplePlayer.Load(); samplePlayer.Play();
-            sampleClock.Restart(); playbackUntil = Math.Max(.1, (audio.Length - 44) / 32000.0); sampleTimer.Start();
-            ((DictionaryButton)samplePlayButton).Glyph = "stop"; samplePlayButton.AccessibleName = "停止试听"; samplePlayButton.Invalidate();
-        } catch (Exception error) { StopSamplePlayback(); sampleNotice.Text = "试听失败：" + error.Message; }
-    }
-    bool SaveSample() {
-        if (pendingAudio == null || RecordingBusy) return false;
-        try {
-            StopSamplePlayback(); var saved = sampleStore.Save(recordingWord, spokenText.Text, pendingAudio);
-            pendingAudio = null; LoadSamples();
-            for (int i = 0; i < samplesList.Items.Count; i++) if (((VoiceSample)samplesList.Items[i]).id == saved.id) samplesList.SelectedIndex = i;
-            UpdateSampleControls(); sampleNotice.Text = samplesList.Items.Count + " 段样本 · 已保存，待训练"; return true;
-        } catch (Exception error) { sampleNotice.Text = "保存失败：" + error.Message; return false; }
-    }
-    bool ResolvePendingAudio() {
-        if (RecordingBusy) return false;
-        if (pendingAudio == null) return true;
-        var answer = MessageBox.Show(this, "这段录音尚未保存，保存为样本吗？", "录音样本", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
-        if (answer == DialogResult.Cancel) return false;
-        if (answer == DialogResult.Yes) return SaveSample();
-        StopSamplePlayback(); pendingAudio = null; UpdateSampleControls(); return true;
-    }
-    void RemoveSample() {
-        if (RecordingBusy) return;
-        if (pendingAudio != null) {
-            using (var confirmation = new DictionaryDeleteDialog("", true)) if (confirmation.ShowDialog(this) != DialogResult.OK) return;
-            StopSamplePlayback(); pendingAudio = null; LoadSamples(); UpdateSampleControls(); return;
-        }
-        var sample = samplesList.SelectedItem as VoiceSample; if (sample == null) return;
-        using (var confirmation = new DictionaryDeleteDialog("", true)) if (confirmation.ShowDialog(this) != DialogResult.OK) return;
-        try { StopSamplePlayback(); sampleStore.Remove(sample); LoadSamples(); UpdateSampleControls(); }
-        catch (Exception error) { sampleNotice.Text = "删除失败：" + error.Message; }
-    }
-
     void MarkDirty() { dirty = true; saveButton.Enabled = true; status.Text = "有未保存的修改"; UpdateCounts(); InvalidatePreview(); }
 
     void UpdateCounts() {
@@ -1443,6 +2756,7 @@ sealed class DictionaryDialog : DictionaryWindow
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         if (selected) using (var shape = MicrophoneMenuRenderer.Outline(new Rectangle(0, e.Bounds.Y + 1, 246, e.Bounds.Height - 2), 7))
             using (var back = new SolidBrush(list.Focused ? Color.FromArgb(230, 229, 227) : Color.FromArgb(233, 232, 230))) e.Graphics.FillPath(back, shape);
+        if (selected) using (var brush = new SolidBrush(Dim)) e.Graphics.FillRectangle(brush, e.Bounds.X + 1, e.Bounds.Y + 8, 2, e.Bounds.Height - 16);
         e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
         using (var brush = new SolidBrush(Ink))
         using (var format = new StringFormat { LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
@@ -1515,8 +2829,6 @@ sealed class DictionaryDialog : DictionaryWindow
         wordTitle.Text = current >= 0 ? groups[current].Word : "先添加一个词语";
         silent = was;
         UpdateCounts();
-        spokenText.Text = current >= 0 ? groups[current].Word : "";
-        LoadSamples(); UpdateSampleControls();
     }
 
     void RefreshList(int select) {
@@ -1579,13 +2891,12 @@ sealed class DictionaryDialog : DictionaryWindow
 
     void OnSelected(object sender, EventArgs e) {
         if (silent) return;
-        if (!ResolvePendingAudio()) { bool before = silent; silent = true; list.SelectedIndex = visible.IndexOf(current); silent = before; return; }
         Commit();  // keep edits to the word the user just left
         ShowWord(list.SelectedIndex >= 0 ? visible[list.SelectedIndex] : -1);
     }
 
     void Add() {
-        if (RecordingBusy || !ResolvePendingAudio()) return;
+        if (RecordingBusy) return;
         var word = entry.Text.Trim();
         if (word.Length == 0) { status.Text = "先在上面填一个词"; entry.Focus(); return; }
         int existing = Index(word);
@@ -1606,7 +2917,7 @@ sealed class DictionaryDialog : DictionaryWindow
     }
 
     void Remove() {
-        if (RecordingBusy || !ResolvePendingAudio()) return;
+        if (RecordingBusy) return;
         if (current < 0 || current >= groups.Count) return;
         Commit();
         var group = groups[current];
@@ -1724,8 +3035,11 @@ sealed class DictionaryDialog : DictionaryWindow
 
     internal static void CheckForTest(string work) {
         Action<bool, string> check = (ok, reason) => { if (!ok) throw new Exception("DICTIONARY-TEST: " + reason); };
+        HistoryCard.CheckForTest(work);
+        using (var choice = new DictionaryCheckBox()) choice.CheckForTest();
         DictionaryDeleteDialog.CheckForTest(work);
-        CheckVoiceSamplesForTest(work);
+        SampleCaptureDialog.CheckSamplesForTest(work);
+        HistoryPanel.CheckForTest(work);
         check(CleanVariants("col death。koex。KOEX,cols；kos|koldex", true) == "col death\r\nkoex\r\ncols\r\nkos\r\nkoldex", "split / case-insensitive dedup");
         check(CleanVariants("C++。.NET。node.js。don't。git　 status", true) == "C++\r\n.NET\r\nnode.js\r\ndon't\r\ngit status", "symbols / apostrophe / fullwidth space");
         check(CleanVariants("\"a,b\"；「x|y」；(a,b)；foo!bar?", true) == "a,b\r\nx|y\r\n(a,b)\r\nfoo!bar?", "quoted separators / brackets / ASCII punctuation");
@@ -1827,7 +3141,7 @@ sealed class DictionaryDialog : DictionaryWindow
             check((int)DictionaryScrollBar.SendMessage(dialog.variants.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero) < top, "text mousewheel without native scrollbar");
             foreach (Control control in dialog.Controls) {
                 if (control is DictionaryHelpIcon) check(dialog.help.GetToolTip(control) == control.AccessibleDescription && control.AccessibleDescription.Contains("纯英文"), "help text matches accessible explanation");
-                foreach (Control child in control.Controls) if (child is DictionaryScrollBar) ((DictionaryScrollBar)child).CheckForTest();
+                foreach (Control child in control.Controls) if (child is DictionaryScrollBar && ((DictionaryScrollBar)child).Overflows) ((DictionaryScrollBar)child).CheckForTest();
             }
             using (var preview = new Bitmap(dialog.Width, dialog.Height)) {
                 dialog.DrawToBitmap(preview, new Rectangle(Point.Empty, preview.Size));
@@ -1849,6 +3163,8 @@ sealed class DictionaryDialog : DictionaryWindow
             dialog.variants.Text = "edited spelling";
             dialog.search.Text = "DIFFERENT";
             check(dialog.visible.Count == 1 && dialog.visible[0] == 1 && dialog.current == 0 && dialog.variants.Text == "edited spelling", "filter preserves hidden draft and matches variants ignoring case");
+            check(dialog.clearWordSearch.Visible, "word search exposes a clear action"); dialog.clearWordSearch.PerformClick(); check(dialog.search.TextLength == 0 && !dialog.clearWordSearch.Visible && dialog.visible.Count == 2, "word clear button restores full list"); dialog.search.Text = "DIFFERENT";
+            using (var bitmap = new Bitmap(dialog.Width, dialog.Height)) { dialog.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-word-search.png")); }
             dialog.list.SelectedIndex = 0;
             check(dialog.current == 1 && dialog.groups[0].Variants[0] == "edited spelling", "filtered row selects its real word without losing edits");
             dialog.search.Text = "no matches";
@@ -1862,12 +3178,12 @@ sealed class DictionaryDialog : DictionaryWindow
             check(dialog.groups[3].Context == "" && dialog.scope.Text.Contains("纯英文"), "new rule defaults to all languages and shows scope");
             dialog.previewInput.Text = "js on";
             finishPreview(dialog.PreviewAsync());
-            check(dialog.previewOutput.Text == "JSON" && dialog.previewHits.Text.Contains("js on → JSON") && File.ReadAllText(file) == original, "preview uses unsaved rules through real Python without writing dictionary");
+            check(dialog.previewOutput.Text == "JSON" && dialog.previewOutput.TabStop && dialog.previewHits.Text.Contains("js on → JSON") && File.ReadAllText(file) == original, "preview uses unsaved rules through real Python without writing dictionary");
             dialog.previewInput.Text = "edited spelling"; finishPreview(dialog.PreviewAsync());
             check(dialog.previewOutput.Text == "edited spelling" && dialog.previewHits.Text.Contains("旧规则仅中文"), "preview explains legacy language restriction");
             dialog.previewInput.Text = "js on";
             var pending = dialog.PreviewAsync(); dialog.previewInput.Text = "changed"; finishPreview(pending);
-            check(dialog.previewOutput.Text == "", "outdated preview is discarded when input changes");
+            check(dialog.previewOutput.Text == "" && !dialog.previewOutput.TabStop, "outdated preview is discarded and empty output does not consume keyboard focus");
             dialog.search.Text = "json"; dialog.list.SelectedIndex = 0;
             dialog.confirmDeletion = word => true; dialog.Remove();
             check(dialog.Index("JSON") < 0 && dialog.UndoDelete() && dialog.groups[3].Variants[0] == "js on" && dialog.current == 3, "filtered deletion and undo preserve word, spelling, scope and index");
@@ -1897,81 +3213,10 @@ sealed class DictionaryDialog : DictionaryWindow
         Console.WriteLine("TIDY-TEST PASS: paste / undo / conflicts / atomic save / legacy context / new bilingual rules / search mapping / hidden edits / duplicate add / filtered delete and undo / unsaved preview / stale preview / preview failure / 80 words and 64 rescue candidates / scrolling / system corners / delete confirmation / multi-clip recording samples / WAV and metadata / safe deletion / sample failure retention / compact tabs and icons");
     }
 
-    internal void RenderVoiceForTest(string work) {
-        SelectPage(true); Application.DoEvents();
-        using (var bitmap = new Bitmap(Width, Height)) { DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-recording-empty.png")); }
-        SelectPage(false);
-    }
-
-    static void CheckVoiceSamplesForTest(string work) {
-        Action<bool, string> check = (ok, reason) => { if (!ok) throw new Exception("VOICE-SAMPLE-TEST: " + reason); };
-        Action<Action, string> fails = (action, reason) => { bool failed = false; try { action(); } catch (IOException) { failed = true; } check(failed, reason); };
-        string fixture = Path.Combine(work, "voice-sample-check-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(fixture);
-        File.WriteAllText(Path.Combine(fixture, "dictionary.json"), "{\"hotwords\":[\"Example\",\"Other\"],\"rules\":[]}");
-        var pcm = new byte[32000];
-        for (int i = 0; i < pcm.Length / 2; i++) { short value = (short)(Math.Sin(i * .12) * 2000); pcm[2 * i] = (byte)(value & 255); pcm[2 * i + 1] = (byte)(value >> 8); }
-        var store = new VoiceSampleStore(fixture);
-        var first = store.Save("Example", "Example", pcm); var second = store.Save("Example", "打开 Example", pcm); store.Save("Other", "Other", pcm);
-        var saved = store.Load("EXAMPLE"); check(saved.Count == 2 && first.id != second.id && store.Load("Other").Count == 1, "multiple independent clips per word, case insensitive lookup, no word mixing");
-        byte[] wav = File.ReadAllBytes(store.AudioPath(first));
-        check(wav.Length == pcm.Length + 44 && Encoding.ASCII.GetString(wav, 0, 4) == "RIFF" && BitConverter.ToInt32(wav, 24) == 16000 && BitConverter.ToInt16(wav, 22) == 1 && BitConverter.ToInt16(wav, 34) == 16 && BitConverter.ToInt32(wav, 40) == pcm.Length, "valid mono PCM16 16k WAV including exact tail");
-        using (var audio = new MemoryStream(wav)) using (var player = new System.Media.SoundPlayer(audio)) { player.Load(); check(player.IsLoadCompleted, "recorded WAV is accepted by the actual playback backend without emitting test audio"); }
-        check(saved.Exists(item => item.correctText == "打开 Example") && saved.TrueForAll(item => item.state == "collected"), "full bilingual labels persist and never claim training");
-        fails(() => store.Save("Example", "", pcm), "missing label blocked");
-        fails(() => store.Save("Example", "Example", new byte[32000]), "silent clip blocked");
-        fails(() => store.Save("Example", "Example", new byte[3]), "invalid PCM blocked");
-        fails(() => store.AudioPath(new VoiceSample { id = "../escape", wav = "../escape.wav" }), "metadata cannot escape sample folder");
-        check(store.Load("Example").Count == 2, "invalid saves never replace previous samples");
-        using (var dialog = new DictionaryDialog(fixture)) {
-            dialog.StartPosition = FormStartPosition.Manual; dialog.Location = new Point(-20000, -20000); dialog.Show(); Application.DoEvents();
-            dialog.SelectPage(true); Application.DoEvents();
-            check(dialog.voicePage.Visible && !dialog.textPage.Visible && dialog.samplesList.Items.Count == 2 && dialog.spokenText.Text == "Example", "recording tab displays per-word samples and canonical default label");
-            dialog.samplesList.SelectedIndex = 0; check(dialog.samplePlayButton.Enabled && dialog.sampleDeleteButton.Enabled, "saved clips offer playback and deletion");
-            dialog.recordingWord = "Example"; dialog.pendingAudio = pcm; dialog.spokenText.Text = "我正在用 Example 写代码"; dialog.UpdateSampleControls();
-            check(dialog.sampleSaveButton.Enabled && !dialog.samplesList.Enabled, "pending clip cannot be relabeled by saved-clip selection");
-            using (var bitmap = new Bitmap(dialog.Width, dialog.Height)) { dialog.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(work, "dictionary-recording.png")); }
-            dialog.spokenText.Clear(); check(!dialog.SaveSample() && dialog.pendingAudio == pcm, "failed save keeps recording available");
-            dialog.spokenText.Text = "我正在用 Example 写代码";
-            check(dialog.SaveSample() && dialog.pendingAudio == null && dialog.samplesList.Items.Count == 3, "UI saves another full-sentence sample through the actual writer");
-            dialog.list.SelectedIndex = 1; check(dialog.samplesList.Items.Count == 1 && dialog.spokenText.Text == "Other", "word switch loads only matching audio");
-            dialog.list.SelectedIndex = 0; check(dialog.samplesList.Items.Count == 3, "multiple samples survive word switching");
-            dialog.SelectPage(false); check(dialog.textPage.Visible && !dialog.voicePage.Visible, "text editing remains separate and accessible");
-            check(!dialog.HasNativeFrame && dialog.ClientSize == new Size(926, 680), "compact redesign preserves borderless geometry");
-            dialog.Close();
-        }
-        store.Remove(first); check(store.Load("Example").Count == 2 && File.Exists(store.AudioPath(first)) && File.Exists(Path.Combine(fixture, "user-data", "voice-samples", first.id + ".json.deleted")), "sample deletion retains recoverable original audio and labels");
-        File.WriteAllText(Path.Combine(fixture, "user-data", "voice-samples", "broken.json"), "{}");
-        fails(() => store.Load("Example"), "invalid metadata is reported instead of silently hidden");
-        Console.WriteLine("VOICE-SAMPLE-TEST PASS: multi-clip / bilingual transcripts / per-word isolation / PCM WAV / silent and invalid rejection / failed-save retention / recoverable deletion / recording tab / no automatic training");
-    }
-
-    internal static void CheckCaptureForTest(string work) {
-        string fixture = Path.Combine(work, "voice-capture-check-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(fixture);
-        File.WriteAllText(Path.Combine(fixture, "dictionary.json"), "{\"hotwords\":[\"Capture test\"],\"rules\":[]}");
-        var counts = new List<int>();
-        using (var dialog = new DictionaryDialog(fixture)) {
-            dialog.StartPosition = FormStartPosition.Manual; dialog.Location = new Point(-20000, -20000); dialog.Show(); Application.DoEvents(); dialog.SelectPage(true);
-            int prepared = 0; dialog.PrepareRecording = () => { prepared++; return Task.FromResult(0); };
-            for (int cycle = 0; cycle < 3; cycle++) {
-                dialog.ToggleSampleRecording().GetAwaiter().GetResult();
-                if (!dialog.RecordingBusy || dialog.list.Enabled || !dialog.spokenText.ReadOnly || dialog.sampleSaveButton.Enabled) throw new Exception("Recording controls did not lock the word and transcript");
-                var clock = Stopwatch.StartNew(); while (clock.ElapsedMilliseconds < 700) { Application.DoEvents(); Thread.Sleep(10); }
-                dialog.StopSampleRecording();
-                if (dialog.RecordingBusy || dialog.sampleTimer.Enabled || dialog.pendingAudio == null || dialog.pendingAudio.Length < 16000 || !dialog.list.Enabled || dialog.spokenText.ReadOnly || !dialog.sampleSaveButton.Enabled) throw new Exception("Sample capture did not drain its tail or release the microphone");
-                counts.Add(dialog.pendingAudio.Length); dialog.pendingAudio = null; dialog.UpdateSampleControls();
-            }
-            if (prepared != 3 || Directory.Exists(Path.Combine(fixture, "user-data"))) throw new Exception("Capture must prepare each start and never save audio without an explicit save");
-            dialog.PrepareRecording = () => { throw new IOException("injected unavailable microphone"); };
-            dialog.ToggleSampleRecording().GetAwaiter().GetResult();
-            if (dialog.RecordingBusy || !dialog.list.Enabled || !dialog.sampleNotice.Text.Contains("injected")) throw new Exception("Start failure must release recording state and show the error");
-            dialog.Close();
-        }
-        File.WriteAllText(Path.Combine(work, "dictionary-capture-test.txt"), "PASS: real default microphone / sample recording controller / three reopen cycles / tail drain / word and label lock / release and retry / injected start failure / no automatic save or training; PCM byte counts=" + string.Join(",", counts));
-    }
+    internal static void CheckCaptureForTest(string work) { SampleCaptureDialog.CheckCaptureForTest(work); }
 
     protected override void OnFormClosing(FormClosingEventArgs e) {
-        StopSampleRecording();
-        if (!ResolvePendingAudio()) { e.Cancel = true; return; }
+        if (!historyPage.Resolve()) { e.Cancel = true; return; }
         if (dirty) {
             var answer = MessageBox.Show(this, "还有未保存的修改，保存吗？", "个人词典",
                                          MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
@@ -1982,10 +3227,6 @@ sealed class DictionaryDialog : DictionaryWindow
     }
     protected override void Dispose(bool disposing) {
         if (disposing) {
-            ++sampleStartRevision; sampleTimer.Stop();
-            if (sampleRecorder != null) { sampleRecorder.Dispose(); sampleRecorder = null; }
-            if (sampleAudio != null) { sampleAudio.Dispose(); sampleAudio = null; }
-            StopSamplePlayback(); samplePlayer.Dispose(); sampleTimer.Dispose();
             previewRevision++;
             if (previewWorker != null) { try { if (!previewWorker.HasExited) previewWorker.Kill(); } catch (InvalidOperationException) { } }
             help.Dispose(); undoTimer.Dispose(); deleted.Clear();
@@ -2298,6 +3539,7 @@ sealed class Microphone : Form
                 if (recorder != null || state == "busy" || state == "loading") throw new IOException("语音输入正在准备或收尾，请稍后录制样本。");
             };
         }
+        dictionary.SetHistoryNotice(lastHistoryNotice);
         if (!dictionary.Visible) dictionary.Show(); else dictionary.BringToFront();
         dictionary.Activate();
     }
@@ -2448,7 +3690,9 @@ sealed class Microphone : Form
         }
         await Toggle();
     }
+    string lastHistoryNotice = "";
     void ApplyReply(Dictionary<string, object> reply) {
+        if (reply.ContainsKey("history_notice")) { lastHistoryNotice = Convert.ToString(reply["history_notice"]); if (dictionary != null && !dictionary.IsDisposed) dictionary.SetHistoryNotice(lastHistoryNotice); }
         if (reply.ContainsKey("level")) level = Convert.ToSingle(reply["level"]);
         if (reply.ContainsKey("speaking")) speechDetected = Convert.ToBoolean(reply["speaking"]);
         if (reply.ContainsKey("transcribing")) transcribing = Convert.ToBoolean(reply["transcribing"]);
@@ -2511,7 +3755,7 @@ sealed class Microphone : Form
             inputs[i * 2] = Native.KeyInput(8, false); inputs[i * 2 + 1] = Native.KeyInput(8, true);
         }
         var added = Native.TextInputs(suffix); Array.Copy(added, 0, inputs, remove * 2, added.Length);
-        uint sent = Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Native.Input)));
+        uint sent = Native.SendToTarget(target, targetFocus, inputs, () => delivery.Paused.Length == 0 && !EditingGestureDown());
         int deleted = Math.Min(remove, (int)((sent + 1) / 2));
         int inserted = Math.Min(suffix.Length, Math.Max(0, (int)((sent + 1) / 2) - remove));
         delivery.Delivered = delivery.Delivered.Substring(0, delivery.Delivered.Length - deleted) + suffix.Substring(0, inserted);
@@ -2833,7 +4077,7 @@ sealed class Microphone : Form
             KeepRecovery(delivery.TakePending()); return;
         }
         var inputs = Native.TextInputs(suffix);
-        uint sent = Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Native.Input)));
+        uint sent = Native.SendToTarget(target, targetFocus, inputs, () => delivery.Paused.Length == 0 && !EditingGestureDown());
         if (sent != inputs.Length) {
             delivery.Sent(suffix.Substring(0, Math.Min(suffix.Length, (int)((sent + 1) / 2))));
             Pause("文字未完整送出，继续录音并保存剩余文字。");
@@ -3164,6 +4408,22 @@ sealed class Microphone : Form
                 if (!editable) await Task.Delay(100);
             }
             if (!editable) throw new Exception("Editable field was not detected");
+            if (!Native.CharacterMessageTarget("Qt51514QWindowIcon", "Weixin") || !Native.CharacterMessageTarget("Qt51514QWindowIcon", "WeChat") ||
+                Native.CharacterMessageTarget("Chrome_WidgetWin_1", "WeChatAppEx") || Native.CharacterMessageTarget("Qt51514QWindowIcon", "Other"))
+                throw new Exception("Character-message compatibility must be limited to WeChat Qt windows");
+            string directText = "微信输入测试：你好，中文 ABC 123";
+            var directInputs = Native.TextInputs(directText);
+            if (Native.SendCharacterMessages(target, targetFocus, directInputs) != directInputs.Length || box.Text != "原文：" + directText)
+                throw new Exception("Character-message path lost Chinese or punctuation");
+            string unchangedDirect = box.Text;
+            if (Native.SendCharacterMessages(target, IntPtr.Zero, Native.TextInputs("不得输入")) != 0 || box.Text != unchangedDirect)
+                throw new Exception("Character-message path ignored a lost focus");
+            int allowedChecks = 0;
+            if (Native.SendCharacterMessages(target, targetFocus, Native.TextInputs("甲乙"), () => ++allowedChecks == 1) != 2 || box.Text != unchangedDirect + "甲")
+                throw new Exception("Character-message path must stop and report exactly the accepted prefix");
+            if (Native.SendCharacterMessages(target, targetFocus, Native.TextInputs("\r\n")) != 0 || box.Text != unchangedDirect + "甲")
+                throw new Exception("Character-message path must not interpret recognized newlines as send keys");
+            box.Text = "原文："; box.SelectionStart = box.TextLength;
             box.ReadOnly = true;
             if (await Task.Run(() => HasEditableTarget())) throw new Exception("Read-only field accepted as editable");
             box.ReadOnly = false;
@@ -3588,7 +4848,7 @@ sealed class Microphone : Form
         lines.Add("kind=" + kind + " deliver=" + Deliverable(kind) + (foreground == window ? "" : " (projected: window is not active, silence is what matters)"));
         if (typed.Length > 0 && foreground == window) {
             var inputs = Native.TextInputs(typed);
-            uint sent = Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Native.Input)));
+            uint sent = Native.SendToTarget(window, focus, inputs);
             lines.Add("typed='" + typed + "' inputs=" + inputs.Length + " sent=" + sent
                 + " foregroundKept=" + (Native.GetForegroundWindow() == window));
         } else if (typed.Length > 0) lines.Add("typed=skipped (window is not active)");
@@ -3769,7 +5029,6 @@ sealed class Microphone : Form
                 string scratch = Path.Combine(root, "work", "dictionary-roundtrip.json");
                 Console.WriteLine("DICTIONARY-TEST " + dialog.DumpForTest());
                 dialog.SaveToForTest(scratch);
-                dialog.RenderVoiceForTest(Path.Combine(root, "work"));
                 dialog.Close();
             }
                 DictionaryDialog.CheckForTest(Path.Combine(root, "work"));

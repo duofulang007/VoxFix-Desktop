@@ -11,6 +11,7 @@ import threading
 import numpy as np
 
 from hotwords import HotwordRescue, preimport as preimport_hotwords
+from dictation_history import HistoryRecorder
 from dictionary_rules import (apply_dictionary, dictionary_pattern, has_chinese,
                               load_dictionary, load_hotwords)
 
@@ -164,8 +165,9 @@ class SenseVoiceSession:
 
 
 class Recognition:
-    def __init__(self, session, vad=None):
+    def __init__(self, session, vad=None, history=None):
         self.session = session
+        self.history = history
         self.vad = vad if vad is not None else create_vad()
         self.dictionary = Dictionary(ROOT / 'dictionary.json')
         # Decode-time hotword rescue stays dormant until the word list asks for
@@ -197,6 +199,8 @@ class Recognition:
             self.active_key = None
             self.preview_key = None
             self.committed = self.preview = self.error = ''
+            self.first_previews = {}
+            self.keep_history = False
             self.ending = False
             self.decoding = False
             self.vad.reset()
@@ -211,7 +215,8 @@ class Recognition:
                                          'text': self.preview} if self.preview and self.preview_key else None),
                     'speaking': bool(self.vad.is_speech_detected()),
                     'transcribing': bool(self.vad.is_speech_detected() or self.pending or self.draft is not None or self.decoding),
-                    'segments': list(self.segments)}
+                    'segments': list(self.segments),
+                    'history_notice': self.history.notice if self.history else ''}
 
     def change_route(self, route):
         if isinstance(route, bool) or not isinstance(route, int) or not 0 <= route <= 100000:
@@ -237,6 +242,7 @@ class Recognition:
                 raise ValueError('上一段录音尚未结束')
             self.clear()
             self.id, self.cancelled = identity, False
+            self.keep_history = self.history.begin() if self.history else False
             self.worker = threading.Thread(target=self.loop, daemon=True)
             self.worker.start()
             return {'event': 'started', 'id': identity}
@@ -363,8 +369,10 @@ class Recognition:
                         key, audio = self.draft
                         self.draft = None
                     self.decoding = True
+                original_audio = audio
                 audio = QuietBoost().process(audio)
                 text = re.sub(r'<\|[^|]*\|>', '', self.session.run(audio).text).strip()
+                raw_text = text
                 # Rescue runs only on finals and only when the sherpa text looks
                 # like a near-miss of a word in the hotword list; anything it
                 # cannot improve (or any failure) leaves the text untouched.
@@ -381,12 +389,19 @@ class Recognition:
                     text = self.session.punctuate(text)
                 with self.condition:
                     self.decoding = False
+                    if self.cancelled:
+                        return
+                    if final and self.keep_history:
+                        first = self.first_previews.pop((preview_start, route), '')
+                        self.history.submit(original_audio, roundId=self.id, route=route,
+                                            start=start, end=end, firstText=first,
+                                            rawText=raw_text, text=text,
+                                            recognitionRejected=outside_product_scripts(text),
+                                            model='R5 INT8')
                     if outside_product_scripts(text):
                         if not final:
                             continue
                         raise RuntimeError('识别到中文和英文之外的文字，本次结果未自动输入')
-                    if self.cancelled:
-                        return
                     if final:
                         previous = self.committed
                         self.committed = join_text(previous, text)
@@ -396,6 +411,8 @@ class Recognition:
                     elif key == self.active_key and not self.ending:
                         self.preview = text
                         self.preview_key = key
+                        if self.keep_history and text:
+                            self.first_previews.setdefault(key, text)
         except Exception as error:
             with self.condition:
                 self.decoding = False
@@ -416,9 +433,10 @@ def main():
         print(json.dumps(value, ensure_ascii=True), file=protocol, flush=True)
 
     recognition = None
+    history = HistoryRecorder(ROOT)
     try:
         session, backend = load_model()
-        recognition = Recognition(session)
+        recognition = Recognition(session, history=history)
         threading.Thread(target=preimport_hotwords, daemon=True).start()
         send({'ready': True, 'streaming': False, 'segmented': True,
               'preview': True, 'model': 'SenseVoiceSmall INT8', 'backend': backend})
@@ -437,6 +455,7 @@ def main():
     finally:
         if recognition is not None:
             recognition.clear()
+        history.close()
     return 0
 
 
