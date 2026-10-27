@@ -15,7 +15,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.71.0")]
+[assembly: AssemblyVersion("1.6.77.0")]
 
 static class Native
 {
@@ -258,6 +258,8 @@ sealed class ShapeMotion
 sealed class DraftText
 {
     internal string Text = "", Separator = "";
+    internal bool InPlace;
+    internal ulong Segment;
 }
 
 sealed class TextDelivery
@@ -3263,12 +3265,8 @@ sealed class Microphone : Form
     readonly string root;
     readonly bool smokeTest;
     readonly bool streamTest;
-    readonly System.Windows.Forms.Timer limit = new System.Windows.Forms.Timer { Interval = 180000 };
+    internal const int RecognitionRoundBytes = 32000 * 180;
     readonly System.Windows.Forms.Timer capture = new System.Windows.Forms.Timer { Interval = 40 };
-    readonly System.Windows.Forms.Timer appendPulse = new System.Windows.Forms.Timer { Interval = 16 };
-    DraftText pacedDraft;
-    int appendChunk;
-    double appendDeadline;
     readonly System.Windows.Forms.Timer animation = new System.Windows.Forms.Timer { Interval = 16 };
     // Idle focus watch: the capsule reports whether text would land in a real input box
     // even before recording starts. Cheap when the target pair has not changed.
@@ -3282,6 +3280,8 @@ sealed class Microphone : Form
     Recorder recorder;
     InteractionGuard guard;
     TextDelivery delivery;
+    InPlaceText textBridge;
+    ulong bridgeSegment;
     readonly ContextMenuStrip menu;
     MenuDismissHook menuGuard;
     internal int menuDismissRequests;
@@ -3301,12 +3301,14 @@ sealed class Microphone : Form
     string recovery = "", draft = "";
     string recordingId;
     int sentBytes;
+    long roundSampleOffset;
     string state = "loading";
     IntPtr target, targetFocus;
     Task targetProbe;
     double nextTargetProbe;
     int targetEpoch;
     int audioRoute, appliedSegments;
+    bool roundBoundary;
     readonly HashSet<int> backupRoutes = new HashSet<int>();
     Point down, origin;
     bool dragged, closing;
@@ -3352,12 +3354,7 @@ sealed class Microphone : Form
         RestorePosition();
         DoubleBuffered = true; Cursor = Cursors.Hand;
         AccessibleDescription = "正在加载本地模型…";
-        limit.Tick += async (s, e) => { limit.Stop(); await Toggle(); };
         capture.Tick += async (s, e) => await Pump();
-        appendPulse.Tick += (s, e) => {
-            try { DrainAppend(motionClock.Elapsed.TotalMilliseconds >= appendDeadline); }
-            catch (Exception error) { Fail(error.Message); }
-        };
         focusWatch.Tick += async (s, e) => await WatchIdleFocus();
         animation.Tick += async (s, e) => {
             if (!Visible && !startOnReveal) { animation.Stop(); return; }
@@ -3434,8 +3431,8 @@ sealed class Microphone : Form
         };
         FormClosed += (s, e) => {
             closing = true; CloseMenu();
+            DropTextBridge();
             if (menuGuard != null) { menuGuard.Dispose(); menuGuard = null; }
-            limit.Stop(); limit.Dispose();
             if (shortcut != null) shortcut.Dispose();
             capture.Stop(); capture.Dispose();
             focusWatch.Stop(); focusWatch.Dispose();
@@ -3443,7 +3440,6 @@ sealed class Microphone : Form
             if (recorder != null) recorder.Dispose();
             EndListening(true);
             animation.Stop(); animation.Dispose();
-            ClearAppend(); appendPulse.Dispose();
             delivery = null;
             StopWorker();
             if (worker != null) worker.Dispose();
@@ -3742,79 +3738,66 @@ sealed class Microphone : Form
         UpdateMemoryShape();
     }
     void ApplySegment(Dictionary<string, object> segment, bool final) {
+        if (delivery == null || delivery.Cancelled) return;
         int route = Convert.ToInt32(segment["route"]);
         string key = route + ":" + Convert.ToString(segment.ContainsKey("preview_start") ? segment["preview_start"] : segment["start"]);
         string text = Convert.ToString(segment["text"]).TrimStart();
+        bool memory = backupRoutes.Contains(route) || delivery.Paused.Length != 0;
         DraftText previous;
         delivery.Drafts.TryGetValue(key, out previous);
-        if (pacedDraft != null) {
-            if (previous == pacedDraft && delivery.Paused.Length == 0) {
-                if (!final && (text.Length == 0 ? "" : previous.Separator + text) == previous.Text) return;
-                // Replace the unseen tail before a new draft can make us type and erase it.
-                previous.Text = previous.Text.Substring(0, previous.Text.Length - delivery.Pending.Length);
-                delivery.Latest = delivery.Accounted;
-                ClearAppend();
-            } else DrainAppend(true);
-        }
-        if (!final && previous != null && OnlyDraftPunctuationChanged(previous.Text, text.Length == 0 ? "" : previous.Separator + text)) return;
-        bool memory = backupRoutes.Contains(route) || delivery.Paused.Length != 0;
         if (previous == null) {
-            if (final) { ApplyText(delivery.Latest + Convert.ToString(segment["text"]), memory); return; }
-            if (memory) return;
-            previous = new DraftText();
-            if (delivery.Latest.Length > 0 && text.Length > 0 &&
+            if (!final && memory) return;
+            string separator = delivery.Latest.Length > 0 && text.Length > 0 &&
                 delivery.Latest[delivery.Latest.Length - 1] < 128 && Char.IsLetterOrDigit(delivery.Latest[delivery.Latest.Length - 1]) &&
-                text[0] < 128 && Char.IsLetterOrDigit(text[0])) previous.Separator = " ";
-            delivery.Drafts.Add(key, previous);
+                text[0] < 128 && Char.IsLetterOrDigit(text[0]) ? " " : "";
+            if (final && memory) {
+                string addition = Convert.ToString(segment["text"]);
+                if (roundBoundary) addition = separator + text;
+                if (addition.Length > 0) roundBoundary = false;
+                ApplyText(delivery.Latest + addition, memory); return;
+            }
+            previous = new DraftText { Separator = separator, Segment = ++bridgeSegment }; delivery.Drafts.Add(key, previous);
         }
         if (text.Length > 0) text = previous.Separator + text;
+        if (!final && (text.Length < previous.Text.Length || OnlyDraftPunctuationChanged(previous.Text, text))) return;
+        if (text.Length > 0) roundBoundary = false;
         if (memory) {
             if (final) {
                 if (text.StartsWith(previous.Text, StringComparison.Ordinal)) ApplyText(delivery.Latest + text.Substring(previous.Text.Length), true);
                 else KeepRecovery("\n[该句最终识别] " + text);
             }
         } else {
-            ReviseText(previous.Text, text, !final && animationsEnabled);
-            previous.Text = text;
-            if (delivery.Pending.Length > 0 && delivery.Paused.Length == 0) {
-                pacedDraft = previous;
-                appendDeadline = motionClock.Elapsed.TotalMilliseconds + 64;
-                appendPulse.Start();
-            }
+            ReviseText(previous, text, final);
         }
         if (final) delivery.Drafts.Remove(key);
     }
-    void ReviseText(string previous, string text, bool pace = false) {
-        int common = CommonPrefix(previous, text);
-        if (common == previous.Length) {
-            string addition = text.Substring(common);
-            appendChunk = pace && previous.Length > 0 && addition.Length >= 12 ? (addition.Length + 3) / 4 : int.MaxValue;
-            ApplyText(delivery.Latest + addition, false, appendChunk);
-            return;
-        }
-        if (delivery.Latest != delivery.Accounted || !delivery.Latest.EndsWith(previous, StringComparison.Ordinal) ||
-            !delivery.Delivered.EndsWith(previous, StringComparison.Ordinal))
+    void DropTextBridge() {
+        if (textBridge != null) { textBridge.Dispose(); textBridge = null; }
+    }
+    void ReviseText(DraftText previous, string text, bool final) {
+        if (delivery.Latest != delivery.Accounted || !delivery.Latest.EndsWith(previous.Text, StringComparison.Ordinal) ||
+            !delivery.Delivered.EndsWith(previous.Text, StringComparison.Ordinal))
             throw new IOException("无法确认本轮草稿位置，已停止修订。");
         if (Native.GetForegroundWindow() != target || targetFocus == IntPtr.Zero || Native.Focus(target) != targetFocus || EditingGestureDown()) {
             Pause("输入位置已变化，已停止修订并保留最终识别结果。");
-            KeepRecovery("\n[该句最终识别] " + text);
-            return;
+            if (final) KeepRecovery("\n[该句最终识别] " + text); return;
         }
-        int remove = previous.Length - common;
-        string suffix = text.Substring(common);
-        var inputs = new Native.Input[(remove + suffix.Length) * 2];
-        for (int i = 0; i < remove; i++) {
-            inputs[i * 2] = Native.KeyInput(8, false); inputs[i * 2 + 1] = Native.KeyInput(8, true);
+        if (text.Length == 0 && previous.Text.Length == 0) return;
+        if (textBridge == null || !textBridge.Matches(target, targetFocus)) {
+            DropTextBridge(); textBridge = new InPlaceText(Handle, target, targetFocus);
         }
-        var added = Native.TextInputs(suffix); Array.Copy(added, 0, inputs, remove * 2, added.Length);
-        uint sent = Native.SendToTarget(target, targetFocus, inputs, () => delivery.Paused.Length == 0 && !EditingGestureDown());
-        int deleted = Math.Min(remove, (int)((sent + 1) / 2));
-        int inserted = Math.Min(suffix.Length, Math.Max(0, (int)((sent + 1) / 2) - remove));
-        delivery.Delivered = delivery.Delivered.Substring(0, delivery.Delivered.Length - deleted) + suffix.Substring(0, inserted);
-        delivery.Latest = delivery.Accounted = delivery.Latest.Substring(0, delivery.Latest.Length - deleted) + suffix.Substring(0, inserted);
-        if (sent != inputs.Length) {
-            Pause("草稿修订未完整送出，已停止修订并保留最终识别结果。");
-            KeepRecovery("\n[该句最终识别] " + text);
+        int status = textBridge.Update(previous.Segment, previous.Text, text, final);
+        if (status == 1) {
+            int oldLength = previous.Text.Length;
+            delivery.Delivered = delivery.Delivered.Substring(0, delivery.Delivered.Length - oldLength) + text;
+            delivery.Latest = delivery.Accounted = delivery.Latest.Substring(0, delivery.Latest.Length - oldLength) + text;
+            previous.Text = text; previous.InPlace = true;
+        } else if (status == 2 && !previous.InPlace) {
+            // Unsupported editors receive complete segments without destructive draft rewrites.
+            if (final) ApplyText(delivery.Latest + text);
+        } else if (status != 2 || final) {
+            Pause("输入位置已变化或改字未确认，已停止修订并保留最终识别结果。");
+            if (final) KeepRecovery("\n[该句最终识别] " + text);
         }
     }
     internal static int CommonPrefix(string previous, string text) {
@@ -3917,9 +3900,12 @@ sealed class Microphone : Form
     }
     void Fail(string message) {
         if (closing) return;
-        ClearAppend();
+        DropTextBridge();
+        if (!smokeTest && !streamTest && !memoryTest) try {
+            File.WriteAllText(Path.Combine(root, "work", "recognition-error.txt"), DateTime.UtcNow.ToString("o") + " / " + Assembly.GetExecutingAssembly().GetName().Version + " / " + state + " / audioBytes=" + sentBytes + " / " + message);
+        } catch (IOException) { } catch (UnauthorizedAccessException) { }
         startOnReveal = false;
-        capture.Stop(); limit.Stop();
+        capture.Stop();
         if (guard != null) { guard.Dispose(); guard = null; }
         if (recorder != null) { recorder.Dispose(); recorder = null; }
         EndListening(true);
@@ -4087,7 +4073,7 @@ sealed class Microphone : Form
                 if (closing) return;
                 guard = new InteractionGuard(OwnsSurface, reason => Pause(reason + "改变了输入位置，正在重新检测输入框。", true));
                 listening = true; playEarcon("BasicListeningEarcon", false);
-                Status("recording", editable ? "正在录音，识别到文字即输入 · 点击麦克风结束" : "正在录音，未上屏文字将直接显示为复制按钮 · 右键可结束录音"); limit.Start(); capture.Start();
+                Status("recording", editable ? "正在录音，草稿即时输入 · 点击麦克风结束" : "正在录音，未上屏文字将直接显示为复制按钮 · 右键可结束录音"); capture.Start();
                 if (dismissRequested) await EndRecording();
             } catch (Exception error) { Fail(error.Message); }
             return;
@@ -4095,14 +4081,14 @@ sealed class Microphone : Form
         await EndRecording();
     }
     async Task BeginStream() {
-        ClearAppend();
+        DropTextBridge();
         draft = ""; speechDetected = transcribing = false;
         stalledWindows.Clear();
-        recordingId = Guid.NewGuid().ToString("N"); delivery = new TextDelivery(); sentBytes = 0;
+        recordingId = Guid.NewGuid().ToString("N"); delivery = new TextDelivery(); sentBytes = 0; roundSampleOffset = 0;
         audioRoute = appliedSegments = 0; backupRoutes.Clear();
+        roundBoundary = false;
         targetEpoch++; nextTargetProbe = 0;
-        var reply = await Exchange(new { op = "start", id = recordingId });
-        if (Convert.ToString(reply["event"]) != "started") throw new IOException("无法开始流式识别。");
+        await StartRecognitionRound();
         recovery = ""; recoveryCopied = false; copyFeedback = readyFeedback = 0;
         UpdateMemoryShape(); RefreshSurface();
     }
@@ -4118,39 +4104,35 @@ sealed class Microphone : Form
         if (!reply.ContainsKey("id") || Convert.ToString(reply["id"]) != recordingId) throw new IOException("识别结果编号不匹配，已停止输入。");
         return reply;
     }
+    async Task StartRecognitionRound() {
+        var reply = await Exchange(new { op = "start", id = recordingId, preview = true, sample_offset = roundSampleOffset });
+        if (Convert.ToString(reply["event"]) != "started") throw new IOException("无法开始语音识别。");
+        sentBytes = appliedSegments = 0;
+    }
     async Task Feed(byte[] audio) {
-        int route = audioRoute;
-        for (int offset = 0; offset < audio.Length && !closing; offset += 32000) {
-            int length = Math.Min(Math.Min(32000, audio.Length - offset), 32000 * 180 - sentBytes);
-            if (length <= 0) return;
+        int route = audioRoute, offset = 0;
+        while (offset < audio.Length && !closing) {
+            if (sentBytes == RecognitionRoundBytes) {
+                ApplyReply(await Exchange(new { op = "stop", id = recordingId }));
+                roundSampleOffset += sentBytes / 2;
+                await StartRecognitionRound();
+                roundBoundary = true;
+            }
+            int length = Math.Min(Math.Min(32000, audio.Length - offset), RecognitionRoundBytes - sentBytes);
             var reply = await Exchange(new { op = "audio", id = recordingId, route = route, pcm = Convert.ToBase64String(audio, offset, length) });
-            sentBytes += length;
+            sentBytes += length; offset += length;
             if (!closing) ApplyReply(reply);
         }
     }
-    void ClearAppend() { appendPulse.Stop(); pacedDraft = null; }
-    void DrainAppend(bool all) {
-        if (delivery == null || delivery.Cancelled || closing) { ClearAppend(); return; }
-        SendPendingText(all ? int.MaxValue : appendChunk);
-        if (delivery.Pending.Length == 0) ClearAppend();
-    }
-    internal static int AppendChunkLength(string text, int limit) {
-        int length = Math.Min(text.Length, limit);
-        // Keep an English token or number together, including decimal points and symbols.
-        while (length < text.Length && length > 0 && text[length - 1] > ' ' && text[length - 1] < 127 && text[length] > ' ' && text[length] < 127) length++;
-        return length;
-    }
-    void ApplyText(string text, bool forceMemory = false, int chunk = int.MaxValue) {
-        if (delivery == null || closing) return;
-        if (pacedDraft != null) DrainAppend(true);
+    void ApplyText(string text, bool forceMemory = false) {
+        if (delivery == null || delivery.Cancelled || closing) return;
         delivery.Accept(text);
         if (forceMemory || delivery.Paused.Length != 0) { KeepRecovery(delivery.TakePending()); return; }
-        SendPendingText(chunk);
+        SendPendingText();
     }
-    void SendPendingText(int chunk) {
-        if (delivery.Paused.Length != 0) { ClearAppend(); KeepRecovery(delivery.TakePending()); return; }
+    void SendPendingText() {
+        if (delivery.Paused.Length != 0) { KeepRecovery(delivery.TakePending()); return; }
         string suffix = delivery.Pending;
-        suffix = suffix.Substring(0, AppendChunkLength(suffix, chunk));
         if (suffix.Length == 0 || closing) return;
         if (Native.GetForegroundWindow() != target || targetFocus == IntPtr.Zero || Native.Focus(target) != targetFocus || EditingGestureDown()) {
             Pause("输入位置已变化，继续录音并保存未上屏文字。");
@@ -4167,6 +4149,7 @@ sealed class Microphone : Form
     }
     void Pause(string reason, bool interaction = false) {
         if (closing || delivery == null) return;
+        DropTextBridge();
         if (delivery.Paused.Length == 0 || interaction) backupRoutes.Add(audioRoute);
         if (delivery.Paused.Length == 0) { audioRoute++; backupRoutes.Add(audioRoute); }
         if (delivery.Paused.Length == 0 || interaction) { targetEpoch++; nextTargetProbe = motionClock.Elapsed.TotalMilliseconds + 150; }
@@ -4178,7 +4161,6 @@ sealed class Microphone : Form
     }
     async Task Pump() {
         if (closing || state != "recording") return;
-        if (sentBytes >= 32000 * 180) { await EndRecording(); return; }
         if (inputFocused && (Native.GetForegroundWindow() != target || Native.Focus(target) != targetFocus)) Pause("输入位置已变化，继续录音并保存未上屏文字。");
         if (motionClock.Elapsed.TotalMilliseconds >= nextTargetProbe && (targetProbe == null || targetProbe.IsCompleted)) {
             nextTargetProbe = motionClock.Elapsed.TotalMilliseconds + 250;
@@ -4197,8 +4179,7 @@ sealed class Microphone : Form
     }
     async Task EndRecording(bool silent = false) {
         if (closing || state != "recording") return;
-        DrainAppend(true);
-        limit.Stop(); capture.Stop(); Status("busy", "正在补全尾字…");
+        capture.Stop(); Status("busy", "正在补全尾字…");
         try {
             byte[] tail;
             try { tail = recorder.Stop(); } finally { recorder.Dispose(); recorder = null; }
@@ -4212,7 +4193,6 @@ sealed class Microphone : Form
             await pipeline.WaitAsync(); acquired = true;
             if (closing || delivery == null || state == "error") return;
             if (delivery.Cancelled) {
-                ClearAppend();
                 await Exchange(new { op = "cancel", id = recordingId });
                 return;
             }
@@ -4224,9 +4204,9 @@ sealed class Microphone : Form
         } catch (Exception error) { Fail(error.Message); }
         finally {
             if (acquired) pipeline.Release();
+            DropTextBridge();
             if (guard != null) { guard.Dispose(); guard = null; }
             if (!closing) {
-                DrainAppend(true);
                 if (state != "error") Status("idle", recovery.Length > 0 ? "有未上屏文字 · 点击复制 · 长按开始下一段录音" : "点击说话 · 拖动移动 · 右键退出");
                 delivery = null;
             }
@@ -4337,7 +4317,7 @@ sealed class Microphone : Form
         bool armedBeforeWaiting = recorder != null;
         await starting;
         if (state != "recording" || recorder == null) throw new Exception("Startup did not reach recording");
-        capture.Stop(); limit.Stop();
+        capture.Stop();
         await Task.Delay(200);
         int bytes;
         try { bytes = recorder.Stop().Length; } finally { recorder.Dispose(); recorder = null; }
@@ -4467,8 +4447,8 @@ sealed class Microphone : Form
             };
             ApplyReply(delayed); await Task.Delay(30);
             ApplyReply(delayed); await Task.Delay(30);
-            if (second.Text != "DFN" || !recovery.EndsWith("T") || MemoryPill)
-                throw new Exception("Late old audio escaped fallback or copy control disappeared");
+            if (second.Text != "DF N" || !recovery.EndsWith("T") || MemoryPill)
+                throw new Exception("Late old audio escaped fallback or copy control disappeared: text=" + second.Text + "; cache=" + recovery + "; capsule=" + MemoryPill);
             delivery = null; Status("idle", "输入框恢复测试通过");
         }
     }
@@ -4476,65 +4456,57 @@ sealed class Microphone : Form
         var clock = Stopwatch.StartNew();
         while (box.Text != expected && clock.ElapsedMilliseconds < 1000) await Task.Delay(10);
     }
-    async Task CheckPacedAppend(TextBox box) {
-        if (!animationsEnabled) return;
-        var segment = new Dictionary<string, object> { { "route", 0 }, { "start", 0 }, { "text", "开头" } };
-        Action<string, bool> update = (text, final) => { segment["text"] = text; ApplySegment(segment, final); };
-        Action reset = () => { ClearAppend(); delivery = new TextDelivery(); recovery = ""; backupRoutes.Clear(); audioRoute = 0; box.Text = "原文："; box.SelectionStart = box.TextLength; update("开头", false); };
-        string longText = "开头甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉";
-        reset();
-        if (delivery.Delivered != "开头" || pacedDraft != null) throw new Exception("First draft must stay immediate");
-        update("开头短句", false);
-        if (delivery.Delivered != "开头短句" || pacedDraft != null) throw new Exception("Short append must stay immediate");
+    async Task CheckFastDraft(TextBox box) {
+        DropTextBridge();
+        box.Text = "原文："; box.SelectionStart = box.TextLength;
+        delivery = new TextDelivery(); recovery = ""; backupRoutes.Clear(); appliedSegments = 0;
+        var first = new Dictionary<string, object> { { "route", 0 }, { "start", 0 }, { "text", "开头" } };
+        var firstClock = Stopwatch.StartNew();
+        while (delivery.Delivered.Length == 0 && firstClock.ElapsedMilliseconds < 1000) { ApplySegment(first, false); await Task.Delay(10); }
+        firstClock.Stop();
+        if (delivery.Delivered != "开头") throw new Exception("First draft bridge: " + (textBridge == null ? "closed" : textBridge.Diagnostic) + "; paused=" + delivery.Paused);
+        first["text"] = "开头短句"; ApplySegment(first, false);
         await AwaitTestText(box, "原文：开头短句");
-        reset(); update("开头。", false); update("开头！", false);
-        if (delivery.Delivered != "开头") throw new Exception("Punctuation-only drafts must not churn the visible text");
-        update("开头！", true); await AwaitTestText(box, "原文：开头！");
-        if (box.Text != "原文：开头！") throw new Exception("Final punctuation must still arrive immediately");
-        reset(); update(longText, false); appendPulse.Stop();
-        string visible = delivery.Delivered, waiting = delivery.Pending;
-        double deadline = appendDeadline;
-        if (visible.Length <= 2 || waiting.Length == 0 || visible + waiting != longText) throw new Exception("Long append must send its first chunk immediately");
-        update(longText, false);
-        if (delivery.Pending != waiting || appendDeadline != deadline) throw new Exception("Duplicate drafts must not restart pacing");
-        await AwaitTestText(box, "原文：" + visible);
-        if (box.Text != "原文：" + visible) throw new Exception("Deferred suffix was sent before its pulse");
-        update(visible + "正确尾字", false);
-        await AwaitTestText(box, "原文：" + visible + "正确尾字");
-        if (box.Text != "原文：" + visible + "正确尾字" || delivery.Pending.Length != 0 || pacedDraft != null) throw new Exception("New draft must replace the unseen suffix without stale text");
-        reset(); update(longText, false); appendPulse.Stop(); update("开头金额1.5元，没有到账。", true);
-        await AwaitTestText(box, "原文：开头金额1.5元，没有到账。");
-        if (box.Text != "原文：开头金额1.5元，没有到账。" || pacedDraft != null) throw new Exception("Final number and negation revision must flush atomically");
-        reset(); update(longText, false); appendPulse.Stop(); DrainAppend(true);
-        await AwaitTestText(box, "原文：" + longText);
-        if (box.Text != "原文：" + longText || delivery.Pending.Length != 0) throw new Exception("Stop must drain without waiting for another pulse");
-        reset(); update(longText, false); appendPulse.Stop();
-        ApplySegment(new Dictionary<string, object> { { "route", 0 }, { "start", 1600 }, { "text", "下一段" } }, false);
-        await AwaitTestText(box, "原文：" + longText + "下一段");
-        if (box.Text != "原文：" + longText + "下一段" || pacedDraft != null) throw new Exception("A new segment must follow the complete previous append");
-        reset(); update(longText, false); appendPulse.Stop(); visible = delivery.Delivered; waiting = delivery.Pending;
-        Pause("Test manual edit", true);
-        DrainAppend(false);
-        await AwaitTestText(box, "原文：" + visible);
-        if (box.Text != "原文：" + visible || recovery != waiting || pacedDraft != null) throw new Exception("Manual edit must cache the unseen suffix exactly once");
-        reset(); update(longText, false); appendPulse.Stop(); visible = delivery.Delivered; waiting = delivery.Pending;
-        IntPtr savedFocus = targetFocus; targetFocus = IntPtr.Zero;
-        try { DrainAppend(false); } finally { targetFocus = savedFocus; }
-        await AwaitTestText(box, "原文：" + visible);
-        if (box.Text != "原文：" + visible || recovery != waiting || pacedDraft != null) throw new Exception("Lost focus must stop paced delivery and retain the suffix");
-        reset(); update(longText, false);
-        var elapsed = Stopwatch.StartNew();
-        while (pacedDraft != null && elapsed.ElapsedMilliseconds < 1000) await Task.Delay(10);
-        await AwaitTestText(box, "原文：" + longText);
-        if (box.Text != "原文：" + longText || delivery.Pending.Length != 0 || pacedDraft != null) throw new Exception("Timer must finish paced delivery without duplication");
-        long pacedMs = elapsed.ElapsedMilliseconds;
-        reset(); update(longText, false); appendPulse.Stop(); delivery.Cancelled = true; visible = delivery.Delivered; DrainAppend(true);
-        await AwaitTestText(box, "原文：" + visible);
-        if (box.Text != "原文：" + visible || pacedDraft != null) throw new Exception("Cancelled delivery must not type the queued tail");
-        ClearAppend(); delivery = new TextDelivery(); recovery = "";
-        string report = "PACING-TEST PASS: immediate first and short drafts / punctuation-only draft coalescing / chunked append / duplicate deadline / unseen-tail replacement / atomic correction / stop flush / edit and focus cache / timer drain / cancellation; drain=" + pacedMs + "ms";
-        File.WriteAllText(Path.Combine(root, "work", "microphone-pacing-test.txt"), report);
-        Console.WriteLine(report);
+        first["text"] = "开头好句"; ApplySegment(first, false);
+        await AwaitTestText(box, "原文：开头好句");
+        if (box.Text != "原文：开头好句") throw new Exception("Small tail revisions must stay responsive");
+        first["text"] = "开头好句！"; ApplySegment(first, false);
+        if (delivery.Delivered != "开头好句") throw new Exception("Punctuation-only previews must not churn the target");
+        var reply = new Dictionary<string, object> { { "segments", new object[] { first } } };
+        ApplyReply(reply); ApplyReply(reply);
+        await AwaitTestText(box, "原文：开头好句！");
+        if (box.Text != "原文：开头好句！") throw new Exception("Final punctuation must arrive once");
+        var second = new Dictionary<string, object> { { "route", 0 }, { "start", 100 }, { "text", "这是一段已经显示的长正文，金额15元，后面这些正确内容一直保留。" } };
+        string visible = box.Text + (string)second["text"];
+        ApplySegment(second, false); await AwaitTestText(box, visible);
+        second["text"] = "这是一段原位纠正的长正文，金额1.5元，后面这些正确内容一直保留。";
+        ApplySegment(second, false); ApplySegment(second, false);
+        await Task.Delay(30);
+        string revised = "原文：开头好句！" + second["text"];
+        if (box.Text != revised || delivery.Latest != revised.Substring(3) || box.SelectionStart != box.TextLength)
+            throw new Exception("Contextual corrections must replace in place, preserve the correct suffix and keep the caret at the end");
+        reply["segments"] = new object[] { first, second };
+        ApplyReply(reply); ApplyReply(reply);
+        string expected = "原文：开头好句！" + second["text"];
+        await AwaitTestText(box, expected);
+        if (box.Text != expected || box.SelectionStart != box.TextLength || delivery.Drafts.Count != 0)
+            throw new Exception("Final must correct the current segment exactly once, keep the prefix and leave the caret at the end");
+        DropTextBridge(); delivery = new TextDelivery(); recovery = ""; box.Text = "原文："; box.SelectionStart = box.TextLength;
+        ApplySegment(new Dictionary<string, object> { { "route", 0 }, { "start", 200 }, { "text", "hello" } }, true);
+        roundBoundary = true;
+        ApplySegment(new Dictionary<string, object> { { "route", 0 }, { "start", 300 }, { "text", "world" } }, false);
+        ApplySegment(new Dictionary<string, object> { { "route", 0 }, { "start", 300 }, { "text", "world" } }, true);
+        await AwaitTestText(box, "原文：hello world");
+        if (box.Text != "原文：hello world") throw new Exception("English boundaries must survive a preview across rounds");
+        string unchanged = box.Text; backupRoutes.Add(7);
+        var offTarget = new Dictionary<string, object> { { "route", 7 }, { "start", 400 }, { "text", "离框草稿" } };
+        ApplySegment(offTarget, false); offTarget["text"] = "离框定稿"; ApplySegment(offTarget, true);
+        await Task.Delay(30);
+        if (box.Text != unchanged || recovery != "离框定稿") throw new Exception("Off-target drafts must wait; finals must be cached");
+        delivery.Cancelled = true; offTarget["route"] = 0; offTarget["text"] = "迟到结果"; ApplySegment(offTarget, true);
+        if (delivery.Latest.Contains("迟到")) throw new Exception("Cancelled rounds must ignore late finals");
+        DropTextBridge(); delivery = new TextDelivery(); recovery = ""; backupRoutes.Clear(); appliedSegments = 0;
+        File.WriteAllText(Path.Combine(root, "work", "microphone-fast-draft-test.txt"), "FAST-DRAFT-TEST PASS: first draft bridge=" + firstClock.ElapsedMilliseconds + "ms / contextual corrections in place / correct suffix retained / caret at voice tail / no injected correction keys / punctuation coalescing / final exact text and deduplication / English round boundary / off-target cache / cancellation");
     }
     async Task RunStreamTest() {
         using (var form = new Form { Text = "VoxFix Desktop test target", Width = 500, Height = 200, TopMost = true })
@@ -4577,19 +4549,8 @@ sealed class Microphone : Form
             await BeginStream(); Status("busy", "流式输入测试");
             guard = new InteractionGuard(OwnsSurface, reason => Pause("Test user input: " + reason));
             var draftSegment = new Dictionary<string, object> { { "route", 0 }, { "start", 0 }, { "text", "金额15元" } };
-            ApplySegment(draftSegment, false); await AwaitTestText(box, "原文：金额15元");
-            if (box.Text != "原文：金额15元") throw new Exception("Draft did not reach target immediately: " + delivery.Paused);
-            draftSegment["text"] = "金额1.5元，没有到账";
-            ApplySegment(draftSegment, false); await AwaitTestText(box, "原文：金额1.5元，没有到账");
-            if (box.Text != "原文：金额1.5元，没有到账") throw new Exception("Draft revision damaged original text or amount: " + box.Text);
-            draftSegment["text"] = "金额1.5元";
-            ApplySegment(draftSegment, false); await AwaitTestText(box, "原文：金额1.5元");
-            if (box.Text != "原文：金额1.5元") throw new Exception("Shorter draft was not revised: " + box.Text);
-            draftSegment["text"] = "金额1.5元。";
-            ApplySegment(draftSegment, true); await AwaitTestText(box, "原文：金额1.5元。");
-            if (box.Text != "原文：金额1.5元。") throw new Exception("Final punctuation did not revise draft");
+            await CheckFastDraft(box);
             guard.Dispose(); guard = null;
-            await CheckPacedAppend(box);
             // Reset only the dedicated test target before the real-model portion.
             if (guard != null) { guard.Dispose(); guard = null; }
             await Exchange(new { op = "cancel", id = recordingId });
@@ -4608,7 +4569,7 @@ sealed class Microphone : Form
                 await Task.Delay(Math.Max(1, (int)((offset - 44 + length) / 32) - (int)clock.ElapsedMilliseconds));
             }
             if (first < 0 || first >= clock.ElapsedMilliseconds) throw new Exception("No text before stop: latest=" + delivery.Latest + "; paused=" + delivery.Paused + "; foreground=" + Native.GetForegroundWindow() + "; target=" + target + "; focus=" + Native.Focus(target) + "; expectedFocus=" + targetFocus);
-            if (!beforeEndpoint) throw new Exception("Draft was not delivered before VAD endpoint");
+            if (!beforeEndpoint) throw new Exception("Draft must arrive before the VAD endpoint");
             if (!delivery.Delivered.Contains("你好")) throw new Exception("Endpoint text incomplete: delivered=" + delivery.Delivered.Length + "; latest=" + delivery.Latest.Length + "; paused=" + delivery.Paused);
             var final = await Exchange(new { op = "stop", id = recordingId }); ApplyReply(final);
             await Task.Delay(100);
@@ -4666,7 +4627,20 @@ sealed class Microphone : Form
             await BeginStream();
             await FinishRecording(new byte[0]);
             if (delivery != null || state != "idle") throw new Exception("New session after cancellation failed");
-            File.WriteAllText(Path.Combine(root, "work", "VoxFix Desktop-stream-test.txt"), "PASS: immediate draft / number and negation revision / shorter draft / final punctuation / original prefix preserved / draft before VAD endpoint / first text " + first + "ms / real SenseVoice / real SendInput / no final duplication / user edit guard / focus guard / manual memory copy (test sink) / clear old cache on successful new round / focus changes keep recording / clipboard busy retry / cancellation never copies / restart after cancellation / no transcript window");
+            await BeginStream();
+            delivery.Accept("已上屏正文"); delivery.Sent("已上屏正文");
+            KeepRecovery("缓存保留"); string keptRecovery = recovery, priorId = recordingId;
+            TextDelivery keptDelivery = delivery; audioRoute = 7; backupRoutes.Add(5); int keptEpoch = targetEpoch;
+            sentBytes = RecognitionRoundBytes - 100;
+            await Feed(new byte[3200]);
+            var boundary = await Exchange(new { op = "stop", id = recordingId }); ApplyReply(boundary);
+            if (recordingId != priorId || roundSampleOffset != RecognitionRoundBytes / 2 || sentBytes != 3100 || Convert.ToInt32(boundary["samples"]) != 1550 ||
+                delivery != keptDelivery || delivery.Delivered != "已上屏正文" || recovery != keptRecovery ||
+                audioRoute != 7 || !backupRoutes.Contains(5) || targetEpoch != keptEpoch)
+                throw new Exception("Round rollover must preserve every audio byte, source group, sample offset, visible text, cache, route and edit protection");
+            await StartRecognitionRound();
+            await FinishRecording(new byte[0]);
+            File.WriteAllText(Path.Combine(root, "work", "VoxFix Desktop-stream-test.txt"), "PASS: fast drafts / contextual corrections in place / correct following text retained / caret at voice tail / no injected correction keys / exact numbers and negation / original prefix preserved / first draft " + first + "ms / real SenseVoice / direct text bridge and append compatibility / final deduplication / interaction and focus guards / cache copy and cancellation / round rollover retains unaligned packet tail, delivery, cache, route and edit epoch / no transcript window");
         }
         Close();
     }
@@ -5473,26 +5447,16 @@ sealed class Microphone : Form
                 revealFrames.Save(Path.Combine(root, "work", "reveal-preview.png"));
             }
             if (Marshal.SizeOf(typeof(Native.Input)) != (IntPtr.Size == 8 ? 40 : 28)) throw new Exception("INPUT layout");
-            if (CommonPrefix("你好", "你好世界") != 2 || CommonPrefix("没有到账", "已经到账") != 0 ||
-                CommonPrefix("金额15元", "金额1.5元") != 3 || CommonPrefix("I use Bl", "I use Blender") != 8 ||
-                CommonPrefix("你好世界", "你好") != 2)
-                throw new Exception("Draft correction prefix must preserve numbers, partial words and shorter revisions");
             using (var shell = new Microphone(root, "--stream-test")) {
-                shell.delivery = new TextDelivery { Latest = "原文", Accounted = "原文", Delivered = "原文", Paused = "测试缓存" };
-                shell.delivery.Drafts.Add("0:0", new DraftText { Text = "原文" });
-                var segment = new Dictionary<string, object> { { "route", 0 }, { "start", 1600 }, { "preview_start", 0 }, { "text", "原文继续。" } };
+                shell.delivery = new TextDelivery { Latest = "前段。", Accounted = "前段。", Delivered = "前段。", Paused = "测试缓存" };
+                var segment = new Dictionary<string, object> { { "route", 0 }, { "start", 1600 }, { "text", "草稿不送出" } };
+                shell.ApplySegment(segment, false);
+                if (shell.delivery.Latest != "前段。" || shell.recovery.Length != 0) throw new Exception("Off-target preview changed the delivery ledger");
+                segment["text"] = "后续定稿。";
                 var reply = new Dictionary<string, object> { { "segments", new object[] { segment } }, { "preview", "" } };
                 shell.ApplyReply(reply); shell.ApplyReply(reply);
-                if (shell.recovery != "继续。" || shell.delivery.Delivered != "原文" || shell.delivery.Invalidated)
-                    throw new Exception("Final after focus loss must cache only its unsent suffix, once");
-                shell.delivery.Drafts.Add("0:20", new DraftText { Text = "没有到账" });
-                shell.ApplySegment(new Dictionary<string, object> { { "route", 0 }, { "start", 20 }, { "text", "已经到账。" } }, true);
-                if (!shell.recovery.Contains("已经到账。") || shell.delivery.Delivered != "原文")
-                    throw new Exception("Changed final after focus loss must remain recoverable without modifying the old target");
-                int prefixes = shell.delivery.Drafts.Count;
-                shell.ApplySegment(new Dictionary<string, object> { { "route", 1 }, { "start", 40 }, { "text", "离框草稿" } }, false);
-                if (shell.delivery.Drafts.Count != prefixes || shell.recovery.Contains("离框草稿"))
-                    throw new Exception("Off-target drafts must wait for final before caching");
+                if (shell.recovery != "后续定稿。" || shell.delivery.Delivered != "前段。" || shell.delivery.Invalidated)
+                    throw new Exception("Final-only cache must preserve previous text and deduplicate finals");
             }
             if (!Deliverable(TargetKind.Unknown)) throw new Exception("Unknown target must stay deliverable");
             if (Deliverable(DecideTarget(false, false)) || Deliverable(DecideTarget(true, false)))
@@ -6074,14 +6038,6 @@ sealed class Microphone : Form
                     bitmap.Save(Path.Combine(frames, i.ToString("D3") + ".png"));
                 }
             }
-            if (!OnlyDraftPunctuationChanged("你好。", "你好！") || !OnlyDraftPunctuationChanged("你好", "你好，") ||
-                OnlyDraftPunctuationChanged("金额15元", "金额1.5元") || OnlyDraftPunctuationChanged("已经到账", "没有到账") ||
-                OnlyDraftPunctuationChanged(".NET", "NET") || OnlyDraftPunctuationChanged("你好", "你好") ||
-                OnlyDraftPunctuationChanged("", "。")) throw new Exception("Draft punctuation coalescing must not delay word, number or symbol corrections");
-            if (AppendChunkLength("甲乙丙丁戊己", 3) != 3 || AppendChunkLength("GitHub API", 3) != 6 ||
-                AppendChunkLength("1.5元", 1) != 3 || AppendChunkLength(".NET后续", 2) != 4 ||
-                AppendChunkLength("", 4) != 0 || AppendChunkLength("短句", int.MaxValue) != 2)
-                throw new Exception("Paced append must preserve complete English tokens and numbers");
             if (delivery.Accept("hello ") != "hello ") throw new Exception("Initial text");
             delivery.Sent("hello ");
             if (delivery.Accept("hello world") != "world") throw new Exception("English boundary");

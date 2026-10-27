@@ -1,16 +1,20 @@
 # 工具索引
 
-版本 1.6.71.0；日期 2026-10-25。生产模型为 R5 INT8；6257 条真人封存比较采用 PyTorch 口径，旧 174 条仅作辅助回归；生产 INT8 固定音频与原生送字自检通过。生产识别与词典预览入口位于 `app/`，以下均为维护工具。
+版本 1.6.77.0；日期 2026-10-27。生产模型为 R5 INT8；6257 条真人封存比较采用 PyTorch 口径，旧 174 条仅作辅助回归；生产 INT8 固定音频与原生送字自检通过。生产识别与词典预览入口位于 `app/`，以下均为维护工具。
 
 `--hotkey-host-test` 使用真实键盘钩子和隔离原生窗口验证缺席启动、现存转发、退出恢复、登录不录音、启动合并/超时、失败重试和重复释放；核对 `work/hotkey-host-test.txt`。正常登录入口为 `--hotkey-host`，`--stop-hotkey-host` 单独退出入口，不终止主程序。
 
-1.6.68.0 的 `--stream-test` 同时运行 `PACING-TEST`，结果为 `work/microphone-pacing-test.txt`：首份/短句即时、仅标点变化合并、长追加分批、过时尾部替换、修订和定稿、停止排空、编辑/失焦缓存与取消。仍须串行运行并核对本轮 PASS，不代表真实微信或日常麦克风体感验收。
+1.6.76.0 的 `--stream-test` 运行 FAST-DRAFT-TEST，核对本轮 `work/microphone-fast-draft-test.txt`：首份草稿和纯追加即时、自动原位替换、正确后文保留、不发送纠错导航或删除键、最终文字准确与去重、句尾标点合并、段尾光标、离框/取消、英文接词和换轮保护。旧STABLE/PACING仅保留历史结果，当前不做分批送字。
 Python 脚本使用项目 `.venv/Scripts/python.exe`，原生测试参数与结果文件见 [AGENTS.md](../AGENTS.md)。
+
+1.6.73.0差异修订已撤回，当前不再发送纠错导航/删除键。`--stream-test`还验证跨三分钟非整包尾部不丢失，正文、缓存、焦点、来源组和累计录音位置保留。固定音频和专用输入框不代表真实麦克风或全部宿主验收。
 
 ## 现行测试
 
 | 文件 | 用途 |
 |---|---|
+| `test_text_bridge.ps1` | 隔离跨进程 EDIT/RichEdit 原位纠错、1000组差异用例、光标、只读和外部编辑保护；需已有 C++ Build Tools/Windows SDK |
+| `test_text_bridge_browser.ps1` | 使用 work 中已获准下载且签名有效的 WebView2 SDK，验证隔离 textarea/contenteditable 实际 DOM 和逐帧光标；-ReplaceSelection覆盖框选替换并检查两侧文字；不下载、不安装，默认合成夹具，可用 -Events 指定私有识别轨迹 |
 | `test_sensevoice.py` | 无模型的协议、分段、草稿、尾音和标点契约 |
 | `test_language_guard.py` | 外文结果拒绝与先前定稿保留 |
 | `test_dictionary.py` | 共享词典规则、个人词表全部变体在独念/英文/中文中纠正、个人英文覆盖与词边界、APP/API 区分、预览子进程、最长错法与 64 词边界；不加载模型 |
@@ -44,7 +48,7 @@ R5 来源与回滚见 [R5 模型启用](../docs/R5模型启用-2026-10-23.md)；
 | `make_wav.py` | `.f32` 单声道 16kHz PCM 转 PCM16 WAV；参数见 `--help`，不会自动生成金标清单 |
 | `fetch.py` | HF 镜像分块下载与 SHA-256 校验；参数见 `--help`，仅下载工具，非生产网络依赖 |
 | `MicrophoneDeviceProbe.cs` | 只读查询默认采音设备、静音和音量，不修改系统设置 |
-| `install-shortcuts.ps1` | 设置当前用户登录后 `--hotkey-host`，兼容迁移同路径旧入口；`-Remove` 撤销并停止入口，仅用户要求时执行 |
+| `install-shortcuts.ps1` | 设置普通用户登录计划任务启动 `--hotkey-host`，失败重试，校验后迁移同路径旧入口；`-Remove` 撤销并停止入口，仅用户要求时执行 |
 
 ## 历史实验
 
@@ -65,3 +69,5 @@ git show 5209268:tools/pseudo_batch.py
 agent 交接服务：`app/training_review.py` 的 register/list/evaluate/deployed 命令见[交接协议](../docs/训练交接与验证协议.md)。它不启动训练或替换生产模型；原生离屏测试还覆盖 REVIEW-TEST 和验证页截图。
 
 状态往返：原生HISTORY-TEST覆盖归档撤回/恢复；test_training_review.py覆盖通过/打回reopen、来源撤回暂停和历史保留。所有撤回测试用隔离夹具，不触碰真实个人批次。
+
+`test_install_shortcuts.ps1`：19项内存模拟检查，覆盖登录任务、账户短名、旧项迁移、冲突保护、失败保留及移除；不写注册表或任务。系统任务对象构造仍需真实 Windows CIM 权限。

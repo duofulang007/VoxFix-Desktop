@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_RATE = 16000
 VAD_FRAME = SAMPLE_RATE // 10  # Stable gain and endpoints even when capture packets are batched.
 MAX_SECONDS = 180
+SEGMENT_SECONDS = 4
 PREVIEW_STEP = 5600  # 350 ms; replace obsolete drafts instead of queueing them.
 MIN_PREVIEW = 8800
 BOUNDARY_PAD = 6400
@@ -122,7 +123,7 @@ def create_vad():
     config.silero_vad.threshold = .30
     config.silero_vad.min_speech_duration = .12
     config.silero_vad.min_silence_duration = .65
-    config.silero_vad.max_speech_duration = 10
+    config.silero_vad.max_speech_duration = SEGMENT_SECONDS
     config.sample_rate = SAMPLE_RATE
     config.num_threads = 1
     return sherpa.VoiceActivityDetector(config, buffer_size_in_seconds=30)
@@ -201,6 +202,8 @@ class Recognition:
             self.committed = self.preview = self.error = ''
             self.first_previews = {}
             self.keep_history = False
+            self.preview_enabled = True
+            self.sample_offset = 0
             self.ending = False
             self.decoding = False
             self.vad.reset()
@@ -240,7 +243,15 @@ class Recognition:
         if operation == 'start':
             if self.id is not None:
                 raise ValueError('上一段录音尚未结束')
+            preview = request.get('preview', True)
+            if not isinstance(preview, bool):
+                raise ValueError('无效的草稿选项')
+            sample_offset = request.get('sample_offset', 0)
+            if isinstance(sample_offset, bool) or not isinstance(sample_offset, int) or not 0 <= sample_offset < 2**53:
+                raise ValueError('无效的录音位置')
             self.clear()
+            self.preview_enabled = preview
+            self.sample_offset = sample_offset
             self.id, self.cancelled = identity, False
             self.keep_history = self.history.begin() if self.history else False
             self.worker = threading.Thread(target=self.loop, daemon=True)
@@ -300,7 +311,7 @@ class Recognition:
         self.samples += audio.size
         self.vad.accept_waveform(boosted)
         self.collect_segments()
-        if self.vad.is_speech_detected():
+        if self.preview_enabled and self.vad.is_speech_detected():
             current = self.vad.current_segment
             start = self.last_end if self.carry else max(self.last_end, self.vad_offset + current.start - BOUNDARY_PAD)
             self.active_key = (start, self.route)
@@ -321,12 +332,12 @@ class Recognition:
             if flushing and self.last_end == 0 and self.samples <= 6 * SAMPLE_RATE:
                 start = 0
             end = min(self.samples, position + len(segment.samples) + BOUNDARY_PAD)
-            forced = len(segment.samples) >= int(9.5 * SAMPLE_RATE) and not flushing
+            forced = len(segment.samples) >= int((SEGMENT_SECONDS - .5) * SAMPLE_RATE) and not flushing
             if forced:
                 # A duration limit is not a word boundary; cut at nearby quiet audio
                 # and carry the remaining samples into the next segment.
                 target = min(self.samples, position + len(segment.samples))
-                search = max(start + SAMPLE_RATE, target - 24000)
+                search = max(start + SAMPLE_RATE, target - 12000)
                 window = self.audio[search:target]
                 count = len(window) // 160
                 if count:
@@ -394,7 +405,7 @@ class Recognition:
                     if final and self.keep_history:
                         first = self.first_previews.pop((preview_start, route), '')
                         self.history.submit(original_audio, roundId=self.id, route=route,
-                                            start=start, end=end, firstText=first,
+                                            start=start + self.sample_offset, end=end + self.sample_offset, firstText=first,
                                             rawText=raw_text, text=text,
                                             recognitionRejected=outside_product_scripts(text),
                                             model='R5 INT8')

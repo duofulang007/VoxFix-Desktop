@@ -1,4 +1,5 @@
 """Private history persistence and production integration, without microphone/model."""
+import base64
 import json
 from pathlib import Path
 import sys
@@ -93,6 +94,29 @@ class HistoryTests(unittest.TestCase):
                 self.assertEqual(data['model'], 'R5 INT8')
                 with wave.open(str(history.folder / data['wav'])) as wav:
                     self.assertEqual(np.frombuffer(wav.readframes(16000), dtype='<i2')[0], int(.015 * 32768))
+            finally:
+                engine.clear()
+                history.close()
+
+    def test_stable_mode_records_final_without_inventing_a_first_draft(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.settings(root, True)
+            history = HistoryRecorder(root)
+            session = Session()
+            session.text = '短句定稿。'
+            engine = Recognition(session, Vad(), history=history)
+            try:
+                pcm = np.full(1600, 100, dtype='<i2').tobytes()
+                for offset in (0, 1600):
+                    engine.handle({'op': 'start', 'id': 'stable', 'preview': False, 'sample_offset': offset})
+                    engine.handle({'op': 'audio', 'id': 'stable', 'pcm': base64.b64encode(pcm).decode()})
+                    self.assertEqual(engine.handle({'op': 'stop', 'id': 'stable'})['text'], session.text)
+                history.jobs.join()
+                records = [json.loads(path.read_text(encoding='utf-8')) for path in history.folder.glob('*.json')]
+                self.assertEqual(sorted((r['start'], r['end']) for r in records), [(0, 1600), (1600, 3200)])
+                for data in records:
+                    self.assertEqual((data['firstText'], data['rawText'], data['text']), ('', session.text, session.text))
+                    self.assertEqual(data['roundId'], 'stable')
             finally:
                 engine.clear()
                 history.close()

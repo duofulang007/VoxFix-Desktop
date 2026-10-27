@@ -65,6 +65,50 @@ class Session:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_stable_session_skips_preview_decode_and_keeps_final(self):
+        session = Session()
+        engine = Recognition(session, Vad())
+        try:
+            for invalid in ('false', 0, None):
+                with self.assertRaisesRegex(ValueError, '草稿选项'):
+                    engine.handle({'op': 'start', 'id': 'test', 'preview': invalid})
+            for invalid in (-1, True, 1.5, '0', 2**53):
+                with self.assertRaisesRegex(ValueError, '录音位置'):
+                    engine.handle({'op': 'start', 'id': 'test', 'sample_offset': invalid})
+            engine.handle({'op': 'start', 'id': 'test', 'preview': False})
+            self.feed(engine)
+            self.assertFalse(session.called.wait(.05), 'stable mode must not decode unused drafts')
+            self.assertEqual(engine.snapshot()['preview'], '')
+            session.text = '金额1.5元，没有到账。'
+            self.assertEqual(engine.handle({'op': 'stop', 'id': 'test'})['text'], session.text)
+            session.called.clear()
+            engine.handle({'op': 'start', 'id': 'test'})
+            self.feed(engine)
+            self.assertTrue(session.called.wait(1), 'legacy preview protocol must still work')
+        finally:
+            engine.clear()
+
+    def test_four_second_forced_endpoint_preserves_carry_on_stop(self):
+        class FourSecondVad(Vad):
+            def accept_waveform(self, audio):
+                super().accept_waveform(audio)
+                if len(self.audio) == 64000:
+                    self.completed.append(self.current_segment)
+                    self.active = False
+        engine = Recognition(Session(), FourSecondVad())
+        try:
+            engine.handle({'op': 'start', 'id': 'test', 'preview': False})
+            for _ in range(4):
+                self.feed(engine)
+            cut = engine.last_end
+            self.assertTrue(engine.carry)
+            self.assertLess(cut, 64000)
+            final = engine.handle({'op': 'stop', 'id': 'test'})
+            self.assertEqual([(s['start'], s['end']) for s in final['segments']],
+                             [(0, cut), (cut, 64000)])
+        finally:
+            engine.clear()
+
     def test_forced_tail_is_flushed_once_before_stop_or_route_change(self):
         class ForcedVad(Vad):
             def accept_waveform(self, audio):
