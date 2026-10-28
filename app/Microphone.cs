@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Reflection;
 using System.Text;
@@ -15,7 +16,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.78.0")]
+[assembly: AssemblyVersion("1.6.79.0")]
 
 static class Native
 {
@@ -260,6 +261,26 @@ sealed class DraftText
     internal string Text = "", Separator = "";
     internal bool InPlace;
     internal ulong Segment;
+}
+
+sealed class TextReveal
+{
+    internal Dictionary<string, object> Segment;
+    internal string Key;
+    internal bool Final, AppendOnly;
+    internal double Started, Next;
+    internal TextDelivery Owner;
+    // shortcut: ASR has no character timestamps; pace arriving text until timestamped streaming is available.
+    internal static string Step(string shown, string wanted, double age) {
+        if (wanted.Length <= shown.Length) return wanted;
+        int[] boundaries = StringInfo.ParseCombiningCharacters(wanted);
+        int index = 0;
+        while (index < boundaries.Length && boundaries[index] < shown.Length) index++;
+        // Catch up a large recognition burst within 240ms instead of accumulating typing lag.
+        int count = Math.Max(1, (int)Math.Ceiling((boundaries.Length - index) * 35.0 / Math.Max(35, 240 - age)));
+        int end = Math.Min(boundaries.Length, index + count);
+        return end == boundaries.Length ? wanted : wanted.Substring(0, boundaries[end]);
+    }
 }
 
 sealed class TextDelivery
@@ -3272,6 +3293,8 @@ sealed class Microphone : Form
     readonly bool streamTest;
     internal const int RecognitionRoundBytes = 32000 * 180;
     readonly System.Windows.Forms.Timer capture = new System.Windows.Forms.Timer { Interval = 40 };
+    readonly System.Windows.Forms.Timer textReveal = new System.Windows.Forms.Timer { Interval = 15 };
+    readonly List<TextReveal> reveals = new List<TextReveal>();
     readonly System.Windows.Forms.Timer animation = new System.Windows.Forms.Timer { Interval = 16 };
     // Idle focus watch: the capsule reports whether text would land in a real input box
     // even before recording starts. Cheap when the target pair has not changed.
@@ -3360,6 +3383,9 @@ sealed class Microphone : Form
         DoubleBuffered = true; Cursor = Cursors.Hand;
         AccessibleDescription = "正在加载本地模型…";
         capture.Tick += async (s, e) => await Pump();
+        textReveal.Tick += (s, e) => {
+            try { RevealText(); } catch (Exception error) { Fail(error.Message); }
+        };
         focusWatch.Tick += async (s, e) => await WatchIdleFocus();
         animation.Tick += async (s, e) => {
             if (!Visible && !startOnReveal) { animation.Stop(); return; }
@@ -3440,6 +3466,7 @@ sealed class Microphone : Form
             if (menuGuard != null) { menuGuard.Dispose(); menuGuard = null; }
             if (shortcut != null) shortcut.Dispose();
             capture.Stop(); capture.Dispose();
+            textReveal.Stop(); textReveal.Dispose(); reveals.Clear();
             focusWatch.Stop(); focusWatch.Dispose();
             if (guard != null) guard.Dispose();
             if (recorder != null) recorder.Dispose();
@@ -3732,20 +3759,80 @@ sealed class Microphone : Form
             int index = 0;
             foreach (Dictionary<string, object> segment in (System.Collections.IEnumerable)reply["segments"]) {
                 if (index++ < appliedSegments) continue;
-                ApplySegment(segment, true);
+                QueueSegment(segment, true);
                 appliedSegments = index;
             }
         } else ApplyText(Convert.ToString(reply["text"]));
         if (delivery != null && reply.ContainsKey("preview_segment") && reply["preview_segment"] != null)
-            ApplySegment((Dictionary<string, object>)reply["preview_segment"], false);
+            QueueSegment((Dictionary<string, object>)reply["preview_segment"], false);
         string preview = reply.ContainsKey("preview") ? Convert.ToString(reply["preview"]) : "";
         if (draft != preview) { draft = preview; UpdateMemoryShape(); }
         UpdateMemoryShape();
     }
+    static string SegmentKey(Dictionary<string, object> segment) {
+        return Convert.ToString(segment["route"]) + ":" + Convert.ToString(segment.ContainsKey("preview_start") ? segment["preview_start"] : segment["start"]);
+    }
+    void QueueSegment(Dictionary<string, object> segment, bool final) {
+        if (delivery == null || delivery.Cancelled || closing) return;
+        string key = SegmentKey(segment);
+        var pending = reveals.Find(value => value.Owner == delivery && value.Key == key);
+        if (pending != null && pending.Final && !final) return;
+        if (pending == null) {
+            pending = new TextReveal { Key = key, Owner = delivery, Started = motionClock.Elapsed.TotalMilliseconds };
+            reveals.Add(pending);
+        }
+        pending.Segment = new Dictionary<string, object>(segment); pending.Final = final;
+        RevealText();
+        if (reveals.Count > 0) textReveal.Start();
+    }
+    void RevealText() {
+        if (closing || delivery == null || delivery.Cancelled) { reveals.Clear(); textReveal.Stop(); return; }
+        while (reveals.Count > 0) {
+            var pending = reveals[0];
+            if (pending.Owner != delivery) { reveals.RemoveAt(0); continue; }
+            double now = motionClock.Elapsed.TotalMilliseconds;
+            if (now < pending.Next) return;
+            int route = Convert.ToInt32(pending.Segment["route"]);
+            bool memory = delivery.Paused.Length != 0 || backupRoutes.Contains(route);
+            DraftText previous; delivery.Drafts.TryGetValue(pending.Key, out previous);
+            string wanted = Convert.ToString(pending.Segment["text"]).TrimStart();
+            string shown = previous == null ? "" : previous.Text;
+            if (previous != null && previous.Separator.Length > 0 && shown.StartsWith(previous.Separator, StringComparison.Ordinal)) shown = shown.Substring(previous.Separator.Length);
+            if (!pending.Final && wanted.Length < shown.Length) { reveals.RemoveAt(0); continue; }
+            string next = memory || !animationsEnabled ? wanted : TextReveal.Step(shown, wanted, now - pending.Started);
+            var update = new Dictionary<string, object>(pending.Segment); update["text"] = next;
+            bool complete = next == wanted;
+            if (pending.AppendOnly && !memory) AppendReveal(pending, previous, next, complete);
+            else ApplySegment(update, pending.Final && complete);
+            // Unknown interfaces reveal finals by guarded append, never simulated keystroke corrections.
+            if (!pending.AppendOnly && !memory && pending.Final && !complete) {
+                delivery.Drafts.TryGetValue(pending.Key, out previous);
+                if (previous != null && !previous.InPlace && delivery.Paused.Length == 0) {
+                    pending.AppendOnly = true; AppendReveal(pending, previous, next, false);
+                }
+            }
+            if (complete || memory) reveals.RemoveAt(0);
+            else { pending.Next = now + 35; return; }
+        }
+        textReveal.Stop();
+    }
+    void AppendReveal(TextReveal pending, DraftText previous, string text, bool complete) {
+        text = previous.Separator + text;
+        if (!text.StartsWith(previous.Text, StringComparison.Ordinal)) throw new IOException("定稿追加结果发生回退，已停止输入。");
+        ApplyText(delivery.Latest + text.Substring(previous.Text.Length));
+        previous.Text = text;
+        if (complete) delivery.Drafts.Remove(pending.Key);
+    }
+    async Task DrainReveals() {
+        while (reveals.Count > 0 && !closing && delivery != null && !delivery.Cancelled) {
+            RevealText();
+            if (reveals.Count > 0) await Task.Delay(15);
+        }
+    }
     void ApplySegment(Dictionary<string, object> segment, bool final) {
         if (delivery == null || delivery.Cancelled) return;
         int route = Convert.ToInt32(segment["route"]);
-        string key = route + ":" + Convert.ToString(segment.ContainsKey("preview_start") ? segment["preview_start"] : segment["start"]);
+        string key = SegmentKey(segment);
         string text = Convert.ToString(segment["text"]).TrimStart();
         bool memory = backupRoutes.Contains(route) || delivery.Paused.Length != 0;
         DraftText previous;
@@ -3905,6 +3992,16 @@ sealed class Microphone : Form
     }
     void Fail(string message) {
         if (closing) return;
+        textReveal.Stop();
+        if (delivery != null && !delivery.Cancelled) foreach (var pending in reveals) {
+            if (pending.Owner != delivery || !pending.Final) continue;
+            DraftText previous; delivery.Drafts.TryGetValue(pending.Key, out previous);
+            string text = Convert.ToString(pending.Segment["text"]).TrimStart();
+            string shown = previous == null ? "" : previous.Text;
+            if (previous != null && shown.StartsWith(previous.Separator, StringComparison.Ordinal)) shown = shown.Substring(previous.Separator.Length);
+            KeepRecovery(text.StartsWith(shown, StringComparison.Ordinal) ? text.Substring(shown.Length) : "\n[该句最终识别] " + text);
+        }
+        reveals.Clear();
         DropTextBridge();
         if (!smokeTest && !streamTest && !memoryTest) try {
             File.WriteAllText(Path.Combine(root, "work", "recognition-error.txt"), DateTime.UtcNow.ToString("o") + " / " + Assembly.GetExecutingAssembly().GetName().Version + " / " + state + " / audioBytes=" + sentBytes + " / " + message);
@@ -4086,6 +4183,7 @@ sealed class Microphone : Form
         await EndRecording();
     }
     async Task BeginStream() {
+        textReveal.Stop(); reveals.Clear();
         DropTextBridge();
         draft = ""; speechDetected = transcribing = false;
         stalledWindows.Clear();
@@ -4119,6 +4217,7 @@ sealed class Microphone : Form
         while (offset < audio.Length && !closing) {
             if (sentBytes == RecognitionRoundBytes) {
                 ApplyReply(await Exchange(new { op = "stop", id = recordingId }));
+                await DrainReveals();
                 roundSampleOffset += sentBytes / 2;
                 await StartRecognitionRound();
                 roundBoundary = true;
@@ -4198,6 +4297,7 @@ sealed class Microphone : Form
             await pipeline.WaitAsync(); acquired = true;
             if (closing || delivery == null || state == "error") return;
             if (delivery.Cancelled) {
+                textReveal.Stop(); reveals.Clear();
                 await Exchange(new { op = "cancel", id = recordingId });
                 return;
             }
@@ -4205,6 +4305,7 @@ sealed class Microphone : Form
             var result = await Exchange(new { op = "stop", id = recordingId });
             if (!closing) {
                 ApplyReply(result);
+                await DrainReveals();
             }
         } catch (Exception error) { Fail(error.Message); }
         finally {
@@ -4513,6 +4614,63 @@ sealed class Microphone : Form
         DropTextBridge(); delivery = new TextDelivery(); recovery = ""; backupRoutes.Clear(); appliedSegments = 0;
         File.WriteAllText(Path.Combine(root, "work", "microphone-fast-draft-test.txt"), "FAST-DRAFT-TEST PASS: first draft bridge=" + firstClock.ElapsedMilliseconds + "ms / contextual corrections in place / correct suffix retained / caret at voice tail / no injected correction keys / punctuation coalescing / final exact text and deduplication / English round boundary / off-target cache / cancellation");
     }
+    async Task CheckTextReveal(TextBox box) {
+        if (TextReveal.Step("", "甲乙丙丁", 0) != "甲" || TextReveal.Step("", "甲乙丙丁", 240) != "甲乙丙丁" ||
+            TextReveal.Step("", "\ud83d\ude00e\u0301中", 0) != "\ud83d\ude00" || TextReveal.Step("\ud83d\ude00", "\ud83d\ude00e\u0301中", 0) != "\ud83d\ude00e\u0301")
+            throw new Exception("Reveal must advance text elements and bound accumulated lag");
+        reveals.Clear(); textReveal.Stop();
+        box.Text = "原文："; box.SelectionStart = box.TextLength;
+        delivery = new TextDelivery(); recovery = ""; backupRoutes.Clear(); appliedSegments = 0;
+        var frames = new List<string>(); var clock = Stopwatch.StartNew();
+        EventHandler changed = (s, e) => frames.Add(clock.ElapsedMilliseconds + "\t" + box.Text);
+        box.TextChanged += changed;
+        try {
+            var segment = new Dictionary<string, object> { { "route", 0 }, { "start", 0 }, { "text", "逐字出现跟随说话" } };
+            QueueSegment(segment, false);
+            if (animationsEnabled && box.Text == "原文：逐字出现跟随说话") throw new Exception("Draft must not jump out as a whole block");
+            await Task.Delay(120);
+            segment["text"] = "连贯出现跟随说话节奏，金额1.5元。";
+            QueueSegment(segment, true);
+            QueueSegment(new Dictionary<string, object> { { "route", 0 }, { "start", 100 }, { "text", "下一句不能越过前句。" } }, true);
+            await DrainReveals();
+            string expected = "原文：连贯出现跟随说话节奏，金额1.5元。下一句不能越过前句。";
+            if (box.Text != expected || box.SelectionStart != box.TextLength || delivery.Drafts.Count != 0 ||
+                delivery.Delivered != expected.Substring(3) || (animationsEnabled && frames.Count < 4) || clock.ElapsedMilliseconds > 1500)
+                throw new Exception("Paced finals must coalesce, remain ordered, finish promptly and account only applied text");
+            DropTextBridge(); textBridge = new InPlaceText(IntPtr.Zero, target, targetFocus);
+            segment["start"] = 150; segment["text"] = "兼容通道逐字追加。";
+            int beforeFrames = frames.Count;
+            QueueSegment(segment, true); await DrainReveals();
+            expected += "兼容通道逐字追加。";
+            await AwaitTestText(box, expected);
+            if (box.Text != expected || (animationsEnabled && frames.Count - beforeFrames < 2) || delivery.Drafts.Count != 0)
+                throw new Exception("Unsupported text interfaces must pace finalized text without duplication: actual=" + box.Text + "; expected=" + expected + "; frames=" + (frames.Count - beforeFrames) + "; drafts=" + delivery.Drafts.Count + "; paused=" + delivery.Paused);
+            DropTextBridge();
+            box.Text = "左侧原文替换这段右侧原文"; box.Select(4, 4);
+            delivery = new TextDelivery();
+            segment["start"] = 175; segment["text"] = "新的逐字语音";
+            // Warm the bridge before this assertion so it exercises range ownership, not append fallback.
+            textBridge = new InPlaceText(Handle, target, targetFocus);
+            textBridge.Update(++bridgeSegment, "", "", false); await Task.Delay(40);
+            QueueSegment(segment, true); await DrainReveals();
+            if (box.Text != "左侧原文新的逐字语音右侧原文" || box.SelectionStart != 10 || box.SelectionLength != 0)
+                throw new Exception("Paced selection replacement must retain both sides and leave the caret at the voice tail");
+            box.SelectionStart = box.TextLength;
+            segment["start"] = 200; segment["text"] = "用户编辑后这些尾字应保留在缓存";
+            QueueSegment(segment, false); await Task.Delay(45);
+            Pause("测试用户编辑", true); string stopped = box.Text;
+            QueueSegment(segment, true); await DrainReveals();
+            if (box.Text != stopped || recovery.Length == 0) throw new Exception("Pending reveal escaped user-edit protection or lost final text");
+            delivery.Paused = ""; segment["route"] = audioRoute; segment["start"] = 300;
+            QueueSegment(segment, true); delivery.Cancelled = true; RevealText();
+            if (reveals.Count != 0) throw new Exception("Cancelled recording retained queued text");
+            File.WriteAllLines(Path.Combine(root, "work", "text-reveal-frames.txt"), frames.ToArray());
+            File.WriteAllText(Path.Combine(root, "work", "text-reveal-test.txt"), "TEXT-REVEAL-TEST PASS: progressive frames=" + frames.Count + " / coalesced latest candidate and visible correction / ordered final segments / paced append compatibility / paced selection replacement / caret and delivery ledger / user-edit cache / cancellation / Unicode text elements / bounded catch-up / reduced motion follows system setting");
+        } finally {
+            box.TextChanged -= changed; textReveal.Stop(); reveals.Clear(); DropTextBridge();
+            delivery = new TextDelivery(); recovery = ""; backupRoutes.Clear(); appliedSegments = 0;
+        }
+    }
     async Task RunStreamTest() {
         using (var form = new Form { Text = "VoxFix Desktop test target", Width = 500, Height = 200, TopMost = true })
         using (var box = new TextBox { Multiline = true, Dock = DockStyle.Fill, Text = "原文：" }) {
@@ -4555,6 +4713,7 @@ sealed class Microphone : Form
             guard = new InteractionGuard(OwnsSurface, reason => Pause("Test user input: " + reason));
             var draftSegment = new Dictionary<string, object> { { "route", 0 }, { "start", 0 }, { "text", "金额15元" } };
             await CheckFastDraft(box);
+            await CheckTextReveal(box);
             guard.Dispose(); guard = null;
             // Reset only the dedicated test target before the real-model portion.
             if (guard != null) { guard.Dispose(); guard = null; }

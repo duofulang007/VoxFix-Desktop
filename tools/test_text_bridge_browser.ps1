@@ -31,7 +31,7 @@ foreach ($mode in @('textarea','editable')) {
     $output | Set-Content -LiteralPath (Join-Path $directory "$mode-run.log")
     if ($testExit -ne 0) { throw "$mode browser test failed: $output" }
     $resultFile = Get-Item -LiteralPath (Join-Path $directory "$mode-result.json")
-    $result = Get-Content -LiteralPath $resultFile.FullName -Raw | ConvertFrom-Json
+    $result = Get-Content -LiteralPath $resultFile.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($resultFile.LastWriteTime -lt $started -or -not $result.pass) { throw 'Stale or unsuccessful browser test result.' }
     Write-Output $output
 }
