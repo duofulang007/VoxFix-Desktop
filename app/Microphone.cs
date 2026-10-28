@@ -15,7 +15,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.77.0")]
+[assembly: AssemblyVersion("1.6.78.0")]
 
 static class Native
 {
@@ -359,6 +359,12 @@ sealed class MenuDismissHook : IDisposable
 sealed class ShortcutKeys
 {
     readonly HashSet<int> held = new HashSet<int>(), captured = new HashSet<int>();
+    internal void RefreshModifiers() {
+        // Other hooks can consume releases; historical events are not physical key state.
+        foreach (int key in new[] { 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5 }) {
+            if (Native.GetAsyncKeyState(key) < 0) held.Add(key); else held.Remove(key);
+        }
+    }
     internal int Process(int key, bool down, int available, out bool swallow) {
         if (down) held.Add(key); else held.Remove(key);
         swallow = captured.Contains(key);
@@ -383,6 +389,7 @@ sealed class DictationShortcut : IDisposable
     [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr message, IntPtr data);
     [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string name);
     readonly Thread thread;
+    readonly ShortcutKeys keys = new ShortcutKeys();
     Control dispatcher;
     ApplicationContext context;
     Exception failure;
@@ -391,13 +398,14 @@ sealed class DictationShortcut : IDisposable
     internal DictationShortcut(Action<int> command) {
         using (var ready = new ManualResetEventSlim()) {
             thread = new Thread(() => {
-                var keys = new ShortcutKeys();
                 IntPtr handle = IntPtr.Zero;
                 Hook hook = (code, message, data) => {
                     long kind = message.ToInt64();
                     if (code >= 0 && (kind == 0x100 || kind == 0x101 || kind == 0x104 || kind == 0x105)) {
+                        int key = Marshal.ReadInt32(data);
+                        if ((kind == 0x100 || kind == 0x104) && (key == 0x48 || key == 0x1B)) keys.RefreshModifiers();
                         bool swallow;
-                        int action = keys.Process(Marshal.ReadInt32(data), kind == 0x100 || kind == 0x104, Available, out swallow);
+                        int action = keys.Process(key, kind == 0x100 || kind == 0x104, Available, out swallow);
                         if (action == 1) {
                             // An unused key masks the lone Win release without typing into the target.
                             var mask = new[] { Native.KeyInput(0xE8, false), Native.KeyInput(0xE8, true) };
@@ -411,10 +419,7 @@ sealed class DictationShortcut : IDisposable
                 try {
                     dispatcher = new Control(); IntPtr window = dispatcher.Handle;
                     context = new ApplicationContext();
-                    foreach (int key in new[] { 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5 }) {
-                        bool ignored;
-                        if (Native.GetAsyncKeyState(key) < 0) keys.Process(key, true, 0, out ignored);
-                    }
+                    keys.RefreshModifiers();
                     handle = SetWindowsHookEx(13, hook, GetModuleHandle(null), 0);
                     if (handle == IntPtr.Zero) throw new IOException("无法接管 Win+H，请退出后重新打开 VoxFix。");
                 } catch (Exception error) { failure = error; }
@@ -5246,6 +5251,15 @@ sealed class Microphone : Form
                         for (int i = 0; i < escape.Length; i++) escape[i].data.keyboard.extra = UIntPtr.Zero;
                         if (Native.SendInput(2, escape, Marshal.SizeOf(typeof(Native.Input))) != 2) throw new Exception("Escape test injection failed");
                         if (!WaitShortcut(invoked) || Volatile.Read(ref last) != 2 || Volatile.Read(ref calls) != 2 || hook.MaskFailed) throw new Exception("Real Escape hook or Win masking failed");
+                        // A consumed modifier release must not let the next Win+H reach Windows.
+                        foreach (int modifier in new[] { 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5 }) {
+                            var dispatcher = (Control)typeof(DictationShortcut).GetField("dispatcher", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(hook);
+                            var keys = (ShortcutKeys)typeof(DictationShortcut).GetField("keys", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(hook);
+                            dispatcher.Invoke(new Action(() => { bool ignored; keys.Process(modifier, true, 0, out ignored); }));
+                            if (Native.SendInput((uint)press.Length, press, Marshal.SizeOf(typeof(Native.Input))) != press.Length) throw new Exception("Modifier recovery injection failed");
+                            if (!WaitShortcut(invoked) || Volatile.Read(ref last) != 1 || Volatile.Read(ref calls) != 3) throw new Exception("Stale modifier must not leak Win+H to Windows: " + modifier);
+                            Interlocked.Exchange(ref calls, 2);
+                        }
                         // Ctrl+C belongs to the target app: the hook must never capture it,
                         // even with a stale copy bit set and cached text ready.
                         hook.Available = 3;
@@ -5285,7 +5299,7 @@ sealed class Microphone : Form
                     }
                   }
                 }
-                File.WriteAllText(Path.Combine(root, "work", "microphone-hotkey-test.txt"), "PASS: dedicated hook thread / real SendInput Win+H / key repeat suppressed / real Escape / 11 Ctrl+C presses always reach the target app with no captured action / shortcuts bypass edit guard / replayed wheel and movement preserve delivery / replayed mouse buttons still guard delivery / Win release masked / clean unhook; no model, audio or clipboard access");
+                File.WriteAllText(Path.Combine(root, "work", "microphone-hotkey-test.txt"), "PASS: dedicated hook thread / real SendInput Win+H / six stale modifiers recovered without leaking Win+H / key repeat suppressed / real Escape / 11 Ctrl+C presses always reach the target app with no captured action / shortcuts bypass edit guard / replayed wheel and movement preserve delivery / replayed mouse buttons still guard delivery / Win release masked / clean unhook; no model, audio or clipboard access");
             }
             return;
         }
