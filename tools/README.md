@@ -17,6 +17,7 @@ Python 脚本使用项目 `.venv/Scripts/python.exe`，原生测试参数与结�
 |---|---|
 | `test_text_bridge.ps1` | 隔离跨进程 EDIT/RichEdit 原位纠错、1000组差异用例、光标、只读和外部编辑保护；需已有 C++ Build Tools/Windows SDK |
 | `test_text_bridge_browser.ps1` | 使用 work 中已获准下载且签名有效的 WebView2 SDK，验证隔离 textarea/contenteditable 实际 DOM 和逐帧光标；-ReplaceSelection覆盖框选替换并检查两侧文字；不下载、不安装，默认合成夹具，可用 -Events 指定私有识别轨迹 |
+| `test_text_bridge_browser.cs` | 上述浏览器桥接测试的宿主源码，由 `test_text_bridge_browser.ps1` 编译到 `work/` 后运行；不单独执行，不随生产 EXE 分发 |
 | `test_sensevoice.py` | 无模型的协议、分段、草稿、尾音和标点契约 |
 | `test_language_guard.py` | 外文结果拒绝与先前定稿保留 |
 | `test_dictionary.py` | 共享词典规则、个人词表全部变体在独念/英文/中文中纠正、个人英文覆盖与词边界、APP/API 区分、预览子进程、最长错法与 64 词边界；不加载模型 |
@@ -49,6 +50,7 @@ R5 来源与回滚见 [R5 模型启用](../docs/R5模型启用-2026-10-23.md)；
 | `p0_score.py` | 共享的 `units`、`distance`、`exact`、`overall`，保留原模块名避免改动现行导入；已移除依赖安卓绝对路径的旧报表 CLI |
 | `make_wav.py` | `.f32` 单声道 16kHz PCM 转 PCM16 WAV；参数见 `--help`，不会自动生成金标清单 |
 | `fetch.py` | HF 镜像分块下载与 SHA-256 校验；参数见 `--help`，仅下载工具，非生产网络依赖 |
+| `build_text_bridge.ps1` | 编译 `app/native/` 的原生原位编辑组件；DLL 名、消息窗口类和启动消息版本均从 `Microphone.cs` 的 AssemblyVersion 生成，已加载的同版本 DLL 无法覆盖，发布新版本须先升 AssemblyVersion |
 | `MicrophoneDeviceProbe.cs` | 只读查询默认采音设备、静音和音量，不修改系统设置 |
 | `install-shortcuts.ps1` | 设置普通用户登录计划任务启动 `--hotkey-host`，失败重试，校验后迁移同路径旧入口；`-Remove` 撤销并停止入口，仅用户要求时执行 |
 
