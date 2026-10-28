@@ -16,7 +16,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.79.0")]
+[assembly: AssemblyVersion("1.6.80.0")]
 
 static class Native
 {
@@ -44,6 +44,12 @@ static class Native
     internal static string ClassOf(IntPtr window) {
         var name = new StringBuilder(256);
         return GetClassName(window, name, name.Capacity) > 0 ? name.ToString() : "";
+    }
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr window, int index);
+    internal static bool NativeReadOnly(IntPtr focus) {
+        string name = ClassOf(focus);
+        return (name.Equals("Edit", StringComparison.OrdinalIgnoreCase) || name.StartsWith("WindowsForms10.EDIT", StringComparison.OrdinalIgnoreCase) ||
+            name.IndexOf("RichEdit", StringComparison.OrdinalIgnoreCase) >= 0) && (GetWindowLong(focus, -16) & 0x800) != 0;
     }
     internal static string TitleOf(IntPtr window) {
         var text = new StringBuilder(512);
@@ -126,6 +132,7 @@ static class Native
             (string.Equals(processName, "Weixin", StringComparison.OrdinalIgnoreCase) || string.Equals(processName, "WeChat", StringComparison.OrdinalIgnoreCase));
     }
     internal static uint SendToTarget(IntPtr window, IntPtr focus, Input[] inputs, Func<bool> permitted = null) {
+        if (NativeReadOnly(focus)) return 0;
         bool direct = false;
         string windowClass = ClassOf(window);
         if (windowClass.StartsWith("Qt", StringComparison.Ordinal)) try {
@@ -139,7 +146,7 @@ static class Native
     internal static uint SendCharacterMessages(IntPtr window, IntPtr focus, Input[] inputs, Func<bool> permitted = null) {
         uint completed = 0;
         for (int i = 0; i + 1 < inputs.Length; i += 2) {
-            if (GetForegroundWindow() != window || focus == IntPtr.Zero || Focus(window) != focus || (permitted != null && !permitted())) break;
+            if (GetForegroundWindow() != window || focus == IntPtr.Zero || Focus(window) != focus || NativeReadOnly(focus) || (permitted != null && !permitted())) break;
             var down = inputs[i].data.keyboard; UIntPtr result;
             if (down.flags == 4 && down.vk == 0) {
                 if (down.scan == '\r' || down.scan == '\n') break; // Never turn dictated text into WeChat's send action.
@@ -4645,6 +4652,14 @@ sealed class Microphone : Form
             await AwaitTestText(box, expected);
             if (box.Text != expected || (animationsEnabled && frames.Count - beforeFrames < 2) || delivery.Drafts.Count != 0)
                 throw new Exception("Unsupported text interfaces must pace finalized text without duplication: actual=" + box.Text + "; expected=" + expected + "; frames=" + (frames.Count - beforeFrames) + "; drafts=" + delivery.Drafts.Count + "; paused=" + delivery.Paused);
+            segment["start"] = 160; segment["text"] = "只读切换后剩余文字必须留在缓存。";
+            QueueSegment(segment, true); await Task.Delay(45);
+            box.ReadOnly = true; string beforeReadOnly = box.Text;
+            await DrainReveals();
+            string accepted = beforeReadOnly.Substring(expected.Length);
+            if (box.Text != beforeReadOnly || accepted + recovery != (string)segment["text"] || delivery.Paused.Length == 0)
+                throw new Exception("Read-only transition must stop paced append and retain the exact unsent final suffix");
+            box.ReadOnly = false; recovery = ""; backupRoutes.Clear(); audioRoute = 0;
             DropTextBridge();
             box.Text = "左侧原文替换这段右侧原文"; box.Select(4, 4);
             delivery = new TextDelivery();
@@ -4665,7 +4680,7 @@ sealed class Microphone : Form
             QueueSegment(segment, true); delivery.Cancelled = true; RevealText();
             if (reveals.Count != 0) throw new Exception("Cancelled recording retained queued text");
             File.WriteAllLines(Path.Combine(root, "work", "text-reveal-frames.txt"), frames.ToArray());
-            File.WriteAllText(Path.Combine(root, "work", "text-reveal-test.txt"), "TEXT-REVEAL-TEST PASS: progressive frames=" + frames.Count + " / coalesced latest candidate and visible correction / ordered final segments / paced append compatibility / paced selection replacement / caret and delivery ledger / user-edit cache / cancellation / Unicode text elements / bounded catch-up / reduced motion follows system setting");
+            File.WriteAllText(Path.Combine(root, "work", "text-reveal-test.txt"), "TEXT-REVEAL-TEST PASS: progressive frames=" + frames.Count + " / coalesced latest candidate and visible correction / ordered final segments / paced append compatibility / read-only transition retains exact unsent suffix / paced selection replacement / caret and delivery ledger / user-edit cache / cancellation / Unicode text elements / bounded catch-up / reduced motion follows system setting");
         } finally {
             box.TextChanged -= changed; textReveal.Stop(); reveals.Clear(); DropTextBridge();
             delivery = new TextDelivery(); recovery = ""; backupRoutes.Clear(); appliedSegments = 0;

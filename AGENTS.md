@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本仓库的操作约定。当前版本 **1.6.79.0**；产品说明见 [README](README.md)，
+本仓库的操作约定。当前版本 **1.6.80.0**；产品说明见 [README](README.md)，
 技术记录从 [docs/README.md](docs/README.md) 读起，工具入口见 [tools/README.md](tools/README.md)。
 
 ## 生产链路
@@ -279,6 +279,8 @@ Get-Content work\microphone-self-test.txt
 - 修改须跑 `--stream-test` 的 `TEXT-REVEAL-TEST`（`work/text-reveal-test.txt`及合成帧记录），原FAST-DRAFT与原生四项自检；同时检查原生和浏览器桥接，全部为隔离输入框。真实微信草稿仍须单独授权。
 
 ## 维护与提交
+
+- 1.6.80.0：`Native.SendToTarget`及`SendCharacterMessages`在追加前用原生Edit/RichEdit样式检查只读，拒绝时仍返回实际接受事件数，由既有送字层缓存未送出部分。不得把SendInput接受事件数当作只读框收字成功；不得在UI线程做UIA/MSAA。`--stream-test`须覆盖逐字追加中途切只读，断言实际文字不变、已显示前缀加缓存等于完整定稿；并复跑原生四项与桥接检查。
 
 - 1.6.78.0：DictationShortcut 在 H/Esc 按下前用实际异步键状态刷新八个修饰键，不能仅依赖历史钩子事件（其他钩子可能吞掉松键）。主程序和后台入口共用逻辑；保留 H 重复/松键捕获与真正组合键的判定。改动须运行 --hotkey-test 的六种残留修饰键回归及 --hotkey-host-test，不得禁用系统语音组件来掩盖漏键。
 

@@ -1,12 +1,12 @@
 # 工具索引
 
-版本 1.6.79.0；日期 2026-10-28。生产模型为 R5 INT8；6257 条真人封存比较采用 PyTorch 口径，旧 174 条仅作辅助回归；生产 INT8 固定音频与原生送字自检通过。生产识别与词典预览入口位于 `app/`，以下均为维护工具。
+版本 1.6.80.0；日期 2026-10-28。生产模型为 R5 INT8；6257 条真人封存比较采用 PyTorch 口径，旧 174 条仅作辅助回归；生产 INT8 固定音频与原生送字自检通过。生产识别与词典预览入口位于 `app/`，以下均为维护工具。
 
 `--hotkey-test` 新增左右 Shift/Ctrl/Alt 六种残留按下状态后真实 Win+H 恢复回归，核对 `work/microphone-hotkey-test.txt`；详见[快捷键修复](../docs/WinH修饰键残留修复-2026-10-28.md)。
 
 `--hotkey-host-test` 使用真实键盘钩子和隔离原生窗口验证缺席启动、现存转发、退出恢复、登录不录音、启动合并/超时、失败重试和重复释放；核对 `work/hotkey-host-test.txt`。正常登录入口为 `--hotkey-host`，`--stop-hotkey-host` 单独退出入口，不终止主程序。
 
-1.6.79.0 的 `--stream-test` 同时运行 FAST-DRAFT-TEST 和 TEXT-REVEAL-TEST：`work/microphone-fast-draft-test.txt`覆盖原位纠错、正确后文、标点去重、段尾光标、离框/取消、英文接词和换轮保护；`work/text-reveal-test.txt`及`work/text-reveal-frames.txt`覆盖逐步呈现、候选合并、定稿顺序、兼容通道逐字追加、手动编辑缓存、取消、Unicode文本元素和积压追赶。旧STABLE/PACING文件仅为历史；当前逐字调度见[维护契约](../AGENTS.md#16790-逐字出字)。
+1.6.80.0 的 `--stream-test` 同时运行 FAST-DRAFT-TEST 和 TEXT-REVEAL-TEST：`work/microphone-fast-draft-test.txt`覆盖原位纠错、正确后文、标点去重、段尾光标、离框/取消、英文接词和换轮保护；`work/text-reveal-test.txt`及`work/text-reveal-frames.txt`覆盖逐步呈现、候选合并、定稿顺序、兼容通道逐字追加、中途只读时停止并保留准确的未送出后缀、手动编辑缓存、取消、Unicode文本元素和积压追赶。旧STABLE/PACING文件仅为历史；当前逐字调度见[维护契约](../AGENTS.md#16790-逐字出字)。
 Python 脚本使用项目 `.venv/Scripts/python.exe`，原生测试参数与结果文件见 [AGENTS.md](../AGENTS.md)。
 
 1.6.73.0差异修订已撤回，当前不再发送纠错导航/删除键。`--stream-test`还验证跨三分钟非整包尾部不丢失，正文、缓存、焦点、来源组和累计录音位置保留。固定音频和专用输入框不代表真实麦克风或全部宿主验收。
