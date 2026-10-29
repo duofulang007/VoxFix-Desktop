@@ -29,7 +29,9 @@ Python 脚本使用项目 `.venv/Scripts/python.exe`，原生测试参数与结�
 | `evaluate_sensevoice.py` | 必须用 `--manifest` 指定语料；`--output` 指定新结果，重新推理并记录音频/模型/源码哈希、分组错误率；结果不覆盖，不再默认旧 174 条 |
 | `prepare_ascend_test.py` | 已校验的 ASCEND 真人测试集去旧题重合，生成原速、变速、低音量和噪声条件；测试集禁止用于训练 |
 | `test_evaluation.py` | 评分汇总、结果防覆盖、音频校验、衰减和可复现信噪比检查，无需模型 |
-| `test_desktop_window.py` | 实际桌面的窗口、位置和绘制；`--exercise-reopen` 另验证普通二次启动 |
+| `test_desktop_window.py` | 实际桌面的窗口、位置和按当前主题检查的表面颜色（石墨/雾息/混沌）；`--exercise-reopen` 另验证普通二次启动 |
+| `test_chaos_motion.ps1` / `test_chaos_motion.cs` | 实际层叠窗口反复执行混沌圆球/胶囊过渡，测帧间隔并检查开麦相位连续、停麦冻结；合成状态，无模型/麦克风，须在交互桌面与其他原生测试串行运行 |
+| `test_external_focus.ps1` / `test_external_focus.cs` | 两个独立进程检查生产ClassifySafe：Edit、RichEdit、按钮、只读框和返回编辑；仅自有测试窗口，不录音、不注入文字，须在交互桌面串行运行 |
 
 真实模型测试依赖本机权重、运行库及清单对应的 WAV。旧题库位于 `work/p0/manifest.json`；
 评测默认在 `work/sensevoice-20261021/` 下写带时间和随机编号的新结果，指定 `--output` 也不覆盖已有结果。

@@ -1,6 +1,6 @@
 # VoxFix Desktop
 
-Windows x64 本地语音输入，替代 Win+H。当前版本 **1.6.80.0**。
+Windows x64 本地语音输入，替代 Win+H。当前版本 **1.6.94.0**。
 使用 SenseVoiceSmall INT8 + Silero VAD + CT-Transformer，CPU 本地推理；识别与送字不联网。
 
 词典支持文字纠正、搜索、未保存内容预览，以及集中审核录音与完整文本标签。
@@ -73,7 +73,7 @@ Start-Process '.\bin\VoxFix Desktop.exe' -ArgumentList '--hotkey-host' -WindowSt
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\install-shortcuts.ps1
 ```
 
-构建使用系统自带 C# 编译器，以及已安装的 Visual Studio C++ Build Tools、Windows SDK 编译原位编辑组件；无需 .NET SDK 或生产 NuGet 依赖，同时生成项目根目录快捷方式。原生桥接 DLL 名为 `bin/VoxFix.TextBridge.<AssemblyVersion>.dll`（当前 `1.6.80.0`），由 `app/Microphone.cs` 的 AssemblyVersion 生成，须与 EXE 相邻；升级版本后旧 DLL 不再被加载。
+构建使用系统自带 C# 编译器，以及已安装的 Visual Studio C++ Build Tools、Windows SDK 编译原位编辑组件；无需 .NET SDK 或生产 NuGet 依赖，同时生成项目根目录快捷方式。原生桥接 DLL 名为 `bin/VoxFix.TextBridge.<AssemblyVersion>.dll`（当前 `1.6.94.0`），由 `app/Microphone.cs` 的 AssemblyVersion 生成，须与 EXE 相邻；升级版本后旧 DLL 不再被加载。
 1.6.69.0 的登录入口使用 `--hotkey-host`，主程序缺席时仍接住 Win+H 并重新启动；直接 `--background` 只启动主程序。重复后台启动不呼出或开始录音。没有卸载或永久禁用 Windows 语音组件；若入口与主程序都被结束，系统快捷键仍会恢复。见[启动与接管验证](docs/WinH后台接管与准确率复核-2026-10-25.md)。
 `ExecutionPolicy Bypass` 仅作用于本次进程。模型权重、运行环境和个人实验数据不入库；
 当前资产校验值见 [assets.json](work/sensevoice-20261021/assets.json)。
@@ -110,3 +110,21 @@ Start-Process '.\bin\VoxFix Desktop.exe' -ArgumentList '--self-test' -Wait -Pass
 
 旧 Nemotron/Qwen 实验脚本已从工作树移除，恢复方式见工具索引。历史技术记录保留，历史结论不代表当前行为。
 中英混说、英文术语和粤语仍可能识别错误；真人口音、距离、噪声及跨软件长期输入仍需实际验收。
+
+主题：右键 → 主题，可选「石墨」「雾息」「混沌」，选择后自动记住；菜单使用系统平滑圆角。「混沌」复用 ChatAni 的球面着色器，细密透明网面随声音翻涌，保持圆球主体，无麦克风图标，缓存胶囊保留右侧复制入口。[版本说明](docs/混沌球第三主题-2026-10-29.md)。
+
+1.6.83.0 修复说话声纹被并行转写压掉的问题，新主题「雾息」采用半透明气凝胶柔边与独立连续波纹，胶囊只共用石墨外形。
+
+1.6.84.0 细化雾息透明柔边，图标及文字保持清晰；[验证记录](docs/雾息细腻柔边-2026-10-29.md)。
+
+1.6.89.0 修复混沌球与胶囊切换时的低帧率卡顿；停麦为低亮度蓝灰静止球，开麦为青蓝流动球，不添加麦克风或暂停图标。[验证记录](docs/混沌形变流畅与开麦区分-2026-10-29.md)。
+
+1.6.90.0 修复微信等内部焦点宿主被窗口外壳误判为只读的问题，焦点切到同一窗口内的编辑区后继续复查。[验证记录](docs/微信与内部输入框焦点恢复-2026-10-29.md)。
+
+1.6.91.0 修复未上屏草稿等待后，兼容通道将定稿整段追赶输入的问题；定稿首次显示时重新起算逐字节奏。[验证记录](docs/微信兼容逐字等待计时修复-2026-10-29.md)。
+
+1.6.94.0 微信通道恢复有限回改：草稿一出来就上屏，识别变化时退格删掉差异尾部再重打，首字回到约0.7秒；可原位编辑的输入框不受影响。[验证记录](docs/微信兼容逐字等待计时修复-2026-10-29.md)。
+
+1.6.93.0 微信等没有草稿接口的输入框改为边说边出字：识别草稿经三次解码确认后即时上屏，定稿只补未显示部分，不再等说完才出字。[验证记录](docs/微信兼容逐字等待计时修复-2026-10-29.md)。
+
+1.6.92.0 微信等没有草稿接口的输入框改用打字节奏逐字补完定稿（每字70ms），不再在240ms内整段闪出；首帧只上屏一个字。[验证记录](docs/微信兼容逐字等待计时修复-2026-10-29.md)。
