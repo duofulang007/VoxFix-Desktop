@@ -25,9 +25,13 @@ sealed class InPlaceText : IDisposable
     readonly IntPtr owner, target, focus;
     readonly uint thread, token;
     IntPtr module, hook, receiver;
-    bool attempted, unsupported, disposed;
+    bool attempted, unsupported, disposed, rejected;
     int bootstrapAt;
-    internal string Diagnostic { get { return "attempted=" + attempted + "; unavailable=" + unsupported + "; hook=" + hook + "; receiver=" + receiver + "; class=" + Native.ClassOf(focus) + "; owner=" + owner.ToInt64().ToString("X16") + "; thread=" + thread; } }
+    internal string Diagnostic { get { return "attempted=" + attempted + "; unavailable=" + unsupported + "; rejected=" + rejected + "; hook=" + hook + "; receiver=" + receiver + "; class=" + Native.ClassOf(focus) + "; owner=" + owner.ToInt64().ToString("X16") + "; thread=" + thread; } }
+    // True only when the target answered a delivered update with "no text store".
+    // A first call returns 2 before the injected receiver exists, and that must not
+    // be mistaken for a host that cannot be edited in place.
+    internal bool NoTextStore { get { return unsupported || rejected; } }
     internal InPlaceText(IntPtr owner, IntPtr target, IntPtr focus) {
         this.owner = owner; this.target = target; this.focus = focus;
         thread = Native.GetWindowThreadProcessId(focus, IntPtr.Zero);
@@ -82,7 +86,8 @@ sealed class InPlaceText : IDisposable
             var packet = new CopyData { tag = new UIntPtr(0x56465831), length = (uint)bytes.Length, data = pin.AddrOfPinnedObject() };
             UIntPtr result;
             if (SendMessageTimeout(receiver, 0x4a, owner, ref packet, 3, 80, out result) == IntPtr.Zero) return 5;
-            uint status = result.ToUInt32(); return status == 1 || status == 2 || status == 4 || status == 5 ? (int)status : 5;
+            uint status = result.ToUInt32(); if (status == 2) rejected = true;
+            return status == 1 || status == 2 || status == 4 || status == 5 ? (int)status : 5;
         } finally { pin.Free(); }
     }
     void Bootstrap() {

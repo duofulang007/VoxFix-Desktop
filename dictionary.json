@@ -1,5 +1,5 @@
 {
-  "hotwords": ["Python", "API", "JSON", "PDF", "WiFi", "Codex", "VoxFix", "Kotlin", "Java", "git status", "git commit", "sol", "GitHub", "APP", "首字"],
+  "hotwords": ["Python", "API", "JSON", "PDF", "WiFi", "Codex", "VoxFix", "Kotlin", "Java", "git status", "git commit", "sol", "GitHub", "APP", "首字", "逐字吐句"],
   "rules": [
     { "to": "Python", "from": ["python"] },
     { "to": "API", "from": ["a p i", "api i", "api"] },
@@ -15,6 +15,7 @@
     { "to": "sol", "from": ["soul"] },
     { "to": "GitHub", "from": ["gitthub", "gthub", "get up", "kitthub", "github", "git up", "git hub"] },
     { "to": "APP", "from": ["app P", "app P P", "a p p"] },
-    { "to": "首字", "from": ["手字"] }
+    { "to": "首字", "from": ["手字"] },
+    { "to": "逐字吐句", "from": ["逐字土句"] }
   ]
 }

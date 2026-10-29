@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -16,7 +16,7 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("VoxFix Desktop")]
 [assembly: AssemblyProduct("VoxFix Desktop")]
 [assembly: AssemblyDescription("VoxFix Desktop 本地语音输入")]
-[assembly: AssemblyVersion("1.6.80.0")]
+[assembly: AssemblyVersion("1.6.94.0")]
 
 static class Native
 {
@@ -141,7 +141,7 @@ static class Native
         } catch (ArgumentException) { } catch (InvalidOperationException) { } catch (System.ComponentModel.Win32Exception) { }
         return direct ? SendCharacterMessages(window, focus, inputs, permitted) : SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input)));
     }
-    [DllImport("user32.dll", EntryPoint = "GetWindowThreadProcessId")] static extern uint WindowProcessId(IntPtr window, out uint process);
+    [DllImport("user32.dll", EntryPoint = "GetWindowThreadProcessId")] internal static extern uint WindowProcessId(IntPtr window, out uint process);
     // WeChat corrupts VK_PACKET after full-width punctuation; retain paired-input accounting.
     internal static uint SendCharacterMessages(IntPtr window, IntPtr focus, Input[] inputs, Func<bool> permitted = null) {
         uint completed = 0;
@@ -267,6 +267,14 @@ sealed class DraftText
 {
     internal string Text = "", Separator = "";
     internal bool InPlace;
+    // No writable text store: the segment can only grow, never be rewritten.
+    internal bool AppendOnly;
+    // Previous preview decode (punctuation removed). Text that two decodes agree on is
+    // no longer where the recogniser changes its mind, and can be shown on a host that
+    // has no way to take it back.
+    internal string Candidate = "";
+    // Commit target computed for the current decode, kept while it is being typed out.
+    internal string Target = "";
     internal ulong Segment;
 }
 
@@ -276,15 +284,40 @@ sealed class TextReveal
     internal string Key;
     internal bool Final, AppendOnly;
     internal double Started, Next;
+    // Append-only hosts show previews too, so their pacing clock restarts whenever
+    // the target grows; Target is what the current burst is aiming at.
+    internal string Target = "";
     internal TextDelivery Owner;
+    // A host without a draft interface only accepts finalized text, and once appended it
+    // cannot be rewritten. There the only honest progress signal is typing: one text
+    // element per beat. A 240ms catch-up would paste the whole segment in one blink.
+    internal const double AppendStepMs = 70, AppendWindowMs = 1800;
+    // A preview that would rewrite most of the segment waits for the final instead;
+    // deleting and retyping a long run mid-draft only makes the box flicker.
+    internal const int ReviseLimit = 8;
     // shortcut: ASR has no character timestamps; pace arriving text until timestamped streaming is available.
     internal static string Step(string shown, string wanted, double age) {
+        return Pace(shown, wanted, age, 35, 240);
+    }
+    internal static string Append(string shown, string wanted, double age) {
+        return Pace(shown, wanted, age, AppendStepMs, AppendWindowMs);
+    }
+    // The first visible element starts the clock, so it must be exactly one element:
+    // a burst on the opening frame reads as a paste even when the rest types out.
+    internal static string First(string wanted) {
+        if (wanted.Length == 0) return wanted;
+        int[] boundaries = StringInfo.ParseCombiningCharacters(wanted);
+        return boundaries.Length <= 1 ? wanted : wanted.Substring(0, boundaries[1]);
+    }
+    static string Pace(string shown, string wanted, double age, double beat, double window) {
         if (wanted.Length <= shown.Length) return wanted;
         int[] boundaries = StringInfo.ParseCombiningCharacters(wanted);
         int index = 0;
         while (index < boundaries.Length && boundaries[index] < shown.Length) index++;
-        // Catch up a large recognition burst within 240ms instead of accumulating typing lag.
-        int count = Math.Max(1, (int)Math.Ceiling((boundaries.Length - index) * 35.0 / Math.Max(35, 240 - age)));
+        // Catch up before the window closes instead of accumulating typing lag. The append
+        // path uses a wide window so each element keeps its own frame, which also survives
+        // a stalled UI tick that would otherwise dump the remaining burst at once.
+        int count = Math.Max(1, (int)Math.Ceiling((boundaries.Length - index) * beat / Math.Max(beat, window - age)));
         int end = Math.Min(boundaries.Length, index + count);
         return end == boundaries.Length ? wanted : wanted.Substring(0, boundaries[end]);
     }
@@ -548,6 +581,17 @@ static class MenuIcons
                     } else if (name == "power") {
                         g.DrawArc(pen, 3.5f * Scale, 4.0f * Scale, 9.0f * Scale, 9.0f * Scale, 300, 300);
                         g.DrawLine(pen, 8 * Scale, 2.6f * Scale, 8 * Scale, 7.6f * Scale);
+                    } else if (name == "theme") {
+                        // A half filled disc: the product's own mark for appearance.
+                        float box = 3.3f * Scale, disc = 9.4f * Scale;
+                        g.DrawEllipse(pen, box, box, disc, disc);
+                        using (var half = new GraphicsPath()) {
+                            half.AddRectangle(new RectangleF(box, box, disc / 2, disc));
+                            var saved = g.Save();
+                            g.SetClip(half);
+                            using (var fill = new SolidBrush(ink)) g.FillEllipse(fill, box, box, disc, disc);
+                            g.Restore(saved);
+                        }
                     }
                 }
             }
@@ -565,6 +609,14 @@ static class MenuIcons
 
 sealed class MicrophoneMenuRenderer : ToolStripProfessionalRenderer
 {
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
+    internal static void SmoothCorners(ToolStripDropDown menu) {
+        if (!menu.IsHandleCreated) return;
+        // DWM clips with antialiasing; a GDI Region has binary, visibly stepped edges.
+        int preference = 2, border = -2;
+        DwmSetWindowAttribute(menu.Handle, 33, ref preference, 4);
+        DwmSetWindowAttribute(menu.Handle, 34, ref border, 4);
+    }
     internal static readonly Color Surface = Color.White;
     internal static readonly Color Ink = Color.FromArgb(43, 48, 56);
     internal static readonly Color Danger = Color.FromArgb(214, 69, 69);
@@ -3297,7 +3349,7 @@ sealed class Microphone : Form
     const int RenderScale = 4;
     readonly string root;
     readonly bool smokeTest;
-    readonly bool streamTest;
+    readonly bool streamTest, replay;
     internal const int RecognitionRoundBytes = 32000 * 180;
     readonly System.Windows.Forms.Timer capture = new System.Windows.Forms.Timer { Interval = 40 };
     readonly System.Windows.Forms.Timer textReveal = new System.Windows.Forms.Timer { Interval = 15 };
@@ -3311,6 +3363,9 @@ sealed class Microphone : Form
     bool idleWatching;
     readonly SemaphoreSlim pipeline = new SemaphoreSlim(1, 1);
     readonly bool animationsEnabled = Native.AnimationsEnabled();
+    // Read by the skins so a system that asks for less motion still gets every
+    // state, only without the movement.
+    internal static bool ReducedMotion;
     Process worker;
     Recorder recorder;
     InteractionGuard guard;
@@ -3320,6 +3375,14 @@ sealed class Microphone : Form
     readonly ContextMenuStrip menu;
     MenuDismissHook menuGuard;
     internal int menuDismissRequests;
+    // Theme state. The skin is pure drawing: switching it never touches the
+    // recogniser, the microphone or the text that is already on screen.
+    ThemeId theme = ThemeId.Graphite;
+    ThemeId themeFrom = ThemeId.Graphite;
+    double themeAt;
+    double chaosVisualTime, chaosPreviousTime;
+    ThemePicker picker;
+    const double ThemeTransitionMs = 180;
     DictionaryDialog dictionary;
     Action<string> copyText;
     string copiedInTest = "";
@@ -3364,18 +3427,27 @@ sealed class Microphone : Form
     protected override bool ShowWithoutActivation { get { return true; } }
     protected override CreateParams CreateParams { get { var p = base.CreateParams; p.ExStyle |= 0x08080080; return p; } }
     public Microphone(string path, string test) {
-        root = path; smokeTest = test == "--smoke-test"; streamTest = test == "--stream-test"; Text = "VoxFix Desktop"; AccessibleName = "VoxFix Desktop 麦克风";
+        root = path; smokeTest = test == "--smoke-test"; replay = test == "--replay"; streamTest = test == "--stream-test" || replay; Text = "VoxFix Desktop"; AccessibleName = "VoxFix Desktop 麦克风";
         shortcutCycleTest = test == "--hotkey-cycle-test";
         memoryTest = test == "--memory-test" || test == "--focus-test" || test == "--idle-focus-test" || shortcutCycleTest;
         probeOnly = test == "--focus-test" || test == "--idle-focus-test";
         if (memoryTest || streamTest || smokeTest) playEarcon = (name, wait) => { };
         copyText = streamTest || memoryTest ? new Action<string>(text => copiedInTest = text) : new Action<string>(Clipboard.SetText);
-        menu = CreateMenu(() => { var ignored = Dismiss(); }, ShowDictionary, Close);
+        ReducedMotion = !animationsEnabled;
+        theme = themeFrom = ThemeStore.Load(root);
+        picker = new ThemePicker(theme, new Font("Microsoft YaHei UI", 9.5f), id => ApplyTheme(id));
+        menu = CreateMenu(() => { var ignored = Dismiss(); }, ShowDictionary, Close, picker);
         // WinForms relies on deactivation to auto-close a menu, and this window never activates.
         // So the first real click outside the menu surface closes it explicitly.
         menu.Opened += (s, e) => {
             if (menuGuard != null) return;
-            menuGuard = new MenuDismissHook(() => menu.Bounds, () => {
+            menuGuard = new MenuDismissHook(() => {
+                // The theme picker lives in its own drop down window, so a click on
+                // one of its rows is still inside the menu and must not dismiss it.
+                Rectangle surface = menu.Bounds;
+                if (picker != null && picker.Drop.Visible) surface = Rectangle.Union(surface, picker.Drop.Bounds);
+                return surface;
+            }, () => {
                 menuDismissRequests++;
                 if (closing || !IsHandleCreated) return;
                 try { BeginInvoke(new Action(CloseMenu)); } catch (InvalidOperationException) { }
@@ -3395,6 +3467,7 @@ sealed class Microphone : Form
         };
         focusWatch.Tick += async (s, e) => await WatchIdleFocus();
         animation.Tick += async (s, e) => {
+            animation.Interval = theme == ThemeId.Chaos ? 15 : 16;
             if (!Visible && !startOnReveal) { animation.Stop(); return; }
             if (TakeRevealStart()) {
                 if (state == "error") await StartWorker(false);
@@ -3410,6 +3483,9 @@ sealed class Microphone : Form
             }
             if (TakeLongPress(motionClock.Elapsed.TotalMilliseconds)) { await NewRecording(); return; }
             motion.Update(restarting ? "recording" : state, level, motionClock.Elapsed.TotalMilliseconds, !animationsEnabled, speechDetected);
+            double visualNow = motionClock.Elapsed.TotalMilliseconds;
+            chaosVisualTime += Math.Max(0, Math.Min(64, visualNow - chaosPreviousTime)) * (state == "loading" ? 1 : motion.Activity);
+            chaosPreviousTime = visualNow;
             shape.Update(MemoryPill, motionClock.Elapsed.TotalMilliseconds, !animationsEnabled);
             copyFeedback = Feedback(copyFeedback, recoveryCopied ? 1 : 0);
             hoverFeedback = Feedback(hoverFeedback, hovered ? 1 : 0);
@@ -3418,7 +3494,8 @@ sealed class Microphone : Form
             if (state == "idle" || state == "error") {
                 if (!startOnReveal && RevealProgress >= 1 && !pressed && shape.Settled && motion.Activity < .001f && motion.Voice < .001f &&
                     copyFeedback == (recoveryCopied ? 1 : 0) && hoverFeedback == (hovered ? 1 : 0) &&
-                    pressFeedback == (pressed && !pressCancelled && !dragged ? 1 : 0) && readyFeedback == (CopyReady ? 1 : 0)) animation.Stop();
+                    pressFeedback == (pressed && !pressCancelled && !dragged ? 1 : 0) && readyFeedback == (CopyReady ? 1 : 0) &&
+                    themeFrom == theme) animation.Stop();
             }
             RefreshSurface();
         };
@@ -3469,6 +3546,7 @@ sealed class Microphone : Form
         };
         FormClosed += (s, e) => {
             closing = true; CloseMenu();
+            ChaosGpu.Release();
             DropTextBridge();
             if (menuGuard != null) { menuGuard.Dispose(); menuGuard = null; }
             if (shortcut != null) shortcut.Dispose();
@@ -3482,6 +3560,7 @@ sealed class Microphone : Form
             delivery = null;
             StopWorker();
             if (worker != null) worker.Dispose();
+            if (picker != null) { picker.Dispose(); picker = null; }
             menu.Font.Dispose(); menu.Dispose();
         };
     }
@@ -3563,7 +3642,7 @@ sealed class Microphone : Form
     }
     // White card, one icon per row, and every row sizes to its own text so the
     // menu never carries a blank column on the right.
-    internal static ContextMenuStrip CreateMenu(Action dismiss, Action dictionary, Action exit) {
+    internal static ContextMenuStrip CreateMenu(Action dismiss, Action dictionary, Action exit, ThemePicker picker = null) {
         var menu = new ContextMenuStrip();
         menu.ShowImageMargin = false; menu.ShowCheckMargin = false; menu.ShowItemToolTips = false;
         menu.BackColor = MicrophoneMenuRenderer.Surface;
@@ -3572,29 +3651,47 @@ sealed class Microphone : Form
         menu.Padding = new Padding(4);
         menu.ImageScalingSize = new Size(16, 16);
         menu.Renderer = new MicrophoneMenuRenderer();
-        menu.SizeChanged += (s, e) => {
-            if (menu.Width < 2 || menu.Height < 2) return;
-            var previous = menu.Region;
-            using (var outline = MicrophoneMenuRenderer.Outline(new Rectangle(Point.Empty, menu.Size), 11)) menu.Region = new Region(outline);
-            if (previous != null) previous.Dispose();
-        };
-        menu.Items.Add(Entry("收起", "chevron", MicrophoneMenuRenderer.Ink, dismiss));
-        menu.Items.Add(Entry("词典", "book", MicrophoneMenuRenderer.Ink, dictionary));
+        menu.HandleCreated += (s, e) => MicrophoneMenuRenderer.SmoothCorners(menu);
+        menu.Opened += (s, e) => MicrophoneMenuRenderer.SmoothCorners(menu);
+        menu.Items.Add(Entry(menu.Font, "收起", "chevron", MicrophoneMenuRenderer.Ink, dismiss));
+        menu.Items.Add(Entry(menu.Font, "词典", "book", MicrophoneMenuRenderer.Ink, dictionary));
+        if (picker != null) menu.Items.Add(picker.Entry);
         menu.Items.Add(new ToolStripSeparator { Margin = new Padding(0, 2, 0, 2) });
-        menu.Items.Add(Entry("退出", "power", MicrophoneMenuRenderer.Danger, exit));
+        menu.Items.Add(Entry(menu.Font, "退出", "power", MicrophoneMenuRenderer.Danger, exit));
         return menu;
     }
 
-    static ToolStripMenuItem Entry(string text, string icon, Color ink, Action click) {
+    static ToolStripMenuItem Entry(Font font, string text, string icon, Color ink, Action click) {
         var item = new ToolStripMenuItem(text);
         item.Image = MenuIcons.Get(icon, ink);
         item.Tag = ink;
         item.AutoSize = false;
         item.Padding = Padding.Empty;
-        int width = 30 + TextRenderer.MeasureText(text, item.Font).Width + 14;
+        // Measure with the font the row will actually be painted in, so the card
+        // never leaves a gap and never clips the label.
+        int width = 30 + TextRenderer.MeasureText(text, font).Width + 14;
         item.Size = new Size(width, 34);
         item.Click += (s, e) => click();
         return item;
+    }
+
+    // Theme switching is a drawing change only. The recogniser keeps running, the
+    // microphone keeps its buffer and no text is dropped.
+    void ApplyTheme(ThemeId id, bool persist = true) {
+        if (picker != null) picker.SetCurrent(id);
+        if (id == theme) return;
+        themeFrom = theme; theme = id; themeAt = motionClock.Elapsed.TotalMilliseconds;
+        if (!animationsEnabled) themeFrom = id;
+        if (persist) ThemeStore.Save(root, id);
+        animation.Start();
+        RefreshSurface();
+    }
+    // 0 while the old skin still owns the surface, 1 once the new one has taken over.
+    double ThemeMix() {
+        if (themeFrom == theme) return 1;
+        double elapsed = motionClock.Elapsed.TotalMilliseconds - themeAt;
+        if (!animationsEnabled || elapsed >= ThemeTransitionMs) { themeFrom = theme; return 1; }
+        return DictationMotion.Ease(elapsed / ThemeTransitionMs);
     }
 
     void ShowDictionary() {
@@ -3719,6 +3816,10 @@ sealed class Microphone : Form
     }
     bool OwnsSurface(Point point) {
         SizeF size = ShapeSize(shape.Value);
+        if (theme == ThemeId.Chaos) {
+            float folds = 16 * (1 - (float)Math.Max(0, Math.Min(1, shape.Value)));
+            size = new SizeF(size.Width + folds, size.Height + folds);
+        }
         double diameter = Math.Min(size.Width, size.Height);
         double dx = Math.Max(0, Math.Abs(point.X - Left - 64) - (size.Width - diameter) / 2);
         double dy = Math.Max(0, Math.Abs(point.Y - Top - 48) - (size.Height - diameter) / 2);
@@ -3805,30 +3906,116 @@ sealed class Microphone : Form
             string wanted = Convert.ToString(pending.Segment["text"]).TrimStart();
             string shown = previous == null ? "" : previous.Text;
             if (previous != null && previous.Separator.Length > 0 && shown.StartsWith(previous.Separator, StringComparison.Ordinal)) shown = shown.Substring(previous.Separator.Length);
-            if (!pending.Final && wanted.Length < shown.Length) { reveals.RemoveAt(0); continue; }
-            string next = memory || !animationsEnabled ? wanted : TextReveal.Step(shown, wanted, now - pending.Started);
+            // Only a host without a draft interface reads previews here; a writable one
+            // still goes through ApplySegment so its draft can be corrected in place.
+            bool append = !memory && (pending.AppendOnly || (previous != null && previous.AppendOnly));
+            if (append && previous != null) {
+                if (pending.Final) {
+                    // Keeping the visible prefix avoids retyping for punctuation the final
+                    // only inserts; a real rewrite falls through to the diff below, which
+                    // deletes and retypes on this channel.
+                    wanted = FinalAppendTarget(shown, wanted) ?? wanted;
+                } else {
+                    wanted = PreviewAppendTarget(previous, shown, wanted);
+                }
+            }
+            if (!append && !pending.Final && wanted.Length < shown.Length) { reveals.RemoveAt(0); continue; }
+            // Each new burst (a preview commit or the final tail) types from its own start;
+            // an old clock would let the catch-up window dump the whole remainder at once.
+            if (append && wanted != pending.Target) { pending.Target = wanted; pending.Started = now; }
+            // Unpublished preview time is not visible typing lag.
+            bool starting = pending.Final && shown.Length == 0;
+            if (starting) pending.Started = now;
+            string next = memory || !animationsEnabled ? wanted
+                : starting ? TextReveal.First(wanted)
+                : append ? TextReveal.Append(shown, wanted, now - pending.Started)
+                : TextReveal.Step(shown, wanted, now - pending.Started);
             var update = new Dictionary<string, object>(pending.Segment); update["text"] = next;
             bool complete = next == wanted;
-            if (pending.AppendOnly && !memory) AppendReveal(pending, previous, next, complete);
+            if (append) AppendReveal(pending, previous, next, complete);
             else ApplySegment(update, pending.Final && complete);
+            // Remember the full preview, not the slice that is on screen, so the next
+            // decode is compared against everything the recogniser produced.
+            if (!append && !pending.Final) {
+                DraftText current;
+                if (delivery.Drafts.TryGetValue(pending.Key, out current) && current.Candidate.Length == 0) current.Candidate = PlainText(wanted);
+            }
             // Unknown interfaces reveal finals by guarded append, never simulated keystroke corrections.
-            if (!pending.AppendOnly && !memory && pending.Final && !complete) {
+            if (!append && !memory && pending.Final && !complete) {
                 delivery.Drafts.TryGetValue(pending.Key, out previous);
                 if (previous != null && !previous.InPlace && delivery.Paused.Length == 0) {
                     pending.AppendOnly = true; AppendReveal(pending, previous, next, false);
                 }
             }
             if (complete || memory) reveals.RemoveAt(0);
-            else { pending.Next = now + 35; return; }
+            else { pending.Next = now + (append ? TextReveal.AppendStepMs : 35); return; }
         }
         textReveal.Stop();
     }
+    // Text that punctuation or gesture marks may sit between; previews carry their own
+    // punctuation, so comparisons run on the letters alone.
+    static bool Plain(char value) { return !char.IsPunctuation(value) && !char.IsWhiteSpace(value); }
+    static string PlainText(string text) {
+        var plain = new StringBuilder(text.Length);
+        foreach (char value in text) if (Plain(value)) plain.Append(value);
+        return plain.ToString();
+    }
+    // Index in the punctuated final just past the already shown plain characters.
+    static int IndexAfterPlain(string text, int plain) {
+        int seen = 0, index = 0;
+        while (index < text.Length && seen < plain) { if (Plain(text[index])) seen++; index++; }
+        return index;
+    }
+    // On this channel a draft is published as soon as it exists and corrected by deleting
+    // the changed tail, so the first character arrives with the first decode.
+    static string PreviewAppendTarget(DraftText draft, string shown, string candidate) {
+        string plain = PlainText(candidate);
+        draft.Candidate = plain;
+        return plain.Length == 0 ? shown : plain;
+    }
+    // The final may punctuate inside text that is already visible; that mark cannot be
+    // inserted retroactively, so only the part after the visible prefix is appended.
+    static string FinalAppendTarget(string shown, string final) {
+        // The tail is typed slice by slice, so it is usually already a prefix of the final.
+        if (final.StartsWith(shown, StringComparison.Ordinal)) return final;
+        string plain = PlainText(final), committed = PlainText(shown);
+        if (!plain.StartsWith(committed, StringComparison.Ordinal)) return null;
+        return shown + final.Substring(IndexAfterPlain(final, committed.Length));
+    }
     void AppendReveal(TextReveal pending, DraftText previous, string text, bool complete) {
         text = previous.Separator + text;
-        if (!text.StartsWith(previous.Text, StringComparison.Ordinal)) throw new IOException("定稿追加结果发生回退，已停止输入。");
-        ApplyText(delivery.Latest + text.Substring(previous.Text.Length));
+        string shown = previous.Text;
+        int common = CommonPrefix(shown, text);
+        int remove = shown.Length - common;
+        if (remove > 0) {
+            if (!pending.Final && remove > TextReveal.ReviseLimit) return;
+            if (!DeleteTail(remove, pending.Final ? text : "")) return;
+            delivery.Delivered = delivery.Delivered.Substring(0, delivery.Delivered.Length - remove);
+            delivery.Latest = delivery.Accounted = delivery.Latest.Substring(0, delivery.Latest.Length - remove);
+        }
+        string suffix = text.Substring(common);
+        if (suffix.Length > 0) ApplyText(delivery.Latest + suffix);
         previous.Text = text;
-        if (complete) delivery.Drafts.Remove(pending.Key);
+        if (complete && pending.Final) delivery.Drafts.Remove(pending.Key);
+    }
+    // Only for hosts that answer "no text store". The caret is at the end of text this
+    // round wrote, and every delete re-checks foreground and focus; anything unexpected
+    // stops the rewrite and leaves the final in the copy cache.
+    bool DeleteTail(int count, string final) {
+        if (Native.GetForegroundWindow() != target || targetFocus == IntPtr.Zero || Native.Focus(target) != targetFocus || EditingGestureDown()) {
+            Pause("输入位置已变化，已停止修订并保留最终识别结果。");
+            if (final.Length > 0) KeepRecovery("\n[该句最终识别] " + final);
+            return false;
+        }
+        var inputs = new Native.Input[count * 2];
+        for (int i = 0; i < count; i++) { inputs[i * 2] = Native.KeyInput(8, false); inputs[i * 2 + 1] = Native.KeyInput(8, true); }
+        uint sent = Native.SendToTarget(target, targetFocus, inputs, () => delivery.Paused.Length == 0 && !EditingGestureDown());
+        if (sent != (uint)inputs.Length) {
+            Pause("改字未完整送出，已停止修订并保留最终识别结果。");
+            if (final.Length > 0) KeepRecovery("\n[该句最终识别] " + final);
+            return false;
+        }
+        return true;
     }
     async Task DrainReveals() {
         while (reveals.Count > 0 && !closing && delivery != null && !delivery.Cancelled) {
@@ -3890,10 +4077,24 @@ sealed class Microphone : Form
             int oldLength = previous.Text.Length;
             delivery.Delivered = delivery.Delivered.Substring(0, delivery.Delivered.Length - oldLength) + text;
             delivery.Latest = delivery.Accounted = delivery.Latest.Substring(0, delivery.Latest.Length - oldLength) + text;
-            previous.Text = text; previous.InPlace = true;
+            previous.Text = text; previous.InPlace = true; previous.AppendOnly = false;
         } else if (status == 2 && !previous.InPlace) {
-            // Unsupported editors receive complete segments without destructive draft rewrites.
-            if (final) ApplyText(delivery.Latest + text);
+            if (textBridge.NoTextStore) {
+                // The host answered with no writable text store: this segment can only be
+                // appended. The bridge never took ownership of it, so it stays for the
+                // host-level decision and is dropped with the round.
+                previous.AppendOnly = true;
+                // A segment that never showed anything can still arrive whole; a partially
+                // shown one is finished by RevealText, which knows what is already visible.
+                if (final) {
+                    if (previous.Text.Length == 0) ApplyText(delivery.Latest + text);
+                    else KeepRecovery("\n[该句最终识别] " + text);
+                }
+            } else if (final) {
+                // First call installs the hook before the receiver exists; a final that
+                // lands in that window is appended instead of retried.
+                ApplyText(delivery.Latest + text);
+            }
         } else if (status != 2 || final) {
             Pause("输入位置已变化或改字未确认，已停止修订并保留最终识别结果。");
             if (final) KeepRecovery("\n[该句最终识别] " + text);
@@ -4031,10 +4232,14 @@ sealed class Microphone : Form
         if (textHost) return writable ? TargetKind.Editable : TargetKind.ReadOnly;
         return TargetKind.ReadOnly;
     }
-    // Coarse hosts need MSAA's focused descendant; UIA may only report the page root.
+    // These hosts reuse their HWND across internal focus changes; UIA may expose only the shell.
     static bool CoarseClass(IntPtr window) {
-        string name = Native.ClassOf(window);
+        return CoarseWindowClass(Native.ClassOf(window));
+    }
+    static bool CoarseWindowClass(string name) {
         return name.StartsWith("Chrome_WidgetWin_", StringComparison.Ordinal)
+            || name.StartsWith("Qt", StringComparison.Ordinal)
+            || name == "MozillaWindowClass"
             || name == "FLUTTER_RUNNER_WIN32_WINDOW" || name == "CEF-OSC-WIDGET"
             || name == "TaskManagerWindow" || name == "Intermediate D3D Window";
     }
@@ -4597,7 +4802,7 @@ sealed class Microphone : Form
         await Task.Delay(30);
         string revised = "原文：开头好句！" + second["text"];
         if (box.Text != revised || delivery.Latest != revised.Substring(3) || box.SelectionStart != box.TextLength)
-            throw new Exception("Contextual corrections must replace in place, preserve the correct suffix and keep the caret at the end");
+            throw new Exception("Contextual corrections must replace in place, preserve the correct suffix and keep the caret at the end: box=" + box.Text + "; latest=" + delivery.Latest + "; caret=" + box.SelectionStart + "/" + box.TextLength + "; paused=" + delivery.Paused + "; bridge=" + (textBridge == null ? "closed" : textBridge.Diagnostic));
         reply["segments"] = new object[] { first, second };
         ApplyReply(reply); ApplyReply(reply);
         string expected = "原文：开头好句！" + second["text"];
@@ -4625,6 +4830,9 @@ sealed class Microphone : Form
         if (TextReveal.Step("", "甲乙丙丁", 0) != "甲" || TextReveal.Step("", "甲乙丙丁", 240) != "甲乙丙丁" ||
             TextReveal.Step("", "\ud83d\ude00e\u0301中", 0) != "\ud83d\ude00" || TextReveal.Step("\ud83d\ude00", "\ud83d\ude00e\u0301中", 0) != "\ud83d\ude00e\u0301")
             throw new Exception("Reveal must advance text elements and bound accumulated lag");
+        if (TextReveal.Append("", "甲乙丙丁", 0) != "甲" || TextReveal.Append("", "甲乙丙丁", 1800) != "甲乙丙丁" ||
+            TextReveal.First("甲乙丙丁") != "甲" || TextReveal.First("\ud83d\ude00e\u0301中") != "\ud83d\ude00")
+            throw new Exception("Append reveal must type one text element per beat and still finish a long segment");
         reveals.Clear(); textReveal.Stop();
         box.Text = "原文："; box.SelectionStart = box.TextLength;
         delivery = new TextDelivery(); recovery = ""; backupRoutes.Clear(); appliedSegments = 0;
@@ -4650,15 +4858,59 @@ sealed class Microphone : Form
             QueueSegment(segment, true); await DrainReveals();
             expected += "兼容通道逐字追加。";
             await AwaitTestText(box, expected);
-            if (box.Text != expected || (animationsEnabled && frames.Count - beforeFrames < 2) || delivery.Drafts.Count != 0)
-                throw new Exception("Unsupported text interfaces must pace finalized text without duplication: actual=" + box.Text + "; expected=" + expected + "; frames=" + (frames.Count - beforeFrames) + "; drafts=" + delivery.Drafts.Count + "; paused=" + delivery.Paused);
+            long compatSpan = frames.Count > beforeFrames ? long.Parse(frames[frames.Count - 1].Split('\t')[0]) - long.Parse(frames[beforeFrames].Split('\t')[0]) : 0;
+            if (box.Text != expected || (animationsEnabled && (frames.Count - beforeFrames < 5 || compatSpan < 400 || compatSpan > 1400)) || delivery.Drafts.Count != 0)
+                throw new Exception("Unsupported text interfaces must type finalized text a beat at a time: actual=" + box.Text + "; expected=" + expected + "; frames=" + (frames.Count - beforeFrames) + "; spanMs=" + compatSpan + "; drafts=" + delivery.Drafts.Count + "; paused=" + delivery.Paused);
+            segment["start"] = 155; segment["text"] = "等待草稿时还没有任何文字真正显示出来";
+            QueueSegment(segment, false);
+            if (box.Text != expected) throw new Exception("Unsupported previews must not be committed as final text");
+            // Replay a final arriving after a busy UI delayed the unpublished preview queue.
+            Thread.Sleep(280);
+            string delayedFinal = "等待结束以后也必须逐步显示这一段定稿。";
+            segment["text"] = delayedFinal; beforeFrames = frames.Count;
+            QueueSegment(segment, true);
+            if (animationsEnabled && box.Text == expected + delayedFinal)
+                throw new Exception("Unpublished preview wait must not make a compatibility final appear as one whole block");
+            await DrainReveals(); expected += delayedFinal; await AwaitTestText(box, expected);
+            long delayedSpan = frames.Count > beforeFrames ? long.Parse(frames[frames.Count - 1].Split('\t')[0]) - long.Parse(frames[beforeFrames].Split('\t')[0]) : 0;
+            if (box.Text != expected || (animationsEnabled && (frames.Count - beforeFrames < 10 || delayedSpan < 800 || delayedSpan > 2600)))
+                throw new Exception("Delayed compatibility final must be typed out, not pasted as one block: frames=" + (frames.Count - beforeFrames) + "; spanMs=" + delayedSpan);
+            // A host with no text store publishes the draft immediately and fixes it by
+            // deleting the changed tail, so the first character arrives with the first
+            // decode instead of waiting for a confirmation.
+            segment["start"] = 170; segment["text"] = "今天下午要去公园";
+            QueueSegment(segment, false); await DrainReveals(); await Task.Delay(60);
+            await AwaitTestText(box, expected + "今天下午要去公园");
+            if (box.Text != expected + "今天下午要去公园")
+                throw new Exception("First decode must be published on an append-only host: actual=" + box.Text);
+            segment["text"] = "今天下午要去公司";
+            QueueSegment(segment, false); await DrainReveals(); await Task.Delay(60);
+            await AwaitTestText(box, expected + "今天下午要去公司");
+            if (box.Text != expected + "今天下午要去公司")
+                throw new Exception("A changed tail must be deleted and retyped: actual=" + box.Text);
+            int beforeStreamFinal = frames.Count;
+            segment["text"] = "今天下午，要去公司。";
+            QueueSegment(segment, true); await DrainReveals(); await Task.Delay(60);
+            expected += "今天下午要去公司。"; await AwaitTestText(box, expected);
+            if (box.Text != expected || delivery.Drafts.Count != 0 || (animationsEnabled && frames.Count - beforeStreamFinal < 1))
+                throw new Exception("Final must keep the visible prefix and append only the rest: actual=" + box.Text + "; expected=" + expected);
+            // A final that rewrites visible words is corrected the same way, because this
+            // channel is allowed to delete text it wrote this round.
+            segment["start"] = 180; segment["text"] = "今天上午开会";
+            QueueSegment(segment, false); await DrainReveals(); await Task.Delay(60);
+            await AwaitTestText(box, expected + "今天上午开会");
+            segment["text"] = "明天中午开会，讨论。";
+            QueueSegment(segment, true); await DrainReveals(); await Task.Delay(60);
+            expected += "明天中午开会，讨论。"; await AwaitTestText(box, expected);
+            if (box.Text != expected || delivery.Drafts.Count != 0 || recovery.Length != 0)
+                throw new Exception("A rewritten final must replace the segment instead of being cached: actual=" + box.Text + "; recovery=" + recovery);
             segment["start"] = 160; segment["text"] = "只读切换后剩余文字必须留在缓存。";
             QueueSegment(segment, true); await Task.Delay(45);
             box.ReadOnly = true; string beforeReadOnly = box.Text;
             await DrainReveals();
             string accepted = beforeReadOnly.Substring(expected.Length);
             if (box.Text != beforeReadOnly || accepted + recovery != (string)segment["text"] || delivery.Paused.Length == 0)
-                throw new Exception("Read-only transition must stop paced append and retain the exact unsent final suffix");
+                throw new Exception("Read-only transition must stop paced append and retain the exact unsent final suffix: shown=" + accepted.Length + "; recovery=" + recovery.Length + "; final=" + ((string)segment["text"]).Length + "; paused=" + delivery.Paused);
             box.ReadOnly = false; recovery = ""; backupRoutes.Clear(); audioRoute = 0;
             DropTextBridge();
             box.Text = "左侧原文替换这段右侧原文"; box.Select(4, 4);
@@ -4680,13 +4932,67 @@ sealed class Microphone : Form
             QueueSegment(segment, true); delivery.Cancelled = true; RevealText();
             if (reveals.Count != 0) throw new Exception("Cancelled recording retained queued text");
             File.WriteAllLines(Path.Combine(root, "work", "text-reveal-frames.txt"), frames.ToArray());
-            File.WriteAllText(Path.Combine(root, "work", "text-reveal-test.txt"), "TEXT-REVEAL-TEST PASS: progressive frames=" + frames.Count + " / coalesced latest candidate and visible correction / ordered final segments / paced append compatibility / read-only transition retains exact unsent suffix / paced selection replacement / caret and delivery ledger / user-edit cache / cancellation / Unicode text elements / bounded catch-up / reduced motion follows system setting");
+            File.WriteAllText(Path.Combine(root, "work", "text-reveal-test.txt"), "TEXT-REVEAL-TEST PASS: progressive frames=" + frames.Count + " / append typing spanMs=" + compatSpan + " / delayed compatibility final spanMs=" + delayedSpan + " / coalesced latest candidate and visible correction / ordered final segments / one element per beat on append-only hosts / read-only transition retains exact unsent suffix / paced selection replacement / caret and delivery ledger / user-edit cache / cancellation / Unicode text elements / bounded in-place catch-up / reduced motion follows system setting");
         } finally {
             box.TextChanged -= changed; textReveal.Stop(); reveals.Clear(); DropTextBridge();
             delivery = new TextDelivery(); recovery = ""; backupRoutes.Clear(); appliedSegments = 0;
         }
     }
+    // Diagnostic: replay a wav through the production pipeline into the focused host.
+    // Only a WeChat Qt window is accepted, and nothing is sent or clicked afterwards.
+    static string ProcessNameOf(IntPtr window) {
+        try { uint pid; Native.WindowProcessId(window, out pid); using (var process = Process.GetProcessById((int)pid)) return process.ProcessName; }
+        catch (Exception) { return ""; }
+    }
+    async Task RunReplay() {
+        string path = Path.Combine(root, "work", "replay.wav");
+        if (!File.Exists(path)) throw new IOException("缺少回放音频：" + path);
+        // Wait for the user to bring WeChat forward instead of stealing the foreground.
+        var wait = Stopwatch.StartNew();
+        IntPtr window = IntPtr.Zero; string name = "";
+        while (wait.ElapsedMilliseconds < 120000) {
+            window = Native.GetForegroundWindow();
+            name = ProcessNameOf(window);
+            if (window != IntPtr.Zero && window != Handle && Native.CharacterMessageTarget(Native.ClassOf(window), name)) break;
+            await Task.Delay(250);
+        }
+        if (window == IntPtr.Zero || window == Handle || !Native.CharacterMessageTarget(Native.ClassOf(window), name))
+            throw new Exception("回放只写微信前台窗口，当前是 " + Native.ClassOf(window) + "/" + name);
+        target = window; targetFocus = Native.Focus(window);
+        if (targetFocus == IntPtr.Zero) throw new Exception("微信输入框没有焦点，回放未开始。");
+        byte[] file = File.ReadAllBytes(path);
+        int at = 12, data = -1, length = 0;
+        while (at + 8 <= file.Length) {
+            string id = Encoding.ASCII.GetString(file, at, 4);
+            int size = BitConverter.ToInt32(file, at + 4);
+            if (id == "data") { data = at + 8; length = Math.Min(size, file.Length - data); break; }
+            if (size < 0) break;
+            at += 8 + size + (size & 1);
+        }
+        if (data < 0 || length < 3200) throw new IOException("回放音频没有可用的 PCM 数据。");
+        await BeginStream();
+        guard = new InteractionGuard(OwnsSurface, reason => Pause("回放期间检测到输入：" + reason));
+        var frames = new List<string>(); var clock = Stopwatch.StartNew();
+        int fed = 0;
+        for (int offset = data; offset < data + length; offset += 3200) {
+            int size = Math.Min(3200, data + length - offset);
+            var part = new byte[size]; Array.Copy(file, offset, part, 0, size);
+            await Feed(part); fed += size;
+            double due = fed / 2.0 / 16000 * 1000;
+            if (due > clock.ElapsedMilliseconds) await Task.Delay((int)(due - clock.ElapsedMilliseconds));
+            if (delivery == null || delivery.Cancelled) break;
+            frames.Add(clock.ElapsedMilliseconds + "\t" + delivery.Latest);
+        }
+        ApplyReply(await Exchange(new { op = "stop", id = recordingId }));
+        await DrainReveals();
+        frames.Add(clock.ElapsedMilliseconds + "\t" + delivery.Latest);
+        File.WriteAllLines(Path.Combine(root, "work", "replay-frames.txt"), frames.ToArray());
+        File.WriteAllText(Path.Combine(root, "work", "replay-test.txt"), "REPLAY " + name + " / focus=" + targetFocus.ToInt64().ToString("X") +
+            " / paused=[" + delivery.Paused + "] / recovery=[" + recovery + "] / text=" + delivery.Latest);
+        Close();
+    }
     async Task RunStreamTest() {
+        if (replay) { await RunReplay(); return; }
         using (var form = new Form { Text = "VoxFix Desktop test target", Width = 500, Height = 200, TopMost = true })
         using (var box = new TextBox { Multiline = true, Dock = DockStyle.Fill, Text = "原文：" }) {
             form.Controls.Add(box); form.Show(); form.Activate(); Native.SetForegroundWindow(form.Handle); box.Focus(); box.SelectionStart = box.TextLength;
@@ -4838,13 +5144,26 @@ sealed class Microphone : Form
     void DrawCurrent(Graphics g) {
         // Supersample the vector outline so translucent edges cover fractional screen pixels.
         using (var surface = new Bitmap(128 * RenderScale, 96 * RenderScale, System.Drawing.Imaging.PixelFormat.Format32bppPArgb)) {
+            double mix = ThemeMix();
             using (var ink = Graphics.FromImage(surface)) {
                 ink.ScaleTransform(RenderScale, RenderScale);
-                float progress = RevealProgress;
-                if (progress >= 1) DrawContent(ink);
-                else using (var bitmap = new Bitmap(128, 96)) {
-                    using (var content = Graphics.FromImage(bitmap)) DrawContent(content);
-                    DrawReveal(ink, bitmap, progress);
+                if (mix >= 1) DrawContent(ink, theme);
+                else DrawContent(ink, themeFrom);
+            }
+            // A theme switch hands the material over in place: the outgoing skin
+            // stays put while the incoming one fades over it.
+            if (mix > 0 && mix < 1) {
+                using (var layer = new Bitmap(128 * RenderScale, 96 * RenderScale, System.Drawing.Imaging.PixelFormat.Format32bppPArgb)) {
+                    using (var layerInk = Graphics.FromImage(layer)) {
+                        layerInk.ScaleTransform(RenderScale, RenderScale);
+                        DrawContent(layerInk, theme);
+                    }
+                    using (var ink = Graphics.FromImage(surface)) {
+                        using (var attributes = new System.Drawing.Imaging.ImageAttributes()) {
+                            attributes.SetColorMatrix(new System.Drawing.Imaging.ColorMatrix { Matrix33 = (float)mix });
+                            ink.DrawImage(layer, new Rectangle(0, 0, 128 * RenderScale, 96 * RenderScale), 0, 0, layer.Width, layer.Height, GraphicsUnit.Pixel, attributes);
+                        }
+                    }
                 }
             }
             var saved = g.Save();
@@ -4854,6 +5173,22 @@ sealed class Microphone : Form
             g.DrawImage(surface, new Rectangle(0, 0, 128, 96), 0, 0, surface.Width, surface.Height, GraphicsUnit.Pixel);
             g.Restore(saved);
         }
+    }
+    void DrawContent(Graphics g, ThemeId skin) {
+        float progress = RevealProgress;
+        if (progress >= 1) { DrawSkin(g, skin); return; }
+        using (var bitmap = new Bitmap(128, 96)) {
+            using (var content = Graphics.FromImage(bitmap)) DrawSkin(content, skin);
+            DrawReveal(g, bitmap, progress);
+        }
+    }
+    void DrawSkin(Graphics g, ThemeId skin) {
+        DrawShape(g, shape.Value, restarting ? "recording" : state, recoveryCopied, copyFeedback, hoverFeedback, pressFeedback,
+            motion.Activity, motion.Voice, motion.Level, animationsEnabled ? (skin == ThemeId.Chaos ? chaosVisualTime : motionClock.Elapsed.TotalMilliseconds) : 0,
+            restarting || (state == "recording" && !inputFocused && recovery.Length == 0),
+            !restarting && (transcribing || speechDetected || state == "busy"), readyFeedback,
+            // Keep one microphone visible throughout the idle morph in either direction.
+            (state == "idle" || state == "error") && recovery.Length == 0 && !transcribing && !restarting, skin);
     }
     internal static void DrawReveal(Graphics g, Bitmap image, float progress) {
         g.Clear(Color.Transparent);
@@ -4927,32 +5262,38 @@ sealed class Microphone : Form
         if (error) using (var warning = new Pen(Color.FromArgb(180, 235, 178, 102), 1.2f)) g.DrawPath(warning, outline);
     }
     internal static void DrawShape(Graphics g, double shape, string state, bool copied, float success, float hover, float press,
-        float activity = 0, float voice = 0, float level = 0, double now = 0, bool pending = false, bool transcribing = false, float ready = 1, bool stashed = false) {
-        g.Clear(Color.Transparent); g.SmoothingMode = SmoothingMode.AntiAlias;
+        float activity = 0, float voice = 0, float level = 0, double now = 0, bool pending = false, bool transcribing = false, float ready = 1, bool stashed = false, ThemeId theme = ThemeId.Graphite) {
+        g.Clear(Color.Transparent);
+        var context = new ThemeContext {
+            State = state, Shape = shape, Activity = activity, Voice = voice, Level = level,
+            Hover = hover, Press = press, Success = success, Ready = ready, Pending = pending,
+            Transcribing = transcribing, Stashed = stashed, Copied = copied, Now = now,
+            Error = state == "error", Reduced = ReducedMotion
+        };
+        DrawThemeLayer(g, shape, context, theme);
+    }
+    // Skin layer only: silhouette, material and the listening mark. It is kept apart
+    // from the shared copy affordance so a theme switch can cross fade the skin
+    // without drawing the copy control twice.
+    internal static void DrawThemeLayer(Graphics g, double shape, ThemeContext context, ThemeId theme, bool affordance = true) {
+        g.SmoothingMode = SmoothingMode.AntiAlias;
         // A capsule keeps the circle's area, including spring overshoot and reversal.
         SizeF size = ShapeSize(shape);
-        float scale = 1 - .025f * press;
+        float scale = 1 - .025f * context.Press;
         var surfaceState = g.Save();
         g.TranslateTransform(64, 48); g.ScaleTransform(scale, scale); g.TranslateTransform(-64, -48);
         float width = size.Width, height = size.Height;
-        float x = 64 - width / 2, y = 48 - height / 2;
         float blend = (float)Math.Max(0, Math.Min(1, shape));
-        using (var outline = new GraphicsPath()) {
-            float diameter = Math.Min(width, height);
-            if (width >= height) {
-                outline.AddArc(x + .5f, y + .5f, diameter - 1, diameter - 1, 90, 180);
-                outline.AddArc(x + width - diameter + .5f, y + .5f, diameter - 1, diameter - 1, 270, 180);
-            } else {
-                outline.AddArc(x + .5f, y + .5f, diameter - 1, diameter - 1, 180, 180);
-                outline.AddArc(x + .5f, y + height - diameter + .5f, diameter - 1, diameter - 1, 0, 180);
-            }
-            outline.CloseFigure();
-            DrawMaterial(g, outline, outline.GetBounds(), hover, press, activity, now, state == "error");
+        using (var outline = theme == ThemeId.Graphite ? GraphiteOutline(width, height) : ThemeArt.Outline(theme, width, height, shape, context)) {
+            if (theme == ThemeId.Graphite) DrawMaterial(g, outline, outline.GetBounds(), context.Hover, context.Press, context.Activity, context.Now, context.Error);
+            else ThemeArt.PaintBody(g, theme, outline, width, height, context);
             var saved = g.Save(); g.SetClip(outline);
-            if (blend > 0) using (var pill = new Bitmap(106 * RenderScale, 42 * RenderScale)) using (var ink = Graphics.FromImage(pill)) {
+            if (affordance && blend > 0) using (var pill = new Bitmap(106 * RenderScale, 42 * RenderScale)) using (var ink = Graphics.FromImage(pill)) {
                 ink.ScaleTransform(RenderScale, RenderScale);
-                DrawMemory(ink, copied, success, hover, press, false, activity, level, now, state == "busy" || state == "loading", pending, voice, transcribing, ready, false, stashed);
-                DrawFade(g, pill, 11, 27, Math.Max(0, 2 * blend - 1), 106, 42);
+                if (theme == ThemeId.Chaos) ChaosArt.Status(ink, context);
+                else DrawMemory(ink, context.Copied, context.Success, context.Hover, context.Press, false, context.Activity, context.Level, context.Now,
+                    context.State == "busy" || context.State == "loading", context.Pending, context.Voice, context.Transcribing, context.Ready, false, context.Stashed);
+                DrawFade(g, pill, 11, 27, Math.Max(0, 2 * blend - 1), 106, 42, theme == ThemeId.Ink);
             }
             var motif = g.Save();
             float motifSize = Math.Min(width, height);
@@ -4960,18 +5301,34 @@ sealed class Microphone : Form
             g.ScaleTransform(motifSize / 72, motifSize / 72);
             using (var circle = new Bitmap(72 * RenderScale, 72 * RenderScale)) using (var ink = Graphics.FromImage(circle)) {
                 ink.ScaleTransform(RenderScale, RenderScale);
-                DrawListening(ink, state, activity, voice, level, now, false, 1.65f - .05f * blend);
-                DrawFade(g, circle, 0, 0, stashed || pending || state == "busy" ? 1 : activity + (1 - activity) * Math.Max(0, 1 - 2 * blend), 72, 72);
+                if (theme == ThemeId.Graphite) DrawListening(ink, context.State, context.Activity, context.Voice, context.Level, context.Now, false, 1.65f - .05f * blend);
+                else ThemeArt.PaintMotif(ink, theme, context, 1.65f - .05f * blend);
+                DrawFade(g, circle, 0, 0, context.Stashed || context.Pending || context.State == "busy" ? 1 : context.Activity + (1 - context.Activity) * Math.Max(0, 1 - 2 * blend), 72, 72);
             }
             g.Restore(motif);
             g.Restore(saved);
         }
         g.Restore(surfaceState);
     }
-    static void DrawFade(Graphics g, Bitmap image, int x, int y, float opacity, int width = 0, int height = 0) {
+    internal static GraphicsPath GraphiteOutline(float width, float height) {
+        var outline = new GraphicsPath();
+        float x = 64 - width / 2, y = 48 - height / 2;
+        float diameter = Math.Min(width, height);
+        if (width >= height) {
+            outline.AddArc(x + .5f, y + .5f, diameter - 1, diameter - 1, 90, 180);
+            outline.AddArc(x + width - diameter + .5f, y + .5f, diameter - 1, diameter - 1, 270, 180);
+        } else {
+            outline.AddArc(x + .5f, y + .5f, diameter - 1, diameter - 1, 180, 180);
+            outline.AddArc(x + .5f, y + height - diameter + .5f, diameter - 1, diameter - 1, 0, 180);
+        }
+        outline.CloseFigure();
+        return outline;
+    }
+    static void DrawFade(Graphics g, Bitmap image, int x, int y, float opacity, int width = 0, int height = 0, bool darkInk = false) {
         if (opacity <= 0) return;
         using (var attributes = new System.Drawing.Imaging.ImageAttributes()) {
             var matrix = new System.Drawing.Imaging.ColorMatrix { Matrix33 = opacity };
+            if (darkInk) { matrix.Matrix00 = .17f; matrix.Matrix11 = .29f; matrix.Matrix22 = .38f; }
             attributes.SetColorMatrix(matrix);
             g.DrawImage(image, new Rectangle(x, y, width == 0 ? image.Width : width, height == 0 ? image.Height : height), 0, 0, image.Width, image.Height, GraphicsUnit.Pixel, attributes);
         }
@@ -5315,20 +5672,62 @@ sealed class Microphone : Form
                 FormBorderStyle = FormBorderStyle.None, ShowInTaskbar = false,
                 StartPosition = FormStartPosition.Manual, Location = new Point(-20000, -20000),
                 Size = new Size(160, 160), BackColor = Color.White }) {
-                var preview = Microphone.CreateMenu(() => { }, () => { }, () => { });
-                host.Show();
-                preview.Show(host, new Point(0, 0));
-                Application.DoEvents();
-                preview.Items[0].Select();
-                Application.DoEvents();
-                using (var bitmap = new Bitmap(preview.Width, preview.Height)) {
-                    preview.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size));
-                    bitmap.Save(Path.Combine(root, "work", "menu.png"));
+                using (var picker = new ThemePicker(ThemeId.Ink, new Font("Microsoft YaHei UI", 9.5f), id => { }))
+                using (var preview = Microphone.CreateMenu(() => { }, () => { }, () => { }, picker)) {
+                    host.Show();
+                    preview.Show(host, new Point(0, 0));
+                    Application.DoEvents();
+                    preview.Items[0].Select();
+                    Application.DoEvents();
+                    using (var bitmap = new Bitmap(preview.Width, preview.Height)) {
+                        preview.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size));
+                        bitmap.Save(Path.Combine(root, "work", "menu.png"));
+                    }
+                    picker.Drop.Show(new Point(-20000, -20000));
+                    Application.DoEvents();
+                    using (var bitmap = new Bitmap(picker.Drop.Width, picker.Drop.Height)) {
+                        picker.Drop.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size));
+                        bitmap.Save(Path.Combine(root, "work", "theme-picker.png"));
+                    }
+                    picker.Drop.Close();
+                    Console.WriteLine("MENU-TEST OK " + preview.Width + "x" + preview.Height +
+                                      " rows=" + preview.Items.Count +
+                                      " picker=" + picker.Drop.Width + "x" + picker.Drop.Height);
+                    preview.Close();
                 }
-                Console.WriteLine("MENU-TEST OK " + preview.Width + "x" + preview.Height +
-                                  " rows=" + preview.Items.Count);
-                preview.Close();
             }
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--theme-test") {
+            ThemeArt.CheckInk();
+            ChaosArt.Check(root);
+            // Renders every skin in the states that matter, offscreen, so the
+            // whole family can be reviewed on one sheet.
+            Directory.CreateDirectory(Path.Combine(root, "work"));
+            ThemeId[] skins = { ThemeId.Graphite, ThemeId.Ink, ThemeId.Chaos };
+            string[] labels = { "空闲", "聆听", "讲话", "缓存可复制", "转写中", "已复制", "错误" };
+            using (var sheet = new Bitmap(128 * labels.Length, 96 * skins.Length + 20 * skins.Length))
+            using (var ink = Graphics.FromImage(sheet))
+            using (var font = new Font("Microsoft YaHei UI", 9f)) {
+                ink.Clear(Color.FromArgb(38, 43, 50));
+                for (int t = 0; t < skins.Length; t++) for (int s = 0; s < labels.Length; s++) {
+                    double shape = s >= 3 ? 1 : 0;
+                    string state = s == 6 ? "error" : s == 4 ? "recording" : s == 2 ? "recording" : "idle";
+                    float activity = s == 1 || s == 2 || s == 4 ? 1 : 0;
+                    float voice = s == 2 ? 1 : 0;
+                    using (var cell = new Bitmap(128, 96)) using (var layer = Graphics.FromImage(cell)) {
+                        Microphone.DrawShape(layer, shape, state, s == 5, s == 5 ? 1 : 0, 0, 0,
+                            activity, voice, .7f, 600, false, s == 4, s >= 3 ? 1 : 0, false, skins[t]);
+                        ink.DrawImageUnscaled(cell, s * 128, t * 116);
+                    }
+                    using (var label = new SolidBrush(Color.FromArgb(212, 218, 224)))
+                    using (var format = new StringFormat { Alignment = StringAlignment.Center })
+                        ink.DrawString(ThemeCatalog.Of(skins[t]).Name + " · " + labels[s], font, label,
+                            new RectangleF(s * 128, t * 116 + 96, 128, 18), format);
+                }
+                sheet.Save(Path.Combine(root, "work", "theme-sheet.png"));
+            }
+            Console.WriteLine("THEME-TEST OK skins=" + skins.Length);
             return;
         }
         if (args.Length > 0 && args[0] == "--dictionary-test") {
@@ -5529,13 +5928,67 @@ sealed class Microphone : Form
                 var menuSurface = new Rectangle(100, 100, 96, 92);
                 if (!MenuDismissHook.Outside(menuSurface, new Point(60, 140)) || MenuDismissHook.Outside(menuSurface, new Point(120, 120)))
                     throw new Exception("Only clicks outside the menu surface may dismiss it");
-                if (shell.menu.Items.Count != 4 || shell.menu.Items[0].Text != "收起" ||
+                if (shell.menu.Items.Count != 5 || shell.menu.Items[0].Text != "收起" ||
                     shell.menu.Items[1].Text != "词典" ||
-                    !(shell.menu.Items[2] is ToolStripSeparator) || shell.menu.Items[3].Text != "退出")
-                    throw new Exception("Menu must contain dismiss, dictionary, separator and exit");
+                    shell.menu.Items[2].Text != "主题" ||
+                    !(shell.menu.Items[3] is ToolStripSeparator) || shell.menu.Items[4].Text != "退出")
+                    throw new Exception("Menu must contain dismiss, dictionary, theme, separator and exit");
                 foreach (ToolStripItem item in shell.menu.Items)
                     if (!(item is ToolStripSeparator) && item.Image == null)
                         throw new Exception("Every menu row must carry an icon");
+                if (shell.picker == null || shell.picker.Drop.Items.Count != ThemeCatalog.All.Length)
+                    throw new Exception("Theme picker must offer every catalogued skin");
+                foreach (ToolStripItem item in shell.picker.Drop.Items)
+                    if (item is ThemeChoiceItem && ((ThemeChoiceItem)item).Current != (((ThemeChoiceItem)item).Id == shell.theme))
+                        throw new Exception("Theme picker must mark exactly the skin in use");
+                // Every skin must have its own silhouette: a circle and a capsule drawn
+                // in that skin must differ from the graphite pair.
+                foreach (ThemeDefinition definition in ThemeCatalog.All) {
+                    ThemeId skin = definition.Id;
+                    double skinCircleArea = 0, skinCapsuleArea = 0;
+                    using (var circle = new Bitmap(128, 96)) using (var ink = Graphics.FromImage(circle)) {
+                        DrawShape(ink, 0, "idle", false, 0, 0, 0, theme: skin);
+                        for (int x = 0; x < 128; x++) for (int y = 0; y < 96; y++) skinCircleArea += circle.GetPixel(x, y).A / 255.0;
+                    }
+                    using (var capsule = new Bitmap(128, 96)) using (var ink = Graphics.FromImage(capsule)) {
+                        DrawShape(ink, 1, "idle", false, 0, 0, 0, theme: skin);
+                        for (int x = 0; x < 128; x++) for (int y = 0; y < 96; y++) skinCapsuleArea += capsule.GetPixel(x, y).A / 255.0;
+                    }
+                    if (skinCircleArea < 800 || skinCapsuleArea < 800)
+                        throw new Exception("Skin " + skin + " must draw a visible body in both shapes");
+                    if (Math.Abs(skinCircleArea - skinCapsuleArea) / Math.Max(skinCircleArea, skinCapsuleArea) > .35)
+                        throw new Exception("Skin " + skin + " must keep the circle and the capsule comparable in size");
+                }
+                if (ThemeCatalog.All.Length != 3 || ThemeCatalog.Parse("chaos") != ThemeId.Chaos || ThemeCatalog.Parse("resonance") != ThemeId.Graphite ||
+                    ThemeCatalog.Parse("refraction") != ThemeId.Graphite || ThemeCatalog.Parse("weave") != ThemeId.Graphite)
+                    throw new Exception("The catalog must contain graphite, ink and chaos");
+                // Switching the skin is a drawing change only: text, state and the
+                // recogniser must survive it untouched.
+                string keptRecovery = shell.recovery, keptState = shell.state;
+                bool keptDelivery = shell.delivery != null;
+                shell.ApplyTheme(ThemeId.Graphite, false);
+                shell.ApplyTheme(ThemeId.Ink, false);
+                if (shell.recovery != keptRecovery || shell.state != keptState || (shell.delivery != null) != keptDelivery)
+                    throw new Exception("Switching the skin must not touch the cache, the state or the delivery");
+                if (shell.theme != ThemeId.Ink)
+                    throw new Exception("A skin switch must land on the chosen skin");
+                if (shell.ThemeMix() >= 1)
+                    throw new Exception("A skin switch must hand the surface over instead of snapping");
+                shell.ApplyTheme(ThemeId.Graphite, false);
+                // Persisted choice must survive a reload, and a broken file must fall back.
+                shell.themeFrom = ThemeId.Graphite;
+                string themeFolder = Path.Combine(root, "work", "theme-test");
+                Directory.CreateDirectory(themeFolder);
+                try {
+                    ThemeStore.Save(themeFolder, ThemeId.Chaos);
+                    if (ThemeStore.Load(themeFolder) != ThemeId.Chaos) throw new Exception("The chaos skin must be remembered");
+                    ThemeStore.Save(themeFolder, ThemeId.Ink);
+                    if (ThemeStore.Load(themeFolder) != ThemeId.Ink) throw new Exception("The chosen skin must be remembered");
+                    File.WriteAllText(ThemeStore.PathOf(themeFolder), "{ broken");
+                    if (ThemeStore.Load(themeFolder) != ThemeId.Graphite) throw new Exception("A broken skin file must fall back to the default");
+                    File.WriteAllText(ThemeStore.PathOf(themeFolder), "{\"theme\":\"ink\"}");
+                    if (ThemeStore.Load(themeFolder) != ThemeId.Ink) throw new Exception("A skin file must be read back");
+                } finally { if (Directory.Exists(themeFolder)) Directory.Delete(themeFolder, true); }
                 shell.menu.Show(shell, new Point(0, 0));
                 if (!shell.menu.Visible || shell.menuGuard == null) throw new Exception("Open menu must install the outside-click guard");
                 shell.menu.Items[0].Select();
@@ -5543,8 +5996,8 @@ sealed class Microphone : Form
                     shell.menu.DrawToBitmap(preview, new Rectangle(Point.Empty, preview.Size));
                     preview.Save(Path.Combine(root, "work", "microphone-menu.png"));
                 }
-                if (shell.menu.Region == null || shell.menu.Region.IsVisible(Point.Empty) || !shell.menu.Region.IsVisible(20, 20))
-                    throw new Exception("Menu must have rounded corners and preserve item hit targets");
+                if (shell.menu.Region != null || shell.picker.Drop.Region != null)
+                    throw new Exception("Menus must use smooth system corners instead of binary regions");
                 // Replay the real low-level mouse callback instead of clicking the user's desktop.
                 var menuCallback = (Delegate)typeof(MenuDismissHook).GetField("callback", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).GetValue(shell.menuGuard);
                 IntPtr probe = Marshal.AllocHGlobal(32);
@@ -5652,6 +6105,10 @@ sealed class Microphone : Form
             if (DecideTarget(true, true) != TargetKind.Editable || !Deliverable(TargetKind.Editable))
                 throw new Exception("Writable text host must deliver");
             int focusedState = (int)(AccessibleStates.Focused | AccessibleStates.Focusable);
+            foreach (string host in new[] { "Qt51514QWindowIcon", "Qt6QWindowIcon", "MozillaWindowClass", "Chrome_WidgetWin_1" })
+                if (!CoarseWindowClass(host)) throw new Exception("Internal focus hosts must use focused accessibility and keep polling: " + host);
+            if (CoarseWindowClass("WindowsForms10.EDIT.app.0.fixture"))
+                throw new Exception("Native input fields must retain direct focus classification");
             if (DecideAccessibleTarget((int)AccessibleRole.Text, focusedState) != TargetKind.Editable)
                 throw new Exception("Focused MSAA input must deliver even when UIA only reports a document");
             foreach (var blocked in new[] { AccessibleStates.ReadOnly, AccessibleStates.Unavailable, AccessibleStates.Invisible, AccessibleStates.Offscreen })
@@ -5918,6 +6375,7 @@ sealed class Microphone : Form
             var morph = new ShapeMotion();
             var edgeMetrics = new List<string>();
             using (var shell = new Microphone(root, "--stream-test")) {
+                shell.theme = shell.themeFrom = ThemeId.Graphite;
                 shell.state = "idle";
                 foreach (double phase in new[] { 0.0, .5, 1.0 })
                 using (var actual = new Bitmap(128, 96, System.Drawing.Imaging.PixelFormat.Format32bppPArgb))

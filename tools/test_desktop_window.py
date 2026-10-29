@@ -90,10 +90,22 @@ def main():
             colors.append((pixel & 255, (pixel >> 8) & 255, (pixel >> 16) & 255))
     finally:
         user.ReleaseDC(None, screen)
-    # Graphite is cool-tinted and translucent, so the live desktop affects its color.
-    assert sum(max(rgb) - min(rgb) <= 55 and 20 <= min(rgb) <= 155
-               and rgb[2] >= rgb[0] - 20 for rgb in colors) >= 3, \
-        "Window exists but its graphite surface was not drawn on the desktop: " + str(colors)
+    theme_path = Path(__file__).resolve().parent.parent / "user-data/theme.json"
+    try:
+        saved = json.loads(theme_path.read_text(encoding="utf-8-sig"))
+        theme = saved.get("theme", "graphite") if isinstance(saved, dict) else saved
+    except (OSError, ValueError):
+        theme = "graphite"
+    if theme == "chaos":
+        painted = sum((g >= r + 35 and b >= r + 35 and max(g, b) >= 70)
+                      or (b >= r + 6 and g >= r and 10 <= min(r, g, b) <= 100) for r, g, b in colors) >= 3
+    elif theme == "ink":
+        painted = sum(b >= r and min(r, g, b) >= 100 for r, g, b in colors) >= 3
+    else:
+        # Graphite is translucent, so the live desktop affects its color.
+        painted = sum(max(rgb) - min(rgb) <= 55 and 20 <= min(rgb) <= 155
+                      and rgb[2] >= rgb[0] - 20 for rgb in colors) >= 3
+    assert painted, "Window exists but its " + str(theme) + " surface was not drawn on the desktop: " + str(colors)
     print("PASS: VoxFix Desktop has one visible interactive-desktop window")
     if "--exercise-reopen" in sys.argv:
         root = Path(__file__).resolve().parent.parent
